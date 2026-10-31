@@ -28,5 +28,5 @@ fn main(
     let new: [Field; 16] = isoloir::choice_values::<16>(pick, mask);
     let old: [Field; 16] = isoloir::choice_values::<16>(old_pick, mask);
     let v = isoloir::correction(new, old, has_old);
-    isoloir::encrypt::<8, 32>(isoloir::pack::<16, 8>(v), rho, pk_x, pk_y)
+    isoloir::encrypt::<8, 32>(isoloir::pack::<16, 8, 2>(v), rho, pk_x, pk_y)
 }

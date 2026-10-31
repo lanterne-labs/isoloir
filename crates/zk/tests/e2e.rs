@@ -177,7 +177,7 @@ fn a_yes_no_poll_end_to_end() {
         registry: 1,
         title: "Oui ou non ?".into(),
         kind: KindSpec::Choice { options: vec!["Oui".into(), "Non".into()], blank: true },
-        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) } },
+        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) }, per_chunk: 2 },
         publish: Publish::Open { k_real: 1, min_gap: 0, coin: false },
         revote: Revote::Linked,
         opens: l.now,
@@ -293,7 +293,7 @@ fn delta_re_votes_end_to_end() {
         registry: 1,
         title: "delta".into(),
         kind: KindSpec::Choice { options: vec!["Oui".into(), "Non".into()], blank: false },
-        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) } },
+        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) }, per_chunk: 2 },
         publish: Publish::Closed,
         revote: Revote::Delta,
         opens: l.now,
@@ -472,7 +472,7 @@ fn a_tlock_poll_end_to_end() {
 fn a_ranked_poll_with_margins() {
     let tools = Tools::find().expect("nargo and bb");
     let circuits = Circuits::repo();
-    let name = "rankedm12_elgamal_linked_d20";
+    let name = "rankedm12_elgamal_linked_d20_p7";
     let built = circuits.build(&tools, name).unwrap();
     let vkdir = tempfile::tempdir().unwrap();
     isoloir_zk::install(&built, vkdir.path()).unwrap();
@@ -508,7 +508,7 @@ fn a_ranked_poll_with_margins() {
         registry: 1,
         title: "ranked".into(),
         kind: kind.clone(),
-        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) } },
+        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) }, per_chunk: 7 },
         publish: Publish::Closed,
         revote: Revote::Linked,
         opens: l.now,
@@ -601,7 +601,7 @@ fn review_rules() {
         registry: 1,
         title: "rules".into(),
         kind: KindSpec::Choice { options: vec!["Oui".into(), "Non".into()], blank: false },
-        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) } },
+        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) }, per_chunk: 2 },
         publish: Publish::Open { k_real: 5, min_gap: 60, coin: true },
         revote: Revote::Linked,
         opens: l.now,

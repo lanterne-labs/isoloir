@@ -33,7 +33,7 @@ fn a_browser_proof_verifies_on_the_server() {
         registry: 1,
         title: "t".into(),
         kind: KindSpec::Choice { options: vec!["Oui".into(), "Non".into()], blank: true },
-        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: hex::encode([1u8; 32]) } },
+        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: hex::encode([1u8; 32]) }, per_chunk: 2 },
         publish: Publish::Closed,
         revote: Revote::Linked,
         opens: 0,

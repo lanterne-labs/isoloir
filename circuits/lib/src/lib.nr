@@ -189,15 +189,21 @@ pub fn correction<let NV: u32>(new: [Field; NV], old: [Field; NV], has_old: bool
     d
 }
 
-/// The chunks of values (SPEC §7.1): digits v + 2, two per chunk,
-/// `d0 + d1·2^32`; a missing last digit is the digit of 0.
-pub fn pack<let NV: u32, let NC: u32>(values: [Field; NV]) -> [Field; NC] {
-    assert(NC == (NV + 1) / 2);
+/// The chunks of values (SPEC §7.1): digits v + 2, P per chunk (2 or 7),
+/// `Σ d_k·2^(32k)`; a missing digit is the digit of 0.
+pub fn pack<let NV: u32, let NC: u32, let P: u32>(values: [Field; NV]) -> [Field; NC] {
+    assert(NC == (NV + P - 1) / P);
     let mut p: [Field; NC] = [0; NC];
     for j in 0..NC {
-        let d0 = values[2 * j] + OFFSET;
-        let d1 = if 2 * j + 1 < NV { values[2 * j + 1] + OFFSET } else { OFFSET };
-        p[j] = d0 + d1 * DIGIT;
+        let mut acc: Field = 0;
+        let mut w: Field = 1;
+        for k in 0..P {
+            let i = P * j + k;
+            let d = if i < NV { values[i] + OFFSET } else { OFFSET };
+            acc += d * w;
+            w *= DIGIT;
+        }
+        p[j] = acc;
     }
     p
 }
@@ -287,8 +293,11 @@ mod tests {
 
     #[test]
     fn packing() {
-        let p: [Field; 2] = pack::<3, 2>([1, -1, 0]);
+        let p: [Field; 2] = pack::<3, 2, 2>([1, -1, 0]);
         assert(p[0] == 3 + 1 * 4294967296);
         assert(p[1] == 2 + 2 * 4294967296);
+        let q: [Field; 1] = pack::<3, 1, 7>([1, -1, 0]);
+        let w: Field = 4294967296;
+        assert(q[0] == 3 + 1 * w + 2 * w * w + 2 * w * w * w + 2 * w * w * w * w + 2 * w * w * w * w * w + 2 * w * w * w * w * w * w);
     }
 }

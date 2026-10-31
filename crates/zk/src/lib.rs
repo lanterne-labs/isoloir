@@ -104,8 +104,14 @@ impl Circuits {
     /// of a variant; does nothing when both are newer than the sources.
     pub fn build(&self, tools: &Tools, name: &str) -> Result<Built> {
         let pkg = self.package(name);
-        if !pkg.join("src/main.nr").is_file() {
-            run(Command::new("python3").arg(self.root.join("gen.py")).arg(name))?;
+        let main = pkg.join("src/main.nr");
+        let generator = self.root.join("gen.py");
+        let regenerate = match (main.metadata().and_then(|m| m.modified()), generator.metadata().and_then(|m| m.modified())) {
+            (Ok(m), Ok(g)) => g > m,
+            _ => true,
+        };
+        if regenerate {
+            run(Command::new("python3").arg(&generator).arg(name))?;
         }
         let artifact = pkg.join("target").join(format!("{name}.json"));
         let vk_dir = pkg.join("target").join("vk_out");

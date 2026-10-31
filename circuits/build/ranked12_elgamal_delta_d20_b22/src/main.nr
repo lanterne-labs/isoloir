@@ -31,5 +31,5 @@ fn main(
     let new: [Field; 24] = isoloir::ranked_values::<12, 3, 24>(len, slots, isoloir::ranks::<12, 3>(len, slots, mask, blank));
     let old: [Field; 24] = isoloir::ranked_values::<12, 3, 24>(old_len, old_slots, isoloir::ranks::<12, 3>(old_len, old_slots, mask, blank));
     let v = isoloir::correction(new, old, has_old);
-    isoloir::encrypt::<12, 48>(isoloir::pack::<24, 12>(v), rho, pk_x, pk_y)
+    isoloir::encrypt::<12, 48>(isoloir::pack::<24, 12, 2>(v), rho, pk_x, pk_y)
 }

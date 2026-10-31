@@ -23,5 +23,5 @@ fn main(
     assert(nullifier == isoloir::nullifier(poll, s));
     let _ = (setup, seq);
     let v: [Field; 90] = isoloir::ranked_margin_values::<12, 3, 90>(len, slots, isoloir::ranks::<12, 3>(len, slots, mask, blank));
-    isoloir::encrypt::<45, 180>(isoloir::pack::<90, 45>(v), rho, pk_x, pk_y)
+    isoloir::encrypt::<45, 180>(isoloir::pack::<90, 45, 2>(v), rho, pk_x, pk_y)
 }

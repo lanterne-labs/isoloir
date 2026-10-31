@@ -32,15 +32,16 @@ pub fn aggregate(ballots: &[&LoggedBallot], chunks: usize) -> Vec<(Point, Point)
         .collect()
 }
 
-fn digit_sums(values: &[i64], n: u64, chunks: usize) -> Result<Vec<(u64, u64)>, String> {
+/// The digit sums over `n` ballots of the values, chunk by chunk.
+fn digit_sums(values: &[i64], n: u64, chunks: usize, per: usize) -> Result<Vec<Vec<u64>>, String> {
     let mut d: Vec<i128> = values.iter().map(|v| *v as i128 + n as i128 * OFFSET as i128).collect();
-    while d.len() < chunks * pack::PER_CHUNK {
+    while d.len() < chunks * per {
         d.push(n as i128 * OFFSET as i128);
     }
     if d.iter().any(|x| *x < 0 || *x >= 1i128 << pack::DIGIT_BITS) {
         return Err("a value out of range".into());
     }
-    Ok(d.chunks(2).map(|c| (c[0] as u64, c[1] as u64)).collect())
+    Ok(d.chunks(per).map(|c| c.iter().map(|x| *x as u64).collect()).collect())
 }
 
 /// Builds the tally a single decrypter publishes: decryption shares with
@@ -59,17 +60,37 @@ pub fn build_elgamal<R: RngCore + CryptoRng>(
     let mut share = Share { trustee: 1, d: vec![], proofs: vec![] };
     let agg = if n > 0 { aggregate(&counted, variant.chunks()) } else { vec![] };
     if n > 0 {
-        let mut sums = Vec::new();
-        let table = pack::DlogTable::new(n, kinds::value_bound(n));
-        for (j, (a0, a1)) in agg.iter().enumerate() {
+        let per = variant.per as usize;
+        // The digit sums: two per chunk, from the aggregate (a bounded
+        // discrete logarithm); seven per chunk, from each ballot opened
+        // (a single decrypter may: SPEC §7.1), summed.
+        let mut sums: Vec<u64> = vec![0; variant.chunks() * per];
+        if per == 2 {
+            let table = pack::DlogTable::new(n, kinds::value_bound(n));
+            for (j, (a0, a1)) in agg.iter().enumerate() {
+                let m = (Projective::from(*a1) - *a0 * sk).into_affine();
+                let (d0, d1) = table.find(&m).ok_or("a chunk does not decrypt within its bound")?;
+                sums[2 * j] = d0;
+                sums[2 * j + 1] = d1;
+            }
+        } else {
+            let table = pack::BallotTable::new(per);
+            for b in &counted {
+                for (j, c) in b.ct.iter().enumerate() {
+                    let m = (Projective::from(c.c1) - c.c0 * sk).into_affine();
+                    let digits = table.find(&m).ok_or_else(|| format!("ballot {} chunk {j}: not a ballot's digits", b.seq))?;
+                    for (k, d) in digits.iter().enumerate() {
+                        sums[per * j + k] += d;
+                    }
+                }
+            }
+        }
+        for (j, a0) in agg.iter().map(|(a0, _)| a0).enumerate() {
             let (d, proof) = Dleq::prove(sk, a0, &domain(poll.current().id, due.upto, j), rng);
-            let m = (Projective::from(*a1) - d).into_affine();
-            let (d0, d1) = table.find(&m).ok_or("a chunk does not decrypt within its bound")?;
-            sums.push((d0, d1));
             share.d.push(grumpkin::to_hex(&d).map_err(|e| e.to_string())?);
             share.proofs.push([grumpkin::scalar_to_hex(&proof.c), grumpkin::scalar_to_hex(&proof.z)]);
         }
-        values = pack::values_of(&pack::unpack(&sums), variant.values(), n);
+        values = pack::values_of(&sums, variant.values(), n);
     }
     let mut t = Tally {
         v: V1,
@@ -112,15 +133,15 @@ pub fn verify_elgamal(poll: &PollState, t: &Tally, body: &[u8], due: &Due) -> Re
     if t.aggregate.as_ref() != Some(&named) {
         return Err("the aggregates are not the log's".into());
     }
-    verify_shares(&poll.current().encryption, t, body, poll.variant.values(), poll.variant.chunks(), &agg)
+    verify_shares(&poll.current().encryption, t, body, poll.variant.values(), poll.variant.chunks(), poll.variant.per as usize, &agg)
 }
 
 /// Checks an ElGamal tally against the aggregates it names: the
 /// signature, the shares' proofs, the values. A browser runs this with
 /// the aggregates from the tally itself; the auditor and the ingest with
 /// the aggregates they recomputed from the log.
-pub fn verify_shares(encryption: &Encryption, t: &Tally, body: &[u8], n_values: usize, chunks: usize, agg: &[(Point, Point)]) -> Result<(), String> {
-    let Encryption::Elgamal { pk, decrypter } = encryption else { return Err("not an ElGamal poll".into()) };
+pub fn verify_shares(encryption: &Encryption, t: &Tally, body: &[u8], n_values: usize, chunks: usize, per: usize, agg: &[(Point, Point)]) -> Result<(), String> {
+    let Encryption::Elgamal { pk, decrypter, .. } = encryption else { return Err("not an ElGamal poll".into()) };
     let crate::body::Decrypter::Single { sign_key } = decrypter;
     sig::verify_tally(sign_key, body)?;
     let pk = grumpkin::from_hex(pk).map_err(|e| e.to_string())?;
@@ -139,7 +160,7 @@ pub fn verify_shares(encryption: &Encryption, t: &Tally, body: &[u8], n_values: 
     if share.trustee != 1 || share.d.len() != chunks || share.proofs.len() != chunks {
         return Err("the share's shape".into());
     }
-    let sums = digit_sums(&t.values, n, chunks)?;
+    let sums = digit_sums(&t.values, n, chunks, per)?;
     for (j, (a0, a1)) in agg.iter().enumerate() {
         let d = grumpkin::from_hex(&share.d[j]).map_err(|e| e.to_string())?;
         let proof = Dleq {
@@ -150,7 +171,7 @@ pub fn verify_shares(encryption: &Encryption, t: &Tally, body: &[u8], n_values: 
             return Err(format!("chunk {j}: the decryption proof does not verify"));
         }
         let m = (Projective::from(*a1) - d).into_affine();
-        let want = grumpkin::mul_g(&Fr::from(pack::chunk_of(sums[j].0, sums[j].1))).into_affine();
+        let want = grumpkin::mul_g(&pack::chunk_of(&sums[j])).into_affine();
         if m != want {
             return Err(format!("chunk {j}: the values do not match the decryption"));
         }

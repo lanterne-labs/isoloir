@@ -219,7 +219,7 @@ pub fn draft<R: RngCore + CryptoRng>(
             let (x, y) = pk.xy().ok_or("pk at infinity")?;
             m.insert("pk_x".into(), hexf(&x));
             m.insert("pk_y".into(), hexf(&y));
-            let chunks = pack::pack(&values).map_err(|e| e.to_string())?;
+            let chunks = pack::pack(&values, variant.per as usize).map_err(|e| e.to_string())?;
             let rho: Vec<Fr> = chunks.iter().map(|_| grumpkin::random_fr(rng)).collect();
             let ct: Vec<[String; 2]> = chunks
                 .iter()

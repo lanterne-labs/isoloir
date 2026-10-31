@@ -156,7 +156,7 @@ async fn the_ingest_on_postgres() {
         registry: 1,
         title: "Oui ou non ?".into(),
         kind: KindSpec::Choice { options: vec!["Oui".into(), "Non".into()], blank: true },
-        encryption: Encryption::Elgamal { pk: keys.pk.clone(), decrypter: Decrypter::Single { sign_key: keys.sign_key.clone() } },
+        encryption: Encryption::Elgamal { pk: keys.pk.clone(), decrypter: Decrypter::Single { sign_key: keys.sign_key.clone() }, per_chunk: 2 },
         publish: Publish::Open { k_real: 1, min_gap: 0, coin: false },
         revote: Revote::Linked,
         opens: now,
@@ -225,7 +225,7 @@ async fn the_ingest_on_postgres() {
     let body: Tally = canonical::from_slice(latest["body"].as_str().unwrap().as_bytes()).unwrap();
     // A browser checks the tally from itself.
     let agg: Vec<_> = body.aggregate.as_ref().unwrap().iter().map(|[a, b]| (grumpkin::from_hex(a).unwrap(), grumpkin::from_hex(b).unwrap())).collect();
-    isoloir_proto::tally::verify_shares(&poll.encryption, &body, latest["body"].as_str().unwrap().as_bytes(), variant.values(), variant.chunks(), &agg).unwrap();
+    isoloir_proto::tally::verify_shares(&poll.encryption, &body, latest["body"].as_str().unwrap().as_bytes(), variant.values(), variant.chunks(), variant.per as usize, &agg).unwrap();
     let _ = Projective::default();
 
     // Withholding: what the relays hold against the log.
