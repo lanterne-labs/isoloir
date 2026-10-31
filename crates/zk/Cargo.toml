@@ -14,3 +14,6 @@ hex.workspace = true
 thiserror.workspace = true
 tempfile = "3"
 rand.workspace = true
+
+[dev-dependencies]
+isoloir-decrypt.workspace = true

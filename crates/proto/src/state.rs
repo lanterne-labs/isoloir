@@ -317,12 +317,18 @@ impl State {
                 let idx = st.ballots.len();
                 match &pseudonym {
                     Pseudonym::Linked { nullifier, seq: s } => {
-                        if let Some((last, _)) = st.latest.get(nullifier) {
-                            if st.current().revote == Revote::None || last >= s {
-                                return Err(format!("ballot {seq}: the re-vote rule"));
+                        // Within a checkpoint entries are in body-hash order,
+                        // not arrival order: keep the highest seq.
+                        match st.latest.get(nullifier) {
+                            Some(_) if st.current().revote == Revote::None => {
+                                return Err(format!("ballot {seq}: a second ballot in a poll without re-votes"));
+                            }
+                            Some((last, _)) if last == s => return Err(format!("ballot {seq}: seq {s} used twice")),
+                            Some((last, _)) if last > s => {}
+                            _ => {
+                                st.latest.insert(nullifier.clone(), (*s, idx));
                             }
                         }
-                        st.latest.insert(nullifier.clone(), (*s, idx));
                     }
                     Pseudonym::Delta { ident } => {
                         if !st.idents.insert(ident.clone()) {

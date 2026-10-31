@@ -72,8 +72,6 @@ impl Ledger {
         self.now += 20;
         let mut q = std::mem::take(&mut self.queue);
         q.sort_by_key(|(_, b)| isoloir_core::encoding::body_hash(b));
-        // Setups first: what they define is used by the rest.
-        q.sort_by_key(|(k, _)| !matches!(k, EntryKind::Ledger | EntryKind::Registry | EntryKind::Poll));
         for (k, b) in q {
             self.state.apply(k, &b, self.now).unwrap();
         }
@@ -296,4 +294,120 @@ fn delta_re_votes_end_to_end() {
     assert_eq!(&t.values[..2], &[0, 2]);
     assert_eq!(t.counted, 3, "every delta ballot counts");
     assert_eq!(l.post(EntryKind::Tally, canonical::to_vec(&t).unwrap(), &checkers), Verdict::Accept);
+}
+
+#[test]
+fn a_tlock_poll_end_to_end() {
+    use isoloir_decrypt::bls::TestChain;
+    use isoloir_decrypt::tlock::{self as tl, DrandTlock};
+    let tools = Tools::find().expect("nargo and bb");
+    let circuits = Circuits::repo();
+    let name = "choice4_tlock_linked_d20";
+    let built = circuits.build(&tools, name).unwrap();
+    let vkdir = tempfile::tempdir().unwrap();
+    isoloir_zk::install(&built, vkdir.path()).unwrap();
+    let proofs = BbProofs::new(tools.bb.clone(), vkdir.path().to_path_buf());
+    let prover = Prover::new(tools, circuits);
+    let opener = DrandTlock;
+    let checkers = Checkers { proofs: &proofs, passports: &DevPassports, tlock: Some(&opener) };
+    let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+
+    let mut l = Ledger::new(1_800_000_000);
+    l.setup(Body::Registry(RegistrySetup {
+        v: 1,
+        id: 1,
+        version: 1,
+        name: "test".into(),
+        eligibility: Eligibility { provider: "dev".into(), domain: "test.example".into(), scope: "t".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false },
+        validity: 3600,
+        depth: 20,
+    }));
+    l.checkpoint();
+    let voters: Vec<Fr> = (0..3).map(|_| grumpkin::random_fr(&mut rng)).collect();
+    for (i, s) in voters.iter().enumerate() {
+        let body = client::register_body(1, s, &format!("t{i}"), json!({"uid": format!("t{i}")}), l.now, &[0x70 + i as u8; 32]);
+        assert_eq!(l.post(EntryKind::Register, body, &checkers), Verdict::Accept);
+    }
+    l.checkpoint();
+    // A test chain standing for drand: genesis now, a round every 3 s.
+    let chain = TestChain::new(42);
+    let (genesis, period) = (l.now, 3u64);
+    let closes = l.now + 3_600;
+    let round = (closes - genesis) / period + 1;
+    let poll = PollSetup {
+        v: 1,
+        id: 11,
+        version: 1,
+        registry: 1,
+        title: "tlock".into(),
+        kind: KindSpec::Choice { options: vec!["Oui".into(), "Non".into()], blank: true },
+        encryption: Encryption::Tlock { chain: hex::encode([1u8; 32]), public_key: hex::encode(chain.public_key()), period, genesis, round },
+        publish: Publish::Closed,
+        revote: Revote::None,
+        opens: l.now,
+        closes,
+        blackouts: vec![],
+        circuit: CircuitRef { name: name.into(), vk_hash: built.vk_hash.clone() },
+        ballot_depth: None,
+    };
+    // tlock with re-votes, or open results, is refused (SPEC §8).
+    for bad in [PollSetup { revote: Revote::Linked, ..poll.clone() }, PollSetup { publish: Publish::Open { k_real: 1, min_gap: 0, coin: false }, ..poll.clone() }] {
+        assert!(judge::judge_setup(&l.state, EntryKind::Poll, &Body::Poll(bad).encode(), l.now).is_err());
+    }
+    l.setup(Body::Poll(poll.clone()));
+    l.checkpoint();
+    let setup_seq = l.state.polls[&11].setups[0].0;
+    let variant = Variant::parse(name).unwrap();
+    let (pk, r) = tl::params(&poll.encryption).unwrap();
+    let mut seal_rng = rand::rngs::StdRng::seed_from_u64(10);
+    let seal = move |p: &[u8]| tl::seal(&pk, r, p, &mut seal_rng);
+    let seal = std::cell::RefCell::new(seal);
+    let sealer = |p: &[u8]| (seal.borrow_mut())(p);
+
+    let draft = |l: &Ledger, s: &Fr, pick: Option<u32>, rng: &mut rand::rngs::StdRng| {
+        let m = member(&l.state, 1, s);
+        client::draft(&poll, setup_seq, &variant, &m, s, &Choice::Pick(pick), &Revoting::Linked { seq: 0 }, Some(&sealer), rng).unwrap()
+    };
+    // Two honest ballots: yes, no.
+    for (s, pick) in [(&voters[0], 0), (&voters[1], 1)] {
+        let d = draft(&l, s, Some(pick), &mut rng);
+        let p = prover.prove(name, &d.inputs).unwrap();
+        assert_eq!(l.post(EntryKind::Ballot, d.finish(&p.proof), &checkers), Verdict::Accept);
+    }
+    // A relay swaps a blob: the proof binds it, the ballot is refused.
+    let d = draft(&l, &voters[2], Some(0), &mut rng);
+    let p = prover.prove(name, &d.inputs).unwrap();
+    let mut swapped = d.clone();
+    let mut blob = isoloir_core::encoding::unb64(swapped.body.blob.as_ref().unwrap()).unwrap();
+    blob[40] ^= 1;
+    swapped.body.blob = Some(isoloir_core::encoding::b64(&blob));
+    assert_eq!(l.post(EntryKind::Ballot, swapped.finish(&p.proof), &checkers), Verdict::Reject(Reason::BadProof));
+    // The third voter's own blob is garbage, proven as such: void at the round.
+    let m = member(&l.state, 1, &voters[2]);
+    let junk = |_: &[u8]| Ok(vec![0u8; 200]);
+    let d = client::draft(&poll, setup_seq, &variant, &m, &voters[2], &Choice::Pick(Some(0)), &Revoting::Linked { seq: 0 }, Some(&junk), &mut rng).unwrap();
+    let p = prover.prove(name, &d.inputs).unwrap();
+    assert_eq!(l.post(EntryKind::Ballot, d.finish(&p.proof), &checkers), Verdict::Accept);
+    // One ballot per voter.
+    let again = draft(&l, &voters[0], Some(1), &mut rng);
+    let p = prover.prove(name, &again.inputs).unwrap();
+    assert_eq!(l.post(EntryKind::Ballot, again.finish(&p.proof), &checkers), Verdict::Reject(Reason::RevoteOff));
+    l.checkpoint();
+
+    // The close, then the opening with the round's beacon.
+    l.now = closes;
+    l.queue.push((EntryKind::Close, Body::Close(Close { v: 1, poll: 11, at: closes, last: l.state.polls[&11].ballots.last().unwrap().seq }).encode()));
+    let cp = l.checkpoint();
+    let due = policy::due_at(&l.state, 11, cp.index).unwrap();
+    let wrong = Beacon { round, signature: hex::encode(TestChain::new(43).sign(round)) };
+    assert!(tally::build_tlock(&l.state.polls[&11], &due, &wrong, &opener).is_err(), "another chain's beacon");
+    let beacon = Beacon { round, signature: hex::encode(chain.sign(round)) };
+    let t = tally::build_tlock(&l.state.polls[&11], &due, &beacon, &opener).unwrap();
+    assert_eq!(t.values, vec![1, 1, 0, 0]);
+    assert_eq!(t.counted, 2);
+    assert_eq!(t.void.as_ref().unwrap().len(), 1);
+    assert_eq!(l.post(EntryKind::Tally, canonical::to_vec(&t).unwrap(), &checkers), Verdict::Accept);
+    let mut lie = t.clone();
+    lie.values = vec![2, 0, 0, 0];
+    assert_eq!(judge::judge(&l.state, &Pending::default(), EntryKind::Tally, &canonical::to_vec(&lie).unwrap(), l.now, &checkers), Verdict::Reject(Reason::BadTally));
 }
