@@ -3,7 +3,13 @@
 
 export type Hex = string;
 
-export interface Relay {
+/**
+ * A way to the ingest (SPEC §11.1): a Nostr relay (ws:// or wss://) or the
+ * ingest's own HTTP endpoint ("direct"). Retired channels are read, not
+ * written.
+ */
+export interface Channel {
+	type: 'nostr' | 'direct';
 	url: string;
 	state: 'active' | 'retired';
 }
@@ -15,7 +21,7 @@ export interface LedgerSetup {
 	origin: string;
 	log_key: string;
 	ingest: string;
-	relays: Relay[];
+	channels: Channel[];
 	checkpoint_period: number;
 	anchor_age: number;
 }

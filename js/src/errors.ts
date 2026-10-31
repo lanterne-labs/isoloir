@@ -3,7 +3,9 @@
 //
 // Codes of the session: not_ready, no_setup, log_key (the mirror's
 // checkpoint does not verify under the pinned key), mirror, no_relay
-// (no relay took the message), no_ack (relays took it, none answered),
+// (no channel took the message), no_ack (channels took it, none
+// answered), link_unavailable (the ledger has no Nostr relay: no device
+// link),
 // stale_proof (scan the passport again), not_registered, no_path (the
 // mirror and the checkpoint disagree on the tree), previous_pending
 // (a delta correction waits for its previous ballot in the tree),

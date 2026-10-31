@@ -125,8 +125,9 @@ pub fn secret_from_entropy(entropy: &[u8]) -> R<String> {
     Ok(hexf(&secret_of(&encoding::sha256(&m))))
 }
 
-/// The order of the relays for a key (SPEC §11.1): by
-/// `H(T_relay, s, SHA-256(url) mod r)`, lowest first.
+/// The order of a ledger's channels for a key (SPEC §11.1), relays and
+/// direct endpoints alike, by URL: `H(T_relay, s, SHA-256(url) mod r)`,
+/// lowest first.
 pub fn relay_ranking(s: &str, urls_json: &str) -> R<String> {
     let s = secret(s)?;
     let urls: Vec<String> = parse(urls_json, "urls")?;

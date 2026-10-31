@@ -9,7 +9,8 @@ import { Core, type IsoloirWasm } from '../src/wasm.js';
 import type { Fetcher } from '../src/mirror.js';
 import type { Filter, RelayTransport, SubscribeOptions } from '../src/relay.js';
 import type { Prover } from '../src/prover.js';
-import type { LedgerSetup, NostrEvent, PollSetup, RegistrySetup } from '../src/types.js';
+import { DirectChannel, NostrChannel, type ChannelFactory, type HttpFetch } from '../src/channel.js';
+import type { Channel, LedgerSetup, NostrEvent, PollSetup, RegistrySetup } from '../src/types.js';
 
 export interface DevWasm extends IsoloirWasm {
 	dev_verifier(seed: string, origin: string): string;
@@ -28,6 +29,9 @@ export const core = new Core(wasm);
 export const ORIGIN = 'test.example/isoloir';
 export const TAG = `isoloir/1/${ORIGIN}`;
 export const RELAYS = ['wss://r1.test', 'wss://r2.test', 'wss://r3.test'];
+export const DIRECT = 'https://ingest.test';
+export const nostr = (url: string): Channel => ({ type: 'nostr', url, state: 'active' });
+export const direct = (url: string): Channel => ({ type: 'direct', url, state: 'active' });
 export const MIRROR = 'https://mirror.test';
 
 // ------------------------------------------------------------ mirror
@@ -148,7 +152,8 @@ export class FakeIngest {
 	seq = 0;
 	index = 0;
 	pending: Pending[] = [];
-	readonly judged = new Map<string, string>();
+	/** The ack of every envelope judged, sent again as it is. */
+	readonly acks = new Map<string, NostrEvent>();
 	readonly leaves: string[] = [];
 	readonly uids = new Set<string>();
 	readonly ids = new Set<string>();
@@ -162,12 +167,16 @@ export class FakeIngest {
 	/** Judges nothing (an ingest that is down). */
 	silent = false;
 
+	/** Envelopes the direct endpoint took while the ingest was silent. */
+	readonly backlog: NostrEvent[] = [];
+
 	constructor(
 		readonly relays: FakeRelays,
 		readonly mirror: FakeMirror,
+		readonly channels: Channel[] = RELAYS.map(nostr),
 		readonly now: () => number = () => Math.floor(Date.now() / 1000)
 	) {
-		this.ledger = { v: 1, version: 1, origin: ORIGIN, log_key: this.verifier, ingest: this.pubkey, relays: RELAYS.map((url) => ({ url, state: 'active' as const })), checkpoint_period: 20, anchor_age: 86400 };
+		this.ledger = { v: 1, version: 1, origin: ORIGIN, log_key: this.verifier, ingest: this.pubkey, channels, checkpoint_period: 20, anchor_age: 86400 };
 		this.registry = { v: 1, id: 1, version: 1, name: 'Test', eligibility: { provider: 'dev', domain: 'vote.test', scope: 'isoloir/registry/1' }, validity: 3600, depth: 20 };
 		const elgamal = { mode: 'elgamal' as const, pk: this.decrypter.pk, decrypter: { type: 'single' as const, sign_key: this.decrypter.sign_key } };
 		const base = { v: 1 as const, version: 1, registry: 1, title: 'Q', kind: { type: 'choice' as const, options: ['Oui', 'Non'], blank: true }, encryption: elgamal, publish: { mode: 'open' as const, k_real: 1, min_gap: 0, coin: false }, opens: 0, closes: 4_000_000_000 };
@@ -190,17 +199,27 @@ export class FakeIngest {
 			return { seq, kind: s.kind, body };
 		});
 		this.publishCheckpoint(entries);
-		for (const url of RELAYS) {
-			relays.subscribe(url, { kinds: [core.kinds.register, core.kinds.ballot], '#t': [TAG] }, (e) => this.judge(url, e));
+		for (const url of this.relayUrls()) {
+			relays.subscribe(url, { kinds: [core.kinds.register, core.kinds.ballot], '#t': [TAG] }, (e) => this.onRelay(url, e));
 		}
 	}
 
-	/** Comes back after being down: judges what the relays hold, as a real ingest reads them by cursor. */
+	relayUrls(): string[] {
+		return this.channels.filter((c) => c.type === 'nostr').map((c) => c.url);
+	}
+
+	private onRelay(url: string, e: NostrEvent) {
+		const ack = this.judge(e);
+		if (ack) void this.relays.publish(url, ack);
+	}
+
+	/** Comes back after being down: judges what the relays and the endpoint hold, as a real ingest reads them by cursor. */
 	resume(): void {
 		this.silent = false;
-		for (const [url, r] of this.relays.relays) {
-			for (const e of r.events) if ((e.kind === core.kinds.register || e.kind === core.kinds.ballot) && !this.judged.has(e.id)) this.judge(url, e);
+		for (const url of this.relayUrls()) {
+			for (const e of this.relays.relay(url).events) if ((e.kind === core.kinds.register || e.kind === core.kinds.ballot) && !this.acks.has(e.id)) this.onRelay(url, e);
 		}
+		for (const e of this.backlog.splice(0)) this.judge(e);
 	}
 
 	poll(id: number): PollSetup {
@@ -209,10 +228,11 @@ export class FakeIngest {
 		return p;
 	}
 
-	private judge(relay: string, e: NostrEvent) {
-		if (this.silent) return;
-		const prior = this.judged.get(e.id);
-		if (prior) return this.ack(relay, e.id, prior);
+	/** Judges an envelope once; returns its signed ack (the same on every channel), null when silent. */
+	judge(e: NostrEvent): NostrEvent | null {
+		if (this.silent) return null;
+		const prior = this.acks.get(e.id);
+		if (prior) return prior;
 		const kind = e.kind === core.kinds.register ? 'register' : 'ballot';
 		const hash = core.bodyHash(e.content);
 		const reason = kind === 'register' ? this.checkRegister(e.content) : this.checkBallot(e.content);
@@ -220,14 +240,9 @@ export class FakeIngest {
 			? { v: 1, of: e.id, hash, outcome: 'rejected', reason }
 			: { v: 1, of: e.id, hash, outcome: 'accepted', checkpoint: this.index + 1 };
 		if (!reason) this.pending.push({ kind, body: e.content, hash });
-		const content = core.canonical(ack);
-		this.judged.set(e.id, content);
-		this.ack(relay, e.id, content);
-	}
-
-	private ack(relay: string, of: string, content: string) {
-		const ev = core.signEvent(this.secret, this.now(), core.kinds.ack, [['e', of], ['t', TAG]], content);
-		void this.relays.publish(relay, ev);
+		const ev = core.signEvent(this.secret, this.now(), core.kinds.ack, [['t', TAG], ['e', e.id]], core.canonical(ack));
+		this.acks.set(e.id, ev);
+		return ev;
 	}
 
 	private checkRegister(text: string): string | null {
@@ -329,7 +344,7 @@ export class FakeIngest {
 		for (const [n, s] of this.pseudonyms) pseud.set(n.slice(2, 4), { ...(pseud.get(n.slice(2, 4)) ?? {}), [n]: s });
 		for (const p of this.polls) if (p.revote !== 'delta') for (const [pp, v] of pseud) m.put(`polls/${p.id}/pseudonyms/${pp}.json`, v);
 		for (const [poll, l] of this.ballotLeaves) this.shards(`polls/${poll}/ballots`, l);
-		for (const r of RELAYS) void this.relays.publish(r, core.signEvent(this.secret, this.now(), core.kinds.checkpoint, [['t', TAG]], note));
+		for (const r of this.relayUrls()) void this.relays.publish(r, core.signEvent(this.secret, this.now(), core.kinds.checkpoint, [['t', TAG]], note));
 	}
 
 	private shards(dir: string, leaves: string[]) {
@@ -356,11 +371,67 @@ export class StubProver implements Prover {
 	}
 }
 
-export function world() {
-	const relays = new FakeRelays(RELAYS);
+// ------------------------------------------------------------ direct
+
+/**
+ * The ingest's HTTP endpoint (crates/server/src/direct.rs): POST
+ * /v1/messages answers the ack (200) or {pending} (202); GET
+ * /v1/acks/{id} the ack (200) or 404.
+ */
+export class FakeDirect {
+	/** The next POST is judged and its response lost (a dropped connection). */
+	dropResponse = false;
+	/** The next POST is answered 202 and judged this many ms later. */
+	deferMs: number | null = null;
+	/** POSTs answered with this status (a refusal of the endpoint itself). */
+	refuseStatus: number | null = null;
+	readonly received: NostrEvent[] = [];
+	readonly requests: string[] = [];
+
+	constructor(
+		readonly url: string,
+		readonly ingest: FakeIngest
+	) {}
+
+	fetch: HttpFetch = async (url, init) => {
+		const path = url.slice(this.url.length);
+		const method = init?.method ?? 'GET';
+		this.requests.push(`${method} ${path}`);
+		const json = (status: number, v: unknown) => ({ status, ok: status < 300, text: async () => JSON.stringify(v) });
+		if (method === 'GET') {
+			const m = /^\/v1\/acks\/([0-9a-f]{64})$/.exec(path);
+			const ack = m ? this.ingest.acks.get(m[1]) : undefined;
+			return ack ? json(200, ack) : { status: 404, ok: false, text: async () => '' };
+		}
+		if (path !== '/v1/messages') return { status: 404, ok: false, text: async () => '' };
+		if (this.ingest.silent) throw new TypeError('fetch failed');
+		if (this.refuseStatus) return { status: this.refuseStatus, ok: false, text: async () => 'refused' };
+		const e = JSON.parse(init!.body!) as NostrEvent;
+		if (!core.verifyEvent(e)) return { status: 400, ok: false, text: async () => "the envelope's signature does not verify" };
+		this.received.push(e);
+		if (e.kind !== core.kinds.register && e.kind !== core.kinds.ballot) return json(202, { pending: e.id });
+		if (this.deferMs !== null) {
+			const ms = this.deferMs;
+			this.deferMs = null;
+			setTimeout(() => this.ingest.judge(e), ms);
+			return json(202, { pending: e.id });
+		}
+		const ack = this.ingest.judge(e)!;
+		if (this.dropResponse) {
+			this.dropResponse = false;
+			throw new TypeError('network error');
+		}
+		return json(200, ack);
+	};
+}
+
+export function world(channels: Channel[] = RELAYS.map(nostr)) {
+	const relays = new FakeRelays(channels.filter((c) => c.type === 'nostr').map((c) => c.url));
 	const mirror = new FakeMirror();
-	const ingest = new FakeIngest(relays, mirror);
-	return { relays, mirror, ingest };
+	const ingest = new FakeIngest(relays, mirror, channels);
+	const endpoint = new FakeDirect(channels.find((c) => c.type === 'direct')?.url ?? DIRECT, ingest);
+	const factory: ChannelFactory = (c) => (c.type === 'nostr' ? new NostrChannel(c.url, relays) : new DirectChannel(c.url, endpoint.fetch, { pollMs: 10, publishTimeoutMs: 200 }));
+	return { relays, mirror, ingest, direct: endpoint, channels: factory };
 }
 
 /** Waits for queued microtasks and timers to run. */

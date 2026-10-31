@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { core, wasm, ORIGIN } from './fakes.js';
 import { Mirror, dirSource } from '../src/mirror.js';
-import { postWithAck } from '../src/relay.js';
+import { NostrChannel, postWithAck } from '../src/channel.js';
 import { FakeRelays } from './fakes.js';
 
 const S = '0x' + '0'.repeat(60) + '1234';
@@ -106,8 +106,8 @@ describe('the wasm core from node', () => {
 		});
 		const ev = core.signEvent('', 1, core.kinds.ballot, [], '{"v":1}');
 		const seen: string[] = [];
-		const r = await postWithAck(core, relays, ['wss://x', 'wss://y'], ev, ingestPub, { ackTimeoutMs: 50, onPosted: (u) => seen.push(u) });
-		expect(r.relay).toBe('wss://y');
+		const r = await postWithAck(core, ['wss://x', 'wss://y'].map((u) => new NostrChannel(u, relays)), ev, ingestPub, { ackTimeoutMs: 50, onPosted: (u) => seen.push(u) });
+		expect(r.channel).toBe('wss://y');
 		expect(seen).toEqual(['wss://x', 'wss://y']);
 		// A forged ack (another key) does not count.
 		const relays2 = new FakeRelays(['wss://z']);
@@ -115,7 +115,7 @@ describe('the wasm core from node', () => {
 			const ack = core.canonical({ v: 1, of: e.id, hash: core.bodyHash(e.content), outcome: 'accepted', checkpoint: 1 });
 			void relays2.publish('wss://z', core.signEvent('98'.repeat(32), 1, core.kinds.ack, [['e', e.id]], ack));
 		});
-		await expect(postWithAck(core, relays2, ['wss://z'], ev, ingestPub, { ackTimeoutMs: 50 })).rejects.toMatchObject({ code: 'no_ack' });
+		await expect(postWithAck(core, [new NostrChannel('wss://z', relays2)], ev, ingestPub, { ackTimeoutMs: 50 })).rejects.toMatchObject({ code: 'no_ack' });
 	});
 });
 
