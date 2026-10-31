@@ -6,11 +6,10 @@ use crate::api::{self, err, fr, R};
 use ark_ec::CurveGroup as _;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use isoloir_core::grumpkin::{self, Dleq, Projective};
+use isoloir_core::grumpkin::{self, Dleq};
 use isoloir_core::{canonical, pack, Fr};
 use isoloir_decrypt::keys::DecrypterKeys;
 use isoloir_proto::body::{self, EntryKind, Share, Tally, V1};
-use isoloir_proto::kinds;
 use isoloir_proto::note::{Checkpoint, Signer};
 use isoloir_proto::{sig, statement, tally};
 use rand_chacha::ChaCha20Rng;
@@ -109,18 +108,21 @@ pub fn build_tally(req_json: &str) -> R<String> {
     let mut share = Share { trustee: 1, d: vec![], proofs: vec![] };
     let mut agg = vec![];
     if n > 0 {
-        let mut sums = vec![];
-        for j in 0..v.chunks() {
-            let (a0, a1) = grumpkin::Ciphertext::sum(cts.iter().map(|c| &c[j]));
-            let (a0, a1) = (a0.into_affine(), a1.into_affine());
-            let (d, proof) = Dleq::prove(&sk, &a0, &tally::domain(r.poll.id, r.upto, j), &mut rng);
-            let m = (Projective::from(a1) - d).into_affine();
-            sums.push(pack::dlog_chunk(&m, n, kinds::value_bound(n)).ok_or("a chunk does not decrypt")?);
+        let points: Vec<_> = (0..v.chunks())
+            .map(|j| {
+                let (a0, a1) = grumpkin::Ciphertext::sum(cts.iter().map(|c| &c[j]));
+                (a0.into_affine(), a1.into_affine())
+            })
+            .collect();
+        for (j, (a0, a1)) in points.iter().enumerate() {
+            let (d, proof) = Dleq::prove(&sk, a0, &tally::domain(r.poll.id, r.upto, j), &mut rng);
             share.d.push(grumpkin::to_hex(&d).map_err(err)?);
             share.proofs.push([grumpkin::scalar_to_hex(&proof.c), grumpkin::scalar_to_hex(&proof.z)]);
-            agg.push([grumpkin::to_hex(&a0).map_err(err)?, grumpkin::to_hex(&a1).map_err(err)?]);
+            agg.push([grumpkin::to_hex(a0).map_err(err)?, grumpkin::to_hex(a1).map_err(err)?]);
         }
-        values = pack::values_of(&pack::unpack(&sums), v.values(), n);
+        let refs: Vec<&[grumpkin::Ciphertext]> = cts.iter().map(|c| c.as_slice()).collect();
+        let sums = tally::decrypt_sums(&v, &refs, &points, &sk)?;
+        values = pack::values_of(&sums, v.values(), n);
     }
     let mut t = Tally {
         v: V1,

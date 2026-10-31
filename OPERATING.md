@@ -24,7 +24,7 @@ and install them into the mirror (their verification keys and the
 artifacts browsers prove with):
 
 ```sh
-isoloir circuits choice4_elgamal_linked_d20 ranked12_elgamal_linked_d20 --mirror mirror
+isoloir circuits choice4_single_linked_d20 ranked12_single_linked_d20 --mirror mirror
 ```
 
 Each line printed is `name vk_hash`: the poll names both.

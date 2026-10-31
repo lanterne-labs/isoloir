@@ -194,13 +194,13 @@ compute `uid`; participation is public to it. Votes are not.
 {"v":1,"id":7,"version":1,"registry":1,"title":"…",
  "kind":{…},"encryption":{…},"publish":{…},"revote":"linked",
  "opens":1761900000,"closes":1777000000,"blackouts":[{"from":…,"to":…}],
- "circuit":{"name":"choice4_elgamal_linked_d20","vk_hash":"0x…"}}
+ "circuit":{"name":"choice4_single_linked_d20","vk_hash":"0x…"}}
 ```
 
 `circuit.name` is a variant name (circuits/gen.py): the kind's family and
-slot count, the encryption, the re-vote chain, the registry depth
-(`d20`), for delta polls the ballot tree depth (`_b22`), which the
-poll also gives as `ballot_depth`, and `_p7` for seven values per chunk. Optional fields at their default
+slot count, the decryption mode (`single`, `tlock`; `threshold` later),
+the re-vote chain, the registry depth (`d20`) and, for delta polls, the
+ballot tree depth (`_b22`), which the poll also gives as `ballot_depth`. Optional fields at their default
 (`blackouts: []`, `require_expiry: false`, `nationality: []`) are left
 out: a body has one spelling (§3).
 
@@ -229,15 +229,16 @@ slots must be empty.
 
 **Packing.** A ballot's values are small signed integers, `|v| ≤ 2` (a
 correction of a margin goes from −1 to +1). Each is written as the digit
-`v + 2`, and digits go `per_chunk` per **chunk**: `chunk = Σ d_k·2^(32k)`.
-`per_chunk` is 2 or 7: with 2, the decrypter recovers the digit sums of
-a chunk from the aggregate alone (a bounded two-digit discrete
-logarithm), which threshold decryption needs; with 7, a single decrypter
-opens each ballot (its digits are in [0, 4]: one table lookup), sums the
-digits, and proves the aggregate decrypts to the sums as with 2. Seven
-per chunk means three to four times fewer ciphertexts, hence a proof a
-phone makes three to four times faster; it is only for a single
-decrypter, which can open ballots anyway.
+`v + 2`, and digits go P per **chunk**: `chunk = Σ d_k·2^(32k)`. P
+follows from how the poll is decrypted, never from a setting: a single
+decrypter may open each ballot (its digits are in [0, 4]: one table
+lookup), sums the digits and proves the aggregate decrypts to the sums,
+so P = 7, the most 32-bit digits below r, and a phone proves three to
+four times fewer ciphertexts; a decryption by aggregate only (a
+threshold committee, a later version) recovers the digit sums by a
+bounded discrete logarithm, so P = 2. The circuit is named after the
+mode (`single`, `threshold`, `tlock`), and the ingest refuses a poll
+whose circuit is for another mode.
 Plaintexts are thus non-negative integers far below both r and q: a
 "negative" element of F would not be negative in Grumpkin's group, whose
 order is q, and sums of ciphertexts would stop being sums of values. A
@@ -250,8 +251,7 @@ reused for each candidate of the other.
 ### 7.2 Encryption
 
 - **`elgamal`**: `{"mode":"elgamal","pk":"<point>","decrypter":
-  {"type":"single","sign_key":"<Ed25519 public key hex>"},
-  "per_chunk":7}` (`per_chunk` left out when 2). Each chunk
+  {"type":"single","sign_key":"<Ed25519 public key hex>"}}`. Each chunk
   is encrypted under `pk` with its own randomness:
   `(ρ_j·G, chunk_j·G + ρ_j·PK)`. One key per committee, independent of
   the poll: the same `pk` may serve many polls (§9.3).

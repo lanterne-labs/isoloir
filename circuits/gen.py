@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Generates the circuit of each ballot variant (SPEC §9.1).
 
-A variant is a kind and its slot count (choiceM, rankedM, rankedmM), an
-encryption (elgamal, tlock), a re-vote mode (linked, which also serves
-"none", or delta), the registry depth, for delta the ballot tree depth,
-and for elgamal the values per chunk (p2, the default, which threshold
-decryption needs; p7 for a single decrypter, which opens each ballot:
-three times fewer ciphertexts). Each variant is a small Noir binary in
-build/<name>/ calling the library in lib/. The name says everything:
-choice4_elgamal_linked_d20, ranked12_elgamal_delta_d20_b22,
-rankedm10_elgamal_linked_d20_p7.
+A variant is a kind and its slot count (choiceM, rankedM, rankedmM), a
+decryption mode, a re-vote mode (linked, which also serves "none", or
+delta), the registry depth and, for delta, the ballot tree depth. The
+decryption mode decides how ballots are packed (SPEC §7.1): `single`
+(ElGamal, one decrypter, who may open each ballot: seven values per
+chunk), `threshold` (ElGamal decrypted by aggregate only: two values per
+chunk), `tlock` (a commitment to the values). Each variant is a small
+Noir binary in build/<name>/ calling the library in lib/. The name says
+everything: choice4_single_linked_d20, ranked12_single_delta_d20_b22,
+choice4_tlock_linked_d20.
 
     gen.py NAME...          writes those variants
     gen.py --defaults       writes the default set
@@ -22,38 +23,36 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 K = 3  # the depth of a ranking
 
 DEFAULTS = [
-    "choice4_elgamal_linked_d20",
-    "choice4_elgamal_delta_d20_b22",
+    "choice4_single_linked_d20",
+    "choice4_single_delta_d20_b22",
     "choice4_tlock_linked_d20",
-    "choice16_elgamal_linked_d20",
-    "choice16_elgamal_delta_d20_b22",
-    "ranked12_elgamal_linked_d20",
-    "ranked12_elgamal_delta_d20_b22",
-    "rankedm12_elgamal_linked_d20",
-    "rankedm10_elgamal_linked_d20_p7",
-    "rankedm12_elgamal_linked_d20_p7",
+    "choice16_single_linked_d20",
+    "choice16_single_delta_d20_b22",
+    "ranked12_single_linked_d20",
+    "ranked12_single_delta_d20_b22",
+    "rankedm12_single_linked_d20",
 ]
 
-NAME = re.compile(r"^(choice|ranked|rankedm)(\d+)_(elgamal|tlock)_(linked|delta)_d(\d+)(?:_b(\d+))?(?:_p(2|7))?$")
+# Values per chunk, by decryption mode (0: no packing).
+PER_CHUNK = {"single": 7, "threshold": 2, "tlock": 0}
+
+NAME = re.compile(r"^(choice|ranked|rankedm)(\d+)_(single|threshold|tlock)_(linked|delta)_d(\d+)(?:_b(\d+))?$")
 
 
 def parse(name):
     m = NAME.match(name)
     if not m:
         raise SystemExit(f"{name}: not a variant name")
-    kind, slots, enc, revote, d, bd, per = m.groups()
+    kind, slots, mode, revote, d, bd = m.groups()
     slots, d = int(slots), int(d)
-    if per and enc != "elgamal":
-        raise SystemExit(f"{name}: the values per chunk are an elgamal setting")
-    if per == "2":
-        raise SystemExit(f"{name}: p2 is the default, left out of the name")
     if not 2 <= slots <= 32:
         raise SystemExit(f"{name}: 2 to 32 slots")
-    if enc == "tlock" and (kind != "choice" or revote != "linked"):
+    if mode == "tlock" and (kind != "choice" or revote != "linked"):
         raise SystemExit(f"{name}: tlock is for single-choice kinds with one ballot per voter only (SPEC §8)")
     if (revote == "delta") != (bd is not None):
         raise SystemExit(f"{name}: a ballot tree depth with delta, and only then")
-    return dict(kind=kind, m=slots, enc=enc, revote=revote, d=d, bd=int(bd) if bd else None, per=int(per) if per else 2)
+    enc = "tlock" if mode == "tlock" else "elgamal"
+    return dict(kind=kind, m=slots, enc=enc, revote=revote, d=d, bd=int(bd) if bd else None, per=PER_CHUNK[mode])
 
 
 def values(kind, m):
@@ -67,7 +66,7 @@ def values(kind, m):
 def main_nr(v):
     kind, m, enc, revote, d, bd, per = v["kind"], v["m"], v["enc"], v["revote"], v["d"], v["bd"], v["per"]
     nv = values(kind, m)
-    nc = (nv + per - 1) // per
+    nc = (nv + per - 1) // per if per else 0
     ranked = kind != "choice"
     pub = ["registry: pub Field", "poll: pub Field", "setup: pub Field", "mask: pub u32"]
     if ranked:

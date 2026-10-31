@@ -351,6 +351,13 @@ network observer links address to relay (Tor); the whole log in memory
 (fine to about 100k ballots); the registry tree rebuilt in the browser
 (fine to about 100k voters).
 
+Circuits are named after their decryption mode (`single`, `tlock`;
+`threshold` later), which decides the packing: a single decrypter opens
+each ballot, so seven values per chunk and a third of the gates for a
+ranked ballot with margins; aggregate-only decryption, two per chunk. No
+poll setting for it (2026-10-31, the owner: optimize per decryption
+method, keep the library general).
+
 Open:
 - M3 done: `isoloir-wasm` (the protocol through WebAssembly) and `@isoloir/web`
   (a framework-free session: keys, registration with the scan first, relays

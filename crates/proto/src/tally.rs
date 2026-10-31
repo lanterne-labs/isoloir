@@ -44,6 +44,41 @@ fn digit_sums(values: &[i64], n: u64, chunks: usize, per: usize) -> Result<Vec<V
     Ok(d.chunks(per).map(|c| c.iter().map(|x| *x as u64).collect()).collect())
 }
 
+/// The digit sums of the counted ballots, chunk by chunk, decrypted as
+/// the variant's mode allows (SPEC §7.1): a mode that may open ballots
+/// (`single`) opens each one and sums its digits; an aggregate-only mode
+/// takes a bounded discrete logarithm of each aggregate.
+pub fn decrypt_sums(variant: &kinds::Variant, ballots: &[&[Ciphertext]], agg: &[(Point, Point)], sk: &Scalar) -> Result<Vec<u64>, String> {
+    let per = variant.per as usize;
+    let n = ballots.len() as u64;
+    let mut sums: Vec<u64> = vec![0; variant.chunks() * per];
+    match variant.mode {
+        kinds::Mode::Single => {
+            let table = pack::BallotTable::new(per);
+            for (b, cts) in ballots.iter().enumerate() {
+                for (j, c) in cts.iter().enumerate() {
+                    let m = (Projective::from(c.c1) - c.c0 * sk).into_affine();
+                    let digits = table.find(&m).ok_or_else(|| format!("ballot {b} chunk {j}: not a ballot's digits"))?;
+                    for (k, d) in digits.iter().enumerate() {
+                        sums[per * j + k] += d;
+                    }
+                }
+            }
+        }
+        kinds::Mode::Threshold => {
+            let table = pack::DlogTable::new(n, kinds::value_bound(n));
+            for (j, (a0, a1)) in agg.iter().enumerate() {
+                let m = (Projective::from(*a1) - *a0 * sk).into_affine();
+                let (d0, d1) = table.find(&m).ok_or("a chunk does not decrypt within its bound")?;
+                sums[2 * j] = d0;
+                sums[2 * j + 1] = d1;
+            }
+        }
+        kinds::Mode::Tlock => return Err("a tlock poll is not decrypted with a key".into()),
+    }
+    Ok(sums)
+}
+
 /// Builds the tally a single decrypter publishes: decryption shares with
 /// their proofs, the values found by discrete logarithm, the signature.
 pub fn build_elgamal<R: RngCore + CryptoRng>(
@@ -60,31 +95,8 @@ pub fn build_elgamal<R: RngCore + CryptoRng>(
     let mut share = Share { trustee: 1, d: vec![], proofs: vec![] };
     let agg = if n > 0 { aggregate(&counted, variant.chunks()) } else { vec![] };
     if n > 0 {
-        let per = variant.per as usize;
-        // The digit sums: two per chunk, from the aggregate (a bounded
-        // discrete logarithm); seven per chunk, from each ballot opened
-        // (a single decrypter may: SPEC §7.1), summed.
-        let mut sums: Vec<u64> = vec![0; variant.chunks() * per];
-        if per == 2 {
-            let table = pack::DlogTable::new(n, kinds::value_bound(n));
-            for (j, (a0, a1)) in agg.iter().enumerate() {
-                let m = (Projective::from(*a1) - *a0 * sk).into_affine();
-                let (d0, d1) = table.find(&m).ok_or("a chunk does not decrypt within its bound")?;
-                sums[2 * j] = d0;
-                sums[2 * j + 1] = d1;
-            }
-        } else {
-            let table = pack::BallotTable::new(per);
-            for b in &counted {
-                for (j, c) in b.ct.iter().enumerate() {
-                    let m = (Projective::from(c.c1) - c.c0 * sk).into_affine();
-                    let digits = table.find(&m).ok_or_else(|| format!("ballot {} chunk {j}: not a ballot's digits", b.seq))?;
-                    for (k, d) in digits.iter().enumerate() {
-                        sums[per * j + k] += d;
-                    }
-                }
-            }
-        }
+        let cts: Vec<&[Ciphertext]> = counted.iter().map(|b| b.ct.as_slice()).collect();
+        let sums = decrypt_sums(&variant, &cts, &agg, sk)?;
         for (j, a0) in agg.iter().map(|(a0, _)| a0).enumerate() {
             let (d, proof) = Dleq::prove(sk, a0, &domain(poll.current().id, due.upto, j), rng);
             share.d.push(grumpkin::to_hex(&d).map_err(|e| e.to_string())?);

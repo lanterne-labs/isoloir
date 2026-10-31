@@ -1,0 +1,8 @@
+[package]
+name = "choice4_single_linked_d1"
+type = "bin"
+authors = ["isoloir"]
+compiler_version = ">=1.0.0"
+
+[dependencies]
+isoloir = { path = "../../lib" }

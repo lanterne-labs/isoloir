@@ -197,9 +197,9 @@ export class FakeIngest {
 		const elgamal = { mode: 'elgamal' as const, pk: this.decrypter.pk, decrypter: { type: 'single' as const, sign_key: this.decrypter.sign_key } };
 		const base = { v: 1 as const, version: 1, registry: 1, title: 'Q', kind: { type: 'choice' as const, options: ['Oui', 'Non'], blank: true }, encryption: elgamal, publish: { mode: 'open' as const, k_real: 1, min_gap: 0, coin: false }, opens: 0, closes: 4_000_000_000 };
 		this.polls = [
-			{ ...base, id: 7, revote: 'linked', circuit: { name: 'choice4_elgamal_linked_d20', vk_hash: '0x' + '0'.repeat(64) } },
-			{ ...base, id: 8, revote: 'delta', ballot_depth: 22, circuit: { name: 'choice4_elgamal_delta_d20_b22', vk_hash: '0x' + '0'.repeat(64) } },
-			{ ...base, id: 9, revote: 'none', publish: { mode: 'closed' }, circuit: { name: 'choice4_elgamal_linked_d20', vk_hash: '0x' + '0'.repeat(64) } }
+			{ ...base, id: 7, revote: 'linked', circuit: { name: 'choice4_single_linked_d20', vk_hash: '0x' + '0'.repeat(64) } },
+			{ ...base, id: 8, revote: 'delta', ballot_depth: 22, circuit: { name: 'choice4_single_delta_d20_b22', vk_hash: '0x' + '0'.repeat(64) } },
+			{ ...base, id: 9, revote: 'none', publish: { mode: 'closed' }, circuit: { name: 'choice4_single_linked_d20', vk_hash: '0x' + '0'.repeat(64) } }
 		];
 		// The setups are the log's first entries, in checkpoint 1.
 		const setups: { kind: string; body: unknown; path: string }[] = [
