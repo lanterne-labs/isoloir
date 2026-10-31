@@ -1,4 +1,4 @@
-# pollkit: anonymous polls with passport eligibility, in Rust
+# isoloir: anonymous polls with passport eligibility, in Rust
 
 A library and a set of binaries for polls where eligibility is proven once
 with a passport (ZKPassport), ballots are anonymous and encrypted, every
@@ -7,7 +7,7 @@ a network of ours. The first instance is the presidential pre-poll of
 tartuffe.me (today in Go, `mirror/docs/vote/SPEC.md`, "v2"); the second is
 whatever comes next. The Go system is not changed by this work.
 
-The name is a placeholder.
+An isoloir is the voting booth: the curtain you vote behind, unseen.
 
 ## 1. Goals
 
@@ -204,7 +204,7 @@ without changing formats.
 ## 6. Workspace
 
 ```
-pollkit/
+isoloir/
   Cargo.toml                 workspace
   SPEC.md                    v3 (forked from mirror/docs/vote/SPEC.md)
   circuits/                  Noir: ballot-ranked, ballot-yesno, keygen (nargo)
@@ -237,10 +237,10 @@ pollkit/
     wasm/        `core` + `kinds` encoders + signature checks for the
                  browser (wasm-bindgen).
   zkverifier/    the Node sidecar for ZKPassport proofs (copied from Go)
-  js/            `@pollkit/web`: the session (registration, mailbox,
+  js/            `@isoloir/web`: the session (registration, mailbox,
                  checkpoints, receipts, link, key) in TypeScript over the
                  wasm core, framework-free. Pages stay in each project.
-  cmd/pollkit    one binary: setup, keygen, ingest, trustee, audit,
+  cmd/isoloir    one binary: setup, keygen, ingest, trustee, audit,
                  archive, nostr-key, relays probe.
 ```
 
@@ -270,7 +270,7 @@ Each milestone ends with its tests green, a tag, and a line in CHANGES.md.
   with a yesno poll and a ranked poll: register, vote, re-vote, receipt,
   complaint, tally, close snapshot, audit exit 0; the two-instance,
   one-lease and durable-ack tests ported from Go.
-- **M3 — the browser package** (2 weeks). `wasm`, `@pollkit/web`, and a
+- **M3 — the browser package** (2 weeks). `wasm`, `@isoloir/web`, and a
   minimal demo page for yesno. Exit: the Playwright flows of v2 (one
   voter, two devices with the code, complaint page) pass on the demo.
 - **M4 — tlock for closed polls** (1–2 weeks). The commitment variant of
@@ -309,4 +309,4 @@ which stays on the Go implementation; M0 is the only step that touches
 1. Licence: MIT OR Apache-2.0, from the first commit.
 2. The presidential kind never runs under tlock (its ballots are
    multiple choices: §5.1).
-3. The name: to be chosen; it should say anonymity and voting.
+3. The name: isoloir.
