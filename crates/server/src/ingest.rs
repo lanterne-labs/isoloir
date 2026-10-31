@@ -1,4 +1,4 @@
-//! The ingest (SPEC §11): reads the relays, judges every message, records
+//! The ingest (SPEC §11): reads its channels, judges every message, records
 //! it before acknowledging it, logs the accepted ones and the refusals at
 //! the next checkpoint in one transaction, closes polls on time, writes
 //! the mirror and posts the checkpoint notes.
@@ -26,24 +26,25 @@ pub mod kinds {
     pub const COMPLAINT: u32 = 7106;
 }
 
-/// The relay tag of a ledger.
+/// The relay tag of a ledger (Nostr channels).
 pub fn tag(origin: &str) -> String {
     format!("{}/{origin}", isoloir_proto::PROTOCOL)
 }
 
-/// The way out to the relays.
+/// The way back to the channels.
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {
-    /// Posts an event to one relay.
-    async fn publish(&self, relay: &str, event: &Event) -> Result<(), String>;
-    /// Posts an event to every relay of the ledger.
+    /// Answers on one channel (the one a message came by).
+    async fn publish(&self, origin: &str, event: &Event) -> Result<(), String>;
+    /// Posts an event to every channel that has an audience (the relays).
     async fn publish_all(&self, event: &Event);
 }
 
-/// A message from a relay.
+/// A message from a channel.
 #[derive(Clone, Debug)]
 pub struct Incoming {
-    pub relay: String,
+    /// The channel it came by: a relay's URL, or a direct endpoint's.
+    pub origin: String,
     pub event: Event,
 }
 
@@ -185,18 +186,18 @@ impl Ingest {
         Event::sign(&self.nostr_sk, now, kinds::ACK, vec![vec!["t".into(), self.tag.clone()], vec!["e".into(), of.to_string()]], canonical::to_string(&ack).expect("ack"))
     }
 
-    async fn send_ack(&self, relay: &str, ev: &Event) {
-        match self.transport.publish(relay, ev).await {
+    async fn send_ack(&self, origin: &str, ev: &Event) {
+        match self.transport.publish(origin, ev).await {
             Ok(()) => {
                 if let Err(e) = self.store.ack_posted(ev.tag("e").unwrap_or_default()).await {
                     tracing::error!(error = %e, "recording a posted ack");
                 }
             }
-            Err(e) => tracing::warn!(relay, error = %e, "ack not posted; retried later"),
+            Err(e) => tracing::warn!(origin, error = %e, "ack not posted; retried later"),
         }
     }
 
-    /// Handles one message from a relay.
+    /// Handles one message from a channel.
     pub async fn handle(&mut self, inc: Incoming, now: u64) -> anyhow::Result<()> {
         let ev = &inc.event;
         let kind = match ev.kind {
@@ -211,7 +212,7 @@ impl Ingest {
         // Judged before: the same ack again, on this relay too.
         if let Some((_, ack, _)) = self.store.seen(&ev.id).await? {
             let ack: Event = serde_json::from_value(ack)?;
-            self.send_ack(&inc.relay, &ack).await;
+            self.send_ack(&inc.origin, &ack).await;
             return Ok(());
         }
         let bytes = ev.content.as_bytes().to_vec();
@@ -241,7 +242,7 @@ impl Ingest {
             kind,
             body: bytes.clone(),
             hash: hash.clone(),
-            relay: inc.relay.clone(),
+            relay: inc.origin.clone(),
             received: now as i64,
             outcome: if outcome == Outcome::Accepted { "accepted".into() } else { "rejected".into() },
             reason: reason.map(|r| r.as_str().to_string()),
@@ -254,10 +255,10 @@ impl Ingest {
             }
             self.rows.push(row);
         } else {
-            self.store.seen_only(&ev.id, &inc.relay, &serde_json::to_value(&ack)?).await?;
+            self.store.seen_only(&ev.id, &inc.origin, &serde_json::to_value(&ack)?).await?;
         }
         self.deferred.remove(&ev.id);
-        self.send_ack(&inc.relay, &ack).await;
+        self.send_ack(&inc.origin, &ack).await;
         Ok(())
     }
 

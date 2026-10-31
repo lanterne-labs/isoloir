@@ -48,6 +48,9 @@ isoloir ingest --mirror-dir /app/mirror --mirror-git git@github.com:org/ledger-d
   --zkverifier /app/zkverifier/verify.mjs
 ```
 
+With a `direct` channel in the ledger, add `--listen 0.0.0.0:8080` and
+put the endpoint behind TLS at the URL the ledger names.
+
 Environment: `DATABASE_URL`, `ISOLOIR_LOG_SEED`, `ISOLOIR_NOSTR_KEY`,
 `ISOLOIR_BB`, `ISOLOIR_ETH_RPC` (optional, for passport certificate
 roots). One instance per database: a second one refuses to start. The

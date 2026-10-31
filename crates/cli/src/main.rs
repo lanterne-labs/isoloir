@@ -5,14 +5,15 @@ use clap::{Parser, Subcommand};
 use isoloir_decrypt::keys::DecrypterKeys;
 use isoloir_decrypt::tlock::DrandTlock;
 use isoloir_proto::audit::Auditor;
-use isoloir_proto::body::{self, Body, EntryKind, RelayState};
+use isoloir_proto::body::{self, Body, EntryKind};
 use isoloir_proto::judge::Checkers;
 use isoloir_proto::note;
 use isoloir_relay::Pool;
 use isoloir_server::eligibility::Verifiers;
 use isoloir_server::ingest::{Config, Ingest};
 use isoloir_server::mirror::Mirror;
-use isoloir_server::relays::{self, PoolTransport};
+use isoloir_server::direct::{self, DirectHub};
+use isoloir_server::relays::{self, Channels};
 use isoloir_server::source::{LogSource, MirrorSource};
 use isoloir_server::store::Store;
 use isoloir_server::trustee::{Keys, Output, Trustee};
@@ -89,6 +90,9 @@ enum Cmd {
         /// Do not timestamp the checkpoints.
         #[arg(long)]
         no_stamps: bool,
+        /// Where to serve the ledger's direct channel (when it lists one).
+        #[arg(long)]
+        listen: Option<std::net::SocketAddr>,
     },
     /// Runs a trustee: verifies the log, publishes the tallies due.
     Trustee {
@@ -272,7 +276,7 @@ async fn main() -> Result<()> {
             }
             println!("submitted ({id}); not logged yet: is the ingest running?");
         }
-        Cmd::Ingest { db, log_seed, nostr_key, mirror_dir, mirror_git, zkverifier, node, rpc_url, dev, no_stamps } => {
+        Cmd::Ingest { db, log_seed, nostr_key, mirror_dir, mirror_git, zkverifier, node, rpc_url, dev, no_stamps, listen } => {
             if dev && std::env::var_os("ISOLOIR_PRODUCTION").is_some() {
                 bail!("--dev is for local trials");
             }
@@ -281,9 +285,15 @@ async fn main() -> Result<()> {
             let entries = store.entries().await?;
             let Some((_, EntryKind::Ledger, first, _)) = entries.first() else { bail!("no ledger: run isoloir genesis first") };
             let Ok(Body::Ledger(l)) = body::decode(EntryKind::Ledger, first) else { bail!("the first entry is not a ledger") };
-            let urls: Vec<String> = l.relays.iter().filter(|r| r.state == RelayState::Active).map(|r| r.url.clone()).collect();
-            let pool = Pool::connect(urls);
-            let transport = Arc::new(PoolTransport { pool: pool.clone() });
+            // The ledger's channels: the relays, and the direct endpoints
+            // this process serves.
+            let relays = l.nostr(true);
+            let pool = (!relays.is_empty()).then(|| Pool::connect(relays));
+            let hubs: Vec<Arc<DirectHub>> = l.direct(true).iter().map(|u| DirectHub::new(u)).collect();
+            if !hubs.is_empty() && listen.is_none() {
+                bail!("the ledger lists a direct channel ({}): --listen to serve it", l.direct(true).join(", "));
+            }
+            let transport = Arc::new(Channels { pool: pool.clone(), direct: hubs.clone() });
             let bb = Tools::find_bb()?;
             let mirror = Mirror { dir: mirror_dir.clone(), git: mirror_git };
             let config = Config { log_seed: seed(&log_seed, "log seed")?, nostr_sk: seed(&nostr_key, "nostr key")? };
@@ -300,22 +310,38 @@ async fn main() -> Result<()> {
             if !no_stamps {
                 ing.calendars = isoloir_stamps_calendars();
             }
-            let mut rx = relays::subscribe(&pool, &store, ing.tag()).await?;
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+            if let Some(p) = &pool {
+                relays::subscribe(p, &store, ing.tag(), tx.clone()).await?;
+            }
+            if let (Some(addr), Some(hub)) = (listen, hubs.first()) {
+                let app = direct::router(hub.clone(), tx.clone(), store.clone());
+                let listener = tokio::net::TcpListener::bind(addr).await?;
+                tracing::info!(%addr, channel = %hub.origin, "direct channel");
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(listener, app).await {
+                        tracing::error!(error = %e, "direct channel");
+                    }
+                });
+            }
+            drop(tx);
             tracing::info!(origin = %l.origin, "ingest running");
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             loop {
                 tokio::select! {
                     m = rx.recv() => match m {
                         Some(inc) => ing.handle(inc, now()).await?,
-                        None => bail!("the relay pool stopped"),
+                        None => bail!("every channel stopped"),
                     },
                     _ = tick.tick() => {
-                        if ing.tick(now()).await?.is_some() {
-                            relays::save_cursors(&pool, &store).await?;
+                        if let (Some(_), Some(p)) = (ing.tick(now()).await?, &pool) {
+                            relays::save_cursors(p, &store).await?;
                         }
                     }
                     _ = tokio::signal::ctrl_c() => {
-                        relays::save_cursors(&pool, &store).await?;
+                        if let Some(p) = &pool {
+                            relays::save_cursors(p, &store).await?;
+                        }
                         return Ok(());
                     }
                 }
@@ -339,8 +365,11 @@ async fn main() -> Result<()> {
                     let first = src.from(1).await?.into_iter().next().context("an empty mirror")?;
                     let Some((EntryKind::Ledger, b)) = first.1.first() else { bail!("no ledger entry") };
                     let Ok(Body::Ledger(l)) = body::decode(EntryKind::Ledger, b) else { bail!("ledger") };
-                    let pool = Pool::connect(l.relays.iter().filter(|r| r.state == RelayState::Active).map(|r| r.url.clone()).collect());
-                    Output::Relays { transport: Arc::new(PoolTransport { pool }), nostr_sk: seed(&k, "nostr key")? }
+                    let relays = l.nostr(true);
+                    if relays.is_empty() {
+                        bail!("the ledger has no relay: post tallies with --db");
+                    }
+                    Output::Relays { transport: Arc::new(Channels { pool: Some(Pool::connect(relays)), direct: vec![] }), nostr_sk: seed(&k, "nostr key")? }
                 }
                 (None, None) => bail!("--db or --nostr-key: where tallies go"),
             };
@@ -388,7 +417,7 @@ async fn main() -> Result<()> {
             let (state, mut r) = a.finish();
             if relays {
                 let l = state.ledger().context("no ledger")?.clone();
-                let urls: Vec<String> = l.relays.iter().map(|r| r.url.clone()).collect();
+                let urls = l.nostr(false);
                 let pool = Pool::connect(urls.clone());
                 let tag = format!("{}/{}", isoloir_proto::PROTOCOL, l.origin);
                 let mut events = vec![];

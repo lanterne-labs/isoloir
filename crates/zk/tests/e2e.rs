@@ -50,7 +50,7 @@ impl Ledger {
             origin: "test.example/isoloir".into(),
             log_key: l.signer.verifier(),
             ingest: hex::encode([2u8; 32]),
-            relays: vec![Relay { url: "wss://relay.test".into(), state: RelayState::Active }],
+            channels: vec![Channel::Nostr { url: "wss://relay.test".into(), state: ChannelState::Active }],
             checkpoint_period: 20,
             anchor_age: 86_400,
         };

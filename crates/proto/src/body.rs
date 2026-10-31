@@ -116,23 +116,60 @@ pub struct LedgerSetup {
     pub origin: String,
     pub log_key: String,
     pub ingest: String,
-    pub relays: Vec<Relay>,
+    /// How messages reach the ingest and acknowledgements come back
+    /// (SPEC §11): any number of channels, of any type.
+    pub channels: Vec<Channel>,
     pub checkpoint_period: u64,
     pub anchor_age: u64,
 }
 
+/// A way to the ingest (SPEC §11.1). Every channel carries the same
+/// signed envelopes and the same signed acknowledgements; what differs is
+/// who sees the messages pass and who keeps a copy.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Relay {
-    pub url: String,
-    pub state: RelayState,
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Channel {
+    /// A public Nostr relay (`ws://` or `wss://`).
+    Nostr { url: String, state: ChannelState },
+    /// The ingest's own HTTP endpoint (`https://`).
+    Direct { url: String, state: ChannelState },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RelayState {
+pub enum ChannelState {
     Active,
     Retired,
+}
+
+impl Channel {
+    pub fn url(&self) -> &str {
+        match self {
+            Channel::Nostr { url, .. } | Channel::Direct { url, .. } => url,
+        }
+    }
+
+    pub fn state(&self) -> ChannelState {
+        match self {
+            Channel::Nostr { state, .. } | Channel::Direct { state, .. } => *state,
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.state() == ChannelState::Active
+    }
+}
+
+impl LedgerSetup {
+    /// The Nostr relays (active ones only, or all).
+    pub fn nostr(&self, active_only: bool) -> Vec<String> {
+        self.channels.iter().filter(|c| matches!(c, Channel::Nostr { .. }) && (!active_only || c.is_active())).map(|c| c.url().to_string()).collect()
+    }
+
+    /// The direct endpoints (active ones only, or all).
+    pub fn direct(&self, active_only: bool) -> Vec<String> {
+        self.channels.iter().filter(|c| matches!(c, Channel::Direct { .. }) && (!active_only || c.is_active())).map(|c| c.url().to_string()).collect()
+    }
 }
 
 /// The `registry` entry (SPEC §5).

@@ -86,7 +86,7 @@ async fn the_ingest_on_postgres() {
         origin: origin.into(),
         log_key: signer.verifier(),
         ingest: hex::encode(isoloir_proto::sig::xonly(&config.nostr_sk)),
-        relays: vec![Relay { url: "wss://a.test".into(), state: RelayState::Active }],
+        channels: vec![Channel::Nostr { url: "wss://a.test".into(), state: ChannelState::Active }],
         checkpoint_period: 20,
         anchor_age: 86_400,
     };
@@ -126,21 +126,21 @@ async fn the_ingest_on_postgres() {
     for (i, s) in voters.iter().enumerate() {
         let b = client::register_body(1, s, &format!("p{i}"), json!({"uid": format!("p{i}")}), now, &[0x20 + i as u8; 32]);
         let ev = event(kinds::REGISTER, &tag, &b, now);
-        ingest.handle(Incoming { relay: "wss://a.test".into(), event: ev.clone() }, now).await.unwrap();
+        ingest.handle(Incoming { origin: "wss://a.test".into(), event: ev.clone() }, now).await.unwrap();
         assert_eq!(mem.ack_of(&ev.id).outcome, Outcome::Accepted);
         assert_eq!(mem.ack_of(&ev.id).checkpoint, Some(3));
         reg_events.push(ev);
     }
     let dup = client::register_body(1, &grumpkin::random_fr(&mut rng), "p0", json!({"uid": "p0"}), now, &[0x30; 32]);
     let dup_ev = event(kinds::REGISTER, &tag, &dup, now);
-    ingest.handle(Incoming { relay: "wss://a.test".into(), event: dup_ev.clone() }, now).await.unwrap();
+    ingest.handle(Incoming { origin: "wss://a.test".into(), event: dup_ev.clone() }, now).await.unwrap();
     assert_eq!(mem.ack_of(&dup_ev.id).reason, Some(isoloir_proto::Reason::UidUsed));
     // A crash before the checkpoint: the accepted messages are not lost.
     drop(ingest);
     let mut ingest = load(store.clone(), mem.clone()).await.unwrap();
     // The same event again: the same ack, nothing new.
     let n = mem.posted.lock().unwrap().len();
-    ingest.handle(Incoming { relay: "wss://b.test".into(), event: reg_events[0].clone() }, now).await.unwrap();
+    ingest.handle(Incoming { origin: "wss://b.test".into(), event: reg_events[0].clone() }, now).await.unwrap();
     assert_eq!(mem.posted.lock().unwrap().len(), n + 1);
     assert_eq!(mem.ack_of(&reg_events[0].id).checkpoint, Some(3));
     now += 30;
@@ -179,7 +179,7 @@ async fn the_ingest_on_postgres() {
         let d = client::draft(&poll, setup_seq, &variant, &m, s, &Choice::Pick(Some(pick)), &Revoting::Linked { seq: 0 }, None, &mut rng).unwrap();
         let p = prover.prove(name, &d.inputs).unwrap();
         let ev = event(kinds::BALLOT, &tag, &d.finish(&p.proof), now);
-        ingest.handle(Incoming { relay: "wss://a.test".into(), event: ev.clone() }, now).await.unwrap();
+        ingest.handle(Incoming { origin: "wss://a.test".into(), event: ev.clone() }, now).await.unwrap();
         assert_eq!(mem.ack_of(&ev.id).outcome, Outcome::Accepted, "{:?}", mem.ack_of(&ev.id));
     }
     now += 30;
@@ -242,4 +242,90 @@ async fn the_ingest_on_postgres() {
     events.push(ack_ev);
     let problems = isoloir_proto::audit::check_relays(&state, &events, &ingest_pk, 0);
     assert_eq!(problems.len(), 2, "{problems:?}");
+}
+
+/// A ledger whose only channel is the ingest's own HTTP endpoint.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_direct_channel() {
+    use isoloir_server::direct::{self, DirectHub};
+    use isoloir_server::relays::Channels;
+    let url = fresh_db().await;
+    let store = Store::connect(&url).await.unwrap();
+    let config = Config { log_seed: [13u8; 32], nostr_sk: [14u8; 32] };
+    let origin = "direct.example/isoloir";
+    let signer = note::Signer::new(origin, &config.log_seed);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let mut now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let ledger = LedgerSetup {
+        v: 1,
+        version: 1,
+        origin: origin.into(),
+        log_key: signer.verifier(),
+        ingest: hex::encode(isoloir_proto::sig::xonly(&config.nostr_sk)),
+        channels: vec![Channel::Direct { url: endpoint.clone(), state: ChannelState::Active }],
+        checkpoint_period: 20,
+        anchor_age: 86_400,
+    };
+    Ingest::genesis(&store, &config, &ledger, now).await.unwrap();
+    let hub = DirectHub::new(&endpoint);
+    let transport = Arc::new(Channels { pool: None, direct: vec![hub.clone()] });
+    let tools = Tools::find().expect("bb");
+    let mut ingest = Ingest::load(
+        store.clone(),
+        config,
+        transport,
+        Box::new(BbProofs::new(tools.bb.clone(), std::env::temp_dir())),
+        Box::new(Verifiers { zkpassport: None, rpc_url: None, allow_dev: true }),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let registry = RegistrySetup {
+        v: 1,
+        id: 1,
+        version: 1,
+        name: "test".into(),
+        eligibility: Eligibility { provider: "dev".into(), domain: "d".into(), scope: "s".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false },
+        validity: 3600,
+        depth: 20,
+    };
+    store.submit(EntryKind::Registry, &Body::Registry(registry).encode(), now).await.unwrap();
+    now += 30;
+    ingest.tick(now).await.unwrap().unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let app = direct::router(hub, tx, store.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    // A voter posts over HTTP; the ingest answers in the response.
+    let tag = ingest.tag().to_string();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(41);
+    let s = grumpkin::random_fr(&mut rng);
+    let body = client::register_body(1, &s, "alice", json!({"uid": "alice"}), now, &[0x44; 32]);
+    let ev = event(kinds::REGISTER, &tag, &body, now);
+    let again = event(kinds::REGISTER, &tag, &client::register_body(1, &grumpkin::random_fr(&mut rng), "alice", json!({"uid": "alice"}), now, &[0x45; 32]), now);
+    let (e1, e2, ep) = (ev.clone(), again.clone(), endpoint.clone());
+    let voter = tokio::spawn(async move {
+        let a = direct::post_direct(&ep, &e1, std::time::Duration::from_secs(30)).await.unwrap();
+        let b = direct::post_direct(&ep, &e2, std::time::Duration::from_secs(30)).await.unwrap();
+        (a, b)
+    });
+    for _ in 0..2 {
+        let inc = rx.recv().await.unwrap();
+        assert_eq!(inc.origin, endpoint);
+        ingest.handle(inc, now).await.unwrap();
+    }
+    let (a, b) = voter.await.unwrap();
+    let ingest_pk = hex::encode(isoloir_proto::sig::xonly(&[14u8; 32]));
+    assert!(a.verify() && a.pubkey == ingest_pk);
+    assert_eq!(decode_ack(a.content.as_bytes()).unwrap().outcome, Outcome::Accepted);
+    assert_eq!(decode_ack(b.content.as_bytes()).unwrap().reason, Some(isoloir_proto::Reason::UidUsed));
+    // After a dropped connection: the same ack by GET.
+    let got: Event = reqwest::get(format!("{endpoint}/v1/acks/{}", ev.id)).await.unwrap().json().await.unwrap();
+    assert_eq!(got, a);
+    assert_eq!(reqwest::get(format!("{endpoint}/v1/acks/{}", "00".repeat(32))).await.unwrap().status(), 404);
+    now += 30;
+    ingest.tick(now).await.unwrap().unwrap();
+    assert_eq!(ingest.state.registries[&1].tree.len(), 1);
 }

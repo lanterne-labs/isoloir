@@ -1,7 +1,7 @@
 //! The matrix of allowed polls (SPEC §8), the checks of a setup on its
 //! own, and the rules of setup succession (SPEC §13).
 
-use crate::body::{Decrypter, Encryption, KindSpec, LedgerSetup, PollSetup, Publish, RegistrySetup, RelayState, Revote};
+use crate::body::{Channel, ChannelState, Decrypter, Encryption, KindSpec, LedgerSetup, PollSetup, Publish, RegistrySetup, Revote};
 use crate::kinds::{self, Class};
 use isoloir_core::grumpkin;
 
@@ -31,11 +31,24 @@ pub fn check_ledger(l: &LedgerSetup) -> Result<(), String> {
     if l.origin.is_empty() || l.origin.contains(char::is_whitespace) || !l.origin.is_ascii() {
         return Err("origin: ASCII, no spaces".into());
     }
-    if l.relays.iter().filter(|r| r.state == RelayState::Active).count() < 1 {
-        return Err("at least one active relay".into());
+    if !l.channels.iter().any(Channel::is_active) {
+        return Err("at least one active channel".into());
     }
-    if l.relays.iter().any(|r| !(r.url.starts_with("wss://") || r.url.starts_with("ws://"))) {
-        return Err("relays are ws:// or wss:// URLs".into());
+    for c in &l.channels {
+        let u = c.url();
+        let local = |rest: &str| rest.starts_with("127.0.0.1") || rest.starts_with("localhost") || rest.starts_with("[::1]");
+        let ok = match c {
+            Channel::Nostr { .. } => u.starts_with("wss://") || u.strip_prefix("ws://").is_some_and(local),
+            Channel::Direct { .. } => u.starts_with("https://") || u.strip_prefix("http://").is_some_and(local),
+        };
+        if !ok || u.ends_with('/') {
+            return Err(format!("channel {u}: nostr is wss://, direct https:// (ws:// and http:// on this machine only), no trailing slash"));
+        }
+    }
+    let mut urls: Vec<&str> = l.channels.iter().map(Channel::url).collect();
+    urls.sort();
+    if urls.windows(2).any(|w| w[0] == w[1]) {
+        return Err("a channel listed twice".into());
     }
     if l.checkpoint_period == 0 || l.anchor_age < l.checkpoint_period {
         return Err("checkpoint_period > 0, anchor_age ≥ checkpoint_period".into());
@@ -150,13 +163,14 @@ pub fn ledger_successor(old: &LedgerSetup, new: &LedgerSetup) -> Result<(), Stri
     if new.origin != old.origin || new.log_key != old.log_key {
         return Err("origin and log_key never change".into());
     }
-    // Relays: kept in order, retired ones stay retired; new ones appended.
-    if new.relays.len() < old.relays.len() {
-        return Err("relays are never removed, only retired".into());
+    // Channels: kept in order, retired ones stay retired; new ones appended.
+    if new.channels.len() < old.channels.len() {
+        return Err("channels are never removed, only retired".into());
     }
-    for (o, n) in old.relays.iter().zip(&new.relays) {
-        if o.url != n.url || (o.state == RelayState::Retired && n.state == RelayState::Active) {
-            return Err("relays keep their place, and a retired relay stays retired".into());
+    for (o, n) in old.channels.iter().zip(&new.channels) {
+        let same = std::mem::discriminant(o) == std::mem::discriminant(n) && o.url() == n.url();
+        if !same || (o.state() == ChannelState::Retired && n.state() == ChannelState::Active) {
+            return Err("channels keep their place and type, and a retired channel stays retired".into());
         }
     }
     Ok(())

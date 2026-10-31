@@ -2,6 +2,7 @@
 //! mirror), the trustee (replay → decrypt → tally), their storage and
 //! their sources of the log.
 
+pub mod direct;
 pub mod eligibility;
 pub mod ingest;
 pub mod mirror;
