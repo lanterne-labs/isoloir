@@ -100,10 +100,14 @@ enum Cmd {
         #[arg(long)]
         mirror: Option<String>,
         #[arg(long)]
-        log_key: String,
-        /// The decrypter's keys (keygen decrypter); absent: tlock polls only.
+        log_key: Option<String>,
+        /// The decrypter's keys (keygen decrypter), or ISOLOIR_DECRYPTER_KEYS
+        /// (the file's JSON); absent: tlock polls only.
         #[arg(long)]
         keys: Option<PathBuf>,
+        /// The ledger's log key (its verifier string), pinned.
+        #[arg(long, env = "ISOLOIR_LOG_KEY")]
+        log_key_env: Option<String>,
         /// A drand HTTP API, for tlock polls.
         #[arg(long, default_value = "https://api.drand.sh")]
         drand: String,
@@ -402,7 +406,8 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Trustee { mirror, log_key, keys, drand, circuits, zkverifier, node, rpc_url, db, nostr_key, every, once } => {
+        Cmd::Trustee { mirror, log_key, log_key_env, keys, drand, circuits, zkverifier, node, rpc_url, db, nostr_key, every, once } => {
+            let log_key = log_key.or(log_key_env).context("--log-key or ISOLOIR_LOG_KEY: the ledger's log key, pinned")?;
             let bb = Tools::find_bb()?;
             let vk_dir = match (circuits, &mirror) {
                 (Some(c), _) => c,
@@ -416,9 +421,14 @@ async fn main() -> Result<()> {
                     dir.join("circuits")
                 }
             };
-            let keys = match keys {
-                Some(p) => {
-                    let k: DecrypterKeys = serde_json::from_slice(&std::fs::read(p)?)?;
+            let keys_json = match (keys, std::env::var("ISOLOIR_DECRYPTER_KEYS").ok()) {
+                (Some(p), _) => Some(std::fs::read(p)?),
+                (None, Some(j)) => Some(j.into_bytes()),
+                (None, None) => None,
+            };
+            let keys = match keys_json {
+                Some(bytes) => {
+                    let k: DecrypterKeys = serde_json::from_slice(&bytes)?;
                     let (sk, sign_seed) = k.secrets().map_err(|e| anyhow::anyhow!(e))?;
                     Some(Keys { pk: k.pk, sk, sign_seed })
                 }
