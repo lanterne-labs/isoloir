@@ -15,7 +15,7 @@ import type { Channel, LedgerSetup, NostrEvent, PollSetup, RegistrySetup } from 
 export interface DevWasm extends IsoloirWasm {
 	dev_verifier(seed: string, origin: string): string;
 	dev_sign_checkpoint(seed: string, checkpoint: string): string;
-	dev_decrypter(seed: string): string;
+	dev_authority(seed: string): string;
 	dev_ed25519_public(seed: string): string;
 	dev_build_tally(req: string): string;
 	dev_log_proof(entries: string, i: number, n: number): string;
@@ -140,7 +140,7 @@ interface Pending {
 
 const SHARD = 1024;
 
-export interface Decrypter {
+export interface Authority {
 	sk: string;
 	pk: string;
 	sign_seed: string;
@@ -152,7 +152,7 @@ export class FakeIngest {
 	readonly pubkey = core.regPubkey(this.secret);
 	readonly logSeed = '22'.repeat(32);
 	readonly verifier = wasm.dev_verifier(this.logSeed, ORIGIN);
-	readonly decrypter = JSON.parse(wasm.dev_decrypter('33'.repeat(32))) as Decrypter;
+	readonly authority = JSON.parse(wasm.dev_authority('33'.repeat(32))) as Authority;
 	readonly ledger: LedgerSetup;
 	readonly registry: RegistrySetup;
 	readonly polls: PollSetup[];
@@ -194,7 +194,7 @@ export class FakeIngest {
 	) {
 		this.ledger = { v: 1, version: 1, origin: ORIGIN, log_key: this.verifier, ingest: this.pubkey, channels, checkpoint_period: 20, anchor_age: 86400 };
 		this.registry = { v: 1, id: 1, version: 1, name: 'Test', eligibility: { provider: 'dev', domain: 'vote.test', scope: 'isoloir/registry/1' }, validity: 3600, depth: 20 };
-		const elgamal = { mode: 'elgamal' as const, pk: this.decrypter.pk, decrypter: { type: 'single' as const, sign_key: this.decrypter.sign_key } };
+		const elgamal = { mode: 'elgamal' as const, pk: this.authority.pk, authority: { type: 'single' as const, sign_key: this.authority.sign_key } };
 		const base = { v: 1 as const, version: 1, registry: 1, title: 'Q', kind: { type: 'choice' as const, options: ['Oui', 'Non'], blank: true }, encryption: elgamal, publish: { mode: 'open' as const, k_real: 1, min_gap: 0, coin: false }, opens: 0, closes: 4_000_000_000 };
 		this.polls = [
 			{ ...base, id: 7, revote: 'linked', circuit: { name: 'choice4_single_linked_d20', vk_hash: '0x' + '0'.repeat(64) } },
@@ -390,14 +390,14 @@ export class FakeIngest {
 		for (let k = 0; k * SHARD < Math.max(leaves.length, 1); k++) this.mirror.put(`${dir}/${k}.json`, leaves.slice(k * SHARD, (k + 1) * SHARD));
 	}
 
-	/** The decrypter's tally of a poll over its counted ballots, on the mirror. */
+	/** The authority's tally of a poll over its counted ballots, on the mirror. */
 	tally(pollId: number): string {
 		const ballots = [...(this.counted.get(pollId)?.values() ?? [])];
-		const req = { poll: this.poll(pollId), upto: this.seq - 1, checkpoint: this.index, final: false, ballots, sk: this.decrypter.sk, sign_seed: this.decrypter.sign_seed, seed: '44'.repeat(32) };
+		const req = { poll: this.poll(pollId), upto: this.seq - 1, checkpoint: this.index, final: false, ballots, sk: this.authority.sk, sign_seed: this.authority.sign_seed, seed: '44'.repeat(32) };
 		return this.logTally(pollId, wasm.dev_build_tally(JSON.stringify(req)));
 	}
 
-	/** Logs a tally body as it is (a decrypter's, or a forged one) and mirrors it with its proof. */
+	/** Logs a tally body as it is (an authority's, or a forged one) and mirrors it with its proof. */
 	logTally(pollId: number, body: string): string {
 		const seq = this.seq;
 		// Logged, then mirrored with its proof (crates/server/src/mirror.rs).

@@ -246,7 +246,7 @@ pub enum KindSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Encryption {
-    Elgamal { pk: String, decrypter: Decrypter },
+    Elgamal { pk: String, authority: Authority },
     Tlock { chain: String, public_key: String, period: u64, genesis: u64, round: u64 },
 }
 
@@ -254,7 +254,7 @@ pub enum Encryption {
 /// version of the body (SPEC §9.4).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Decrypter {
+pub enum Authority {
     Single { sign_key: String },
 }
 
@@ -381,11 +381,11 @@ pub struct Tally {
     pub sig: Option<String>,
 }
 
-/// One trustee's decryption shares, one per chunk, with their proofs.
+/// One authority's decryption shares, one per chunk, with their proofs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Share {
-    pub trustee: u32,
+    pub authority: u32,
     pub d: Vec<String>,
     pub proofs: Vec<[String; 2]>,
 }

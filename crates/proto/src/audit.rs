@@ -1,6 +1,6 @@
 //! The audit (SPEC §16): the log replayed checkpoint by checkpoint
-//! through the same state machine and judge as the ingest. The trustee
-//! replays the same way before it decrypts anything: a decrypter only
+//! through the same state machine and judge as the ingest. The authority
+//! replays the same way before it decrypts anything: an authority only
 //! decrypts aggregates of ballots it verified itself.
 
 use crate::body::{self, Body, EntryKind, Publish};

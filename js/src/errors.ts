@@ -13,10 +13,12 @@ export type IngestReason =
 	| 'stale_date'
 	| 'uid_used'
 	| 'id_used'
+	| 'full'
 	| 'bad_proof'
 	| 'old_root'
 	| 'revote_off'
 	| 'stale_seq'
+	| 'seq_gap'
 	| 'duplicate'
 	| 'not_due'
 	| 'bad_tally'
@@ -91,7 +93,7 @@ export function toIsoloirError(e: unknown, fallback: IsoloirErrorCode = 'unknown
 	return new IsoloirError(fallback, msg);
 }
 
-const REASONS: readonly string[] = ['malformed', 'version', 'unknown', 'not_open', 'closed', 'bad_sig', 'stale_date', 'uid_used', 'id_used', 'bad_proof', 'old_root', 'revote_off', 'stale_seq', 'duplicate', 'not_due', 'bad_tally', 'bad_setup', 'rejected'];
+const REASONS: readonly string[] = ['malformed', 'version', 'unknown', 'not_open', 'closed', 'bad_sig', 'stale_date', 'uid_used', 'id_used', 'full', 'bad_proof', 'old_root', 'revote_off', 'stale_seq', 'seq_gap', 'duplicate', 'not_due', 'bad_tally', 'bad_setup', 'rejected'];
 
 /** An ack's reason as a code (an unknown one is 'rejected'). */
 export function reasonOf(r: string | undefined): IngestReason {

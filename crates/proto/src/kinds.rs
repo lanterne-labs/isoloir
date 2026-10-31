@@ -35,7 +35,7 @@ pub enum Enc {
 /// them (SPEC §7.1): the one place that says so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// ElGamal, one decrypter: it may open each ballot, so the densest
+    /// ElGamal, one authority: it may open each ballot, so the densest
     /// packing (seven values per chunk, the most 32-bit digits below r).
     Single,
     /// ElGamal, decrypted by aggregate only (a threshold committee, a
@@ -72,7 +72,7 @@ impl Mode {
     /// The mode of a poll's encryption.
     pub fn of(e: &Encryption) -> Mode {
         match e {
-            Encryption::Elgamal { decrypter: crate::body::Decrypter::Single { .. }, .. } => Mode::Single,
+            Encryption::Elgamal { authority: crate::body::Authority::Single { .. }, .. } => Mode::Single,
             Encryption::Tlock { .. } => Mode::Tlock,
         }
     }

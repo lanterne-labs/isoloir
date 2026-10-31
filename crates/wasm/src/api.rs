@@ -622,7 +622,7 @@ pub(crate) fn tally_of(text: &str) -> R<Tally> {
     }
 }
 
-/// Verifies a tally from itself (SPEC §10.3): for ElGamal, the decrypter's
+/// Verifies a tally from itself (SPEC §10.3): for ElGamal, the authority's
 /// signature, the shares' proofs and the values against the aggregates the
 /// tally names (the auditor checks that they are the log's); for tlock,
 /// the beacon (the openings need the log). Returns `{ok, checked, error,

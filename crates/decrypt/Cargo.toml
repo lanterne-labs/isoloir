@@ -1,6 +1,6 @@
 [package]
 name = "isoloir-decrypt"
-description = "isoloir decryption: drand time-lock (seal, open, beacon checks) and the single decrypter's keys"
+description = "isoloir decryption: drand time-lock (seal, open, beacon checks) and the single authority's keys"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

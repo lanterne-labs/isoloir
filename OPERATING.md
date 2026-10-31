@@ -2,7 +2,7 @@
 
 The order of operations to put a ledger in production. Three roles, three
 places: the **ingest** (a server with Postgres; it holds the log key and
-the Nostr key), the **decrypter** (a machine with no inbound access; it
+the Nostr key), the **authority** (a machine with no inbound access; it
 holds a decryption key), the **operator** (submits setups; any machine
 with access to the ingest's database).
 
@@ -11,11 +11,11 @@ with access to the ingest's database).
 ```sh
 isoloir keygen log --origin vote.example/isoloir   # ingest: ISOLOIR_LOG_SEED; the log_key goes in the ledger
 isoloir keygen nostr                               # ingest: ISOLOIR_NOSTR_KEY; the public key goes in the ledger
-isoloir keygen decrypter --out /secure/dec.json    # decrypter: back it up offline; pk and sign_key go in polls
+isoloir keygen authority --out /secure/dec.json    # authority: back it up offline; pk and sign_key go in polls
 ```
 
 The log seed never changes for the life of the ledger (every reader pins
-the log key). A decrypter's key may serve many polls.
+the log key). An authority's key may serve many polls.
 
 ## 2. Circuits
 
@@ -76,10 +76,10 @@ by default. At start it replays the log, brings the mirror up to date,
 and reads the relays from its saved cursors. It checkpoints when the
 log grew, and at least every 10 minutes.
 
-## 5. The trustee
+## 5. The authority
 
 ```sh
-isoloir trustee --mirror https://cdn.example/ledger --circuits ./circuits-vk \
+isoloir authority --mirror https://cdn.example/ledger --circuits ./circuits-vk \
   --zkverifier ./zkverifier/verify.mjs --log-key "<log_key>" \
   --keys /secure/dec.json --nostr-key <a Nostr key>
 ```
@@ -90,7 +90,7 @@ says it is due; it retries a transient failure and stops for good on a
 log that does not verify. `--circuits` points at verification keys you
 built yourself (`isoloir circuits … --mirror ./circuits-vk`), so that a
 mirror cannot hand you a different circuit. For tlock polls no key is
-needed: any trustee (or anyone) opens them at the round with
+needed: any authority (or anyone) opens them at the round with
 `--drand https://api.drand.sh`.
 
 ## 6. Checks

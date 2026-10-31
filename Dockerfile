@@ -1,4 +1,4 @@
-# The isoloir ingest (and trustee, audit): the binary, bb to verify
+# The isoloir ingest (and authority, audit): the binary, bb to verify
 # proofs, node for the ZKPassport verifier, git and ssh for the mirror.
 FROM rust:1.90-bookworm AS build
 WORKDIR /src

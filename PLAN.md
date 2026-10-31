@@ -18,7 +18,7 @@ An isoloir is the voting booth: the curtain you vote behind, unseen.
   (the K_REAL rule and the random delay of v2). **Closed**: one result, at
   the close, nothing before.
 - Decryption behind one trait, three implementations: a **single
-  decrypter** (now), **drand** time-lock for closed polls (now, see §5 for
+  authority** (now), **drand** time-lock for closed polls (now, see §5 for
   what it does and does not enforce), **threshold** committee (later: the
   trait and the log entries are shaped for it from day one).
 - A committee key that does not depend on the poll: one key, reused across
@@ -72,10 +72,10 @@ over the body). None of these know what a ballot says.
 4. **Decryption entries.** A `partial` entry: a decryption share of an
    aggregate with a DLEQ proof whose challenge includes the poll
    identifier and the checkpoint it is computed at. A `tally` entry is the
-   combination of `t` partials (the identity for a single decrypter). The
+   combination of `t` partials (the identity for a single authority). The
    browser and the auditor verify partials and combination alike. For
    tlock polls the entries differ (§5).
-5. **Decrypt only what the log justifies.** A trustee computes the
+5. **Decrypt only what the log justifies.** An authority computes the
    aggregate itself from the poll's logged ballots at a checkpoint; it is
    never handed a ciphertext. The committee key is reusable because of
    this rule and of the domain-separated DLEQ.
@@ -96,7 +96,7 @@ over the body). None of these know what a ballot says.
    the disclosure rule of §5 is unchanged. Cost: a second depth-20 Merkle
    proof and the old ciphertext's recomputation in the circuit.
 7. **Deterministic policy.** When to decrypt is a function of the log, so
-   several trustees agree without talking: at the first checkpoint after
+   several authorities agree without talking: at the first checkpoint after
    the close (closed polls); for open polls, the K_REAL rule with the
    delay drawn from the checkpoint hash instead of a private coin.
 
@@ -106,7 +106,7 @@ over the body). None of these know what a ballot says.
 |---|---|---|---|
 | `single` | the key holder | the key holder | M2 |
 | `tlock` | nobody (drand) | nobody: anyone with the drand round finishes the tally | M4 |
-| `threshold` | any `t` of `n` trustees | any `t` of `n` | later |
+| `threshold` | any `t` of `n` authorities | any `t` of `n` | later |
 
 **`tlock`, honestly.** Time-lock encryption is identity-based encryption on
 BLS12-381 against a future drand round. Our proofs are on BN254; doing
@@ -182,20 +182,20 @@ per voter and the sequence rule, as v2); **delta** (§4.6).
   (`c = H(values, salt)` as a public input next to `H(blob)`) so a
   correction can be proven against the previous ballot.
 - Not prohibitions, but to be said in a poll's page: with a single
-  decrypter, "closed" means the public cannot read before the close, the
+  authority, "closed" means the public cannot read before the close, the
   key holder can; threshold spreads that; only tlock removes it. Linked
   re-votes show the log when and how often a voter changed their mind, in
   every mode; delta mode hides it.
 
 `Setup::validate` refuses a forbidden cell; the auditor checks the logged
 setup against the matrix too. The presidential pre-poll is "single
-decrypter, open, multiple choices, linked": allowed.
+authority, open, multiple choices, linked": allowed.
 
 **`single`** is the v2 tallier: one process with the key, partial = full
 decryption, DLEQ proof, Ed25519 signature on the entry.
 
 **`threshold`** reuses everything above with `n > 1`: a Pedersen DKG run
-over the log (shares encrypted to each trustee's key, complaints as
+over the log (shares encrypted to each authority's key, complaints as
 entries, the auditor replays it) or a trusted dealer, and Lagrange
 combination of partials. Not built now; the `Decryptor` trait, the
 `partial` entry and the setup fields are shaped so that it adds code
@@ -229,7 +229,7 @@ isoloir/
     ingest/      the server: verify (bb subprocess, ZKPassport sidecar),
                  ack, checkpoint in one transaction, mirror (git2), stamps
                  (rust-opentimestamps), close snapshot.
-    trustee/     watches the log, applies the policy, posts partials
+    authority/     watches the log, applies the policy, posts partials
                  (single now; threshold later). Read access and a relay
                  only: no inbound port, no database credentials.
     audit/       the verifier: everything in SPEC §12 against the API,
@@ -240,7 +240,7 @@ isoloir/
   js/            `@isoloir/web`: the session (registration, mailbox,
                  checkpoints, receipts, link, key) in TypeScript over the
                  wasm core, framework-free. Pages stay in each project.
-  cmd/isoloir    one binary: setup, keygen, ingest, trustee, audit,
+  cmd/isoloir    one binary: setup, keygen, ingest, authority, audit,
                  archive, nostr-key, relays probe.
 ```
 
@@ -264,8 +264,8 @@ Each milestone ends with its tests green, a tag, and a line in CHANGES.md.
   `kinds` encoders and decoders; vectors from `nargo test`. Exit: a ballot
   made in the browser (`bb.js`) verifies with `bb` through `ingest`'s
   verifier for both kinds.
-- **M2 — the server path, single decrypter** (2–3 weeks). `store`,
-  `relays`, `ingest`, `trustee` (single), `policy` open and closed,
+- **M2 — the server path, single authority** (2–3 weeks). `store`,
+  `relays`, `ingest`, `authority` (single), `policy` open and closed,
   `audit`, the CLI. Exit: the v2 local trial replayed on v3 end to end
   with a yesno poll and a ranked poll: register, vote, re-vote, receipt,
   complaint, tally, close snapshot, audit exit 0; the two-instance,
@@ -274,7 +274,7 @@ Each milestone ends with its tests green, a tag, and a line in CHANGES.md.
   minimal demo page for yesno. Exit: the Playwright flows of v2 (one
   voter, two devices with the code, complaint page) pass on the demo.
 - **M4 — tlock for closed polls** (1–2 weeks). The commitment variant of
-  §5, the drand client, the close-time opening in `audit` and `trustee`,
+  §5, the drand client, the close-time opening in `audit` and `authority`,
   the disclosure refusal. The in-circuit spike, time-boxed to two days,
   with its number in the spec. Exit: a closed yesno poll whose result
   nobody could compute before the round and anyone can after.
@@ -283,7 +283,7 @@ Each milestone ends with its tests green, a tag, and a line in CHANGES.md.
   this repo (no change in `mirror`), the results decoding identical to Go
   (compared on the v2 local log). Exit: a v3 trial of the presidential
   ballot with the same UX flows.
-- **M6 — threshold** (later). DKG over the log, `n > 1` trustees, the
+- **M6 — threshold** (later). DKG over the log, `n > 1` authorities, the
   combiner, the audit of the ceremony.
 
 Rough total for M0–M5: eight to ten weeks of focused work, half in `core`
@@ -320,8 +320,8 @@ Postgres):
 - M0, M1: the core, the circuits (choice, ranked, ranked with margins;
   ElGamal and tlock; linked and delta), the protocol crate, real proofs
   end to end for every family and mode.
-- M2: Postgres storage with migrations, the ingest, the trustee (single
-  decrypter, tlock opener), the mirror (directory or git), the relay
+- M2: Postgres storage with migrations, the ingest, the authority (single
+  authority, tlock opener), the mirror (directory or git), the relay
   pool, OpenTimestamps, the audit (log, proofs, tallies, refusals, the
   relays' withholding), the command.
 - M4: tlock for closed single-choice polls with one ballot per voter.
@@ -342,7 +342,7 @@ the mirror carry inclusion proofs; an audit that cannot check a proof
 fails; refusals keep their body; the ingest heartbeats and rounds ack
 times; k_real only rises; seq gaps and full trees are refused; tlock
 re-votes are forbidden; bb and ZKPassport failures defer instead of
-refusing; the trustee verifies passports and retries; channels follow
+refusing; the authority verifies passports and retries; channels follow
 the ledger's current version; the mirror clones itself; the spec's §17
 says what each party learns, including the mirror host, the network and
 whoever holds the secret. Left as documented limits: an open poll with a
@@ -352,7 +352,7 @@ network observer links address to relay (Tor); the whole log in memory
 (fine to about 100k voters).
 
 Circuits are named after their decryption mode (`single`, `tlock`;
-`threshold` later), which decides the packing: a single decrypter opens
+`threshold` later), which decides the packing: a single authority opens
 each ballot, so seven values per chunk and a third of the gates for a
 ranked ballot with margins; aggregate-only decryption, two per chunk. No
 poll setting for it (2026-10-31, the owner: optimize per decryption
@@ -367,7 +367,7 @@ Open:
 - M5: the presidential instance (a ranked poll of tartuffe's candidates)
   and its UI live in tartuffe's repository, on top of `@isoloir/web`.
 - M6: threshold decryption (the share format and the combination are in
-  place; the DKG and n > 1 trustees are not).
+  place; the DKG and n > 1 authorities are not).
 - The Dockerfile is untested (no Docker on the build machine); the
-  trustee reads verification keys from a local mirror copy; the ingest
+  authority reads verification keys from a local mirror copy; the ingest
   reads the ledger's relays at start only.

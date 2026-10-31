@@ -3,7 +3,7 @@
 //! A value is a small signed integer, `|v| ≤ OFFSET`; it is written as the
 //! digit `v + OFFSET ≥ 0`, P digits per chunk: `chunk = Σ d_k·2^(32k)`.
 //! P is 2 where the aggregate is decrypted (threshold decryption: a
-//! two-digit discrete logarithm), 7 where a single decrypter opens each
+//! two-digit discrete logarithm), 7 where a single authority opens each
 //! ballot (a ballot's digits are in [0, 2·OFFSET]: one table lookup).
 //! Plaintexts are non-negative integers below r and q, so that sums of
 //! ciphertexts are sums of values. A sum over N ballots has digits

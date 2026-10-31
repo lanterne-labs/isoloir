@@ -276,8 +276,8 @@ mod bind {
         }
 
         #[wasm_bindgen]
-        pub fn dev_decrypter(seed: &str) -> Out {
-            js(dev::decrypter(seed))
+        pub fn dev_authority(seed: &str) -> Out {
+            js(dev::authority(seed))
         }
 
         #[wasm_bindgen]

@@ -12,11 +12,11 @@ fn v(s: &str) -> Value {
 const S: &str = "0x0000000000000000000000000000000000000000000000000000000000001234";
 
 fn elgamal_poll(revote: &str, circuit: &str, ballot_depth: Option<u32>) -> (Value, Value) {
-    let keys = isoloir_decrypt::keys::DecrypterKeys::generate(&mut <rand_chacha::ChaCha20Rng as rand_core::SeedableRng>::from_seed([9; 32]));
+    let keys = isoloir_decrypt::keys::AuthorityKeys::generate(&mut <rand_chacha::ChaCha20Rng as rand_core::SeedableRng>::from_seed([9; 32]));
     let mut p = json!({
         "v": 1, "id": 7, "version": 1, "registry": 1, "title": "t",
         "kind": {"type": "choice", "options": ["Oui", "Non"], "blank": true},
-        "encryption": {"mode": "elgamal", "pk": keys.pk, "decrypter": {"type": "single", "sign_key": keys.sign_key}},
+        "encryption": {"mode": "elgamal", "pk": keys.pk, "authority": {"type": "single", "sign_key": keys.sign_key}},
         "publish": {"mode": "closed"}, "revote": revote, "opens": 0, "closes": 2_000_000_000u64,
         "circuit": {"name": circuit, "vk_hash": format!("0x{}", "0".repeat(64))},
     });
@@ -134,7 +134,7 @@ fn a_linked_ballot_and_its_tally() {
         assert!(api::decode_body("ballot", &body).is_ok());
         let pi: Vec<String> = serde_json::from_str(&api::public_inputs(&body, &poll.to_string()).unwrap()).unwrap();
         // registry, poll, setup, mask, root, nullifier, seq, pk.x, pk.y, 1 chunk × 4
-        // (a single decrypter: seven values per chunk).
+        // (a single authority: seven values per chunk).
         assert_eq!(pi.len(), 4 + 1 + 2 + 2 + 4);
         bodies.push(body);
     }
@@ -216,7 +216,7 @@ fn ranked_results() {
     let poll = json!({
         "v": 1, "id": 9, "version": 1, "registry": 1, "title": "t",
         "kind": {"type": "ranked", "options": ["a", "b"], "blank": true, "depth": 3, "margins": true},
-        "encryption": {"mode": "elgamal", "pk": "0x00", "decrypter": {"type": "single", "sign_key": "00"}},
+        "encryption": {"mode": "elgamal", "pk": "0x00", "authority": {"type": "single", "sign_key": "00"}},
         "publish": {"mode": "closed"}, "revote": "linked", "opens": 0, "closes": 1,
         "circuit": {"name": "rankedm12_single_linked_d20", "vk_hash": "0x00"},
     })

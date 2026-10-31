@@ -52,7 +52,7 @@ export type KindSpec =
 	| { type: 'ranked'; options: string[]; blank: boolean; depth: number; margins: boolean };
 
 export type Encryption =
-	| { mode: 'elgamal'; pk: Hex; decrypter: { type: 'single'; sign_key: string } }
+	| { mode: 'elgamal'; pk: Hex; authority: { type: 'single'; sign_key: string } }
 	| { mode: 'tlock'; chain: string; public_key: string; period: number; genesis: number; round: number };
 
 export type Publish = { mode: 'open'; k_real: number; min_gap: number; coin: boolean } | { mode: 'closed' };

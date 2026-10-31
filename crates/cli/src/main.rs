@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use isoloir_decrypt::keys::DecrypterKeys;
+use isoloir_decrypt::keys::AuthorityKeys;
 use isoloir_decrypt::tlock::DrandTlock;
 use isoloir_proto::audit::Auditor;
 use isoloir_proto::body::{self, Body, EntryKind};
@@ -16,7 +16,7 @@ use isoloir_server::direct::{self, DirectHub};
 use isoloir_server::relays::{self, Channels};
 use isoloir_server::source::{LogSource, MirrorSource};
 use isoloir_server::store::Store;
-use isoloir_server::trustee::{Keys, Output, Trustee};
+use isoloir_server::authority::{Keys, Output, Service};
 use isoloir_zk::{BbProofs, Circuits, Tools};
 use rand::RngCore;
 use std::path::PathBuf;
@@ -94,14 +94,14 @@ enum Cmd {
         #[arg(long)]
         listen: Option<std::net::SocketAddr>,
     },
-    /// Runs a trustee: verifies the log, publishes the tallies due.
-    Trustee {
+    /// Runs an authority: verifies the log, publishes the tallies due.
+    Authority {
         /// The log: a mirror directory or URL; absent, the ingest's database (--db).
         #[arg(long)]
         mirror: Option<String>,
         #[arg(long)]
         log_key: Option<String>,
-        /// The decrypter's keys (keygen decrypter), or ISOLOIR_DECRYPTER_KEYS
+        /// The authority's keys (keygen authority), or ISOLOIR_AUTHORITY_KEYS
         /// (the file's JSON); absent: tlock polls only.
         #[arg(long)]
         keys: Option<PathBuf>,
@@ -219,8 +219,8 @@ enum Keygen {
     /// A Nostr key (the ingest's): prints the secret and the public key;
     /// with ISOLOIR_NOSTR_KEY set, only the public key of that one.
     Nostr,
-    /// A decrypter's keys, written to a file; prints the public half.
-    Decrypter {
+    /// An authority's keys, written to a file; prints the public half.
+    Authority {
         #[arg(long)]
         out: PathBuf,
     },
@@ -279,11 +279,11 @@ async fn main() -> Result<()> {
             println!("ISOLOIR_NOSTR_KEY={}", hex::encode(s));
             println!("ingest: {}", hex::encode(isoloir_proto::sig::xonly(&s)));
         }
-        Cmd::Keygen(Keygen::Decrypter { out }) => {
+        Cmd::Keygen(Keygen::Authority { out }) => {
             if out.exists() {
-                bail!("{} exists: a decrypter's keys are never overwritten", out.display());
+                bail!("{} exists: an authority's keys are never overwritten", out.display());
             }
-            let k = DecrypterKeys::generate(&mut rand::rngs::OsRng);
+            let k = AuthorityKeys::generate(&mut rand::rngs::OsRng);
             std::fs::write(&out, serde_json::to_vec_pretty(&k)?)?;
             println!("{}", serde_json::to_string_pretty(&k.public())?);
         }
@@ -406,7 +406,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Trustee { mirror, log_key, log_key_env, keys, drand, circuits, zkverifier, node, rpc_url, db, nostr_key, every, once } => {
+        Cmd::Authority { mirror, log_key, log_key_env, keys, drand, circuits, zkverifier, node, rpc_url, db, nostr_key, every, once } => {
             let log_key = log_key.or(log_key_env).context("--log-key or ISOLOIR_LOG_KEY: the ledger's log key, pinned")?;
             let bb = Tools::find_bb()?;
             let vk_dir = match (circuits, &mirror) {
@@ -415,20 +415,20 @@ async fn main() -> Result<()> {
                 (None, _) => {
                     // A fresh clone of the mirror's repository: its circuits.
                     let git = std::env::var("ISOLOIR_MIRROR_GIT").map_err(|_| anyhow::anyhow!("--circuits, or ISOLOIR_MIRROR_GIT to clone them from"))?;
-                    let dir = std::env::temp_dir().join(format!("isoloir-trustee-{}", std::process::id()));
+                    let dir = std::env::temp_dir().join(format!("isoloir-authority-{}", std::process::id()));
                     let _ = std::fs::remove_dir_all(&dir);
                     Mirror { dir: dir.clone(), git: Some(git) }.prepare()?;
                     dir.join("circuits")
                 }
             };
-            let keys_json = match (keys, std::env::var("ISOLOIR_DECRYPTER_KEYS").ok()) {
+            let keys_json = match (keys, std::env::var("ISOLOIR_AUTHORITY_KEYS").ok()) {
                 (Some(p), _) => Some(std::fs::read(p)?),
                 (None, Some(j)) => Some(j.into_bytes()),
                 (None, None) => None,
             };
             let keys = match keys_json {
                 Some(bytes) => {
-                    let k: DecrypterKeys = serde_json::from_slice(&bytes)?;
+                    let k: AuthorityKeys = serde_json::from_slice(&bytes)?;
                     let (sk, sign_seed) = k.secrets().map_err(|e| anyhow::anyhow!(e))?;
                     Some(Keys { pk: k.pk, sk, sign_seed })
                 }
@@ -454,7 +454,7 @@ async fn main() -> Result<()> {
                 (None, Some(db)) => Box::new(Store::connect(db).await?),
                 (None, None) => bail!("--mirror or --db: where the log is read"),
             };
-            let mut t = Trustee::new(
+            let mut t = Service::new(
                 source,
                 Some(&log_key),
                 Box::new(BbProofs::new(bb, vk_dir)),
@@ -468,7 +468,7 @@ async fn main() -> Result<()> {
                     Ok(n) if n > 0 => tracing::info!(n, "tallies published"),
                     Ok(_) => {}
                     // The log does not verify: never decrypt past it.
-                    Err(e) if e.downcast_ref::<isoloir_server::trustee::LogFault>().is_some() => return Err(e),
+                    Err(e) if e.downcast_ref::<isoloir_server::authority::LogFault>().is_some() => return Err(e),
                     Err(e) => {
                         if once {
                             return Err(e);

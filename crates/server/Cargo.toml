@@ -1,6 +1,6 @@
 [package]
 name = "isoloir-server"
-description = "The isoloir services: the ingest, the trustee, the mirror, the storage, the passport verifier"
+description = "The isoloir services: the ingest, the authority, the mirror, the storage, the passport verifier"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

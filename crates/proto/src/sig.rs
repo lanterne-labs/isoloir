@@ -1,5 +1,5 @@
 //! Signatures in bodies: the registration key's BIP340 signature (SPEC
-//! §6), the decrypter's Ed25519 signature on a tally (SPEC §10.3), and
+//! §6), the authority's Ed25519 signature on a tally (SPEC §10.3), and
 //! Nostr events (SPEC §11.1), which the browser and the server both make
 //! and check.
 
@@ -57,7 +57,7 @@ pub fn xonly(sk: &[u8; 32]) -> [u8; 32] {
     SigningKey::from_bytes(sk).expect("a secp256k1 secret").verifying_key().to_bytes().into()
 }
 
-/// Signs a tally body (without `sig`) with the decrypter's Ed25519 seed.
+/// Signs a tally body (without `sig`) with the authority's Ed25519 seed.
 pub fn sign_tally(seed: &[u8; 32], body_without_sig: &[u8]) -> String {
     use ed25519_dalek::Signer;
     let k = ed25519_dalek::SigningKey::from_bytes(seed);
@@ -69,7 +69,7 @@ pub fn ed25519_public(seed: &[u8; 32]) -> String {
     hex::encode(ed25519_dalek::SigningKey::from_bytes(seed).verifying_key().to_bytes())
 }
 
-/// Checks a tally body's `sig` under the decrypter's key.
+/// Checks a tally body's `sig` under the authority's key.
 pub fn verify_tally(sign_key: &str, body: &[u8]) -> Result<(), String> {
     use ed25519_dalek::Verifier;
     let pk: [u8; 32] = hex::decode(sign_key).ok().and_then(|b| b.try_into().ok()).ok_or("sign_key")?;

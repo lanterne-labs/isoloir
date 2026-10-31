@@ -1,4 +1,4 @@
-//! Tallies (SPEC §10.3, §10.4): built by a decrypter, verified by the
+//! Tallies (SPEC §10.3, §10.4): built by an authority, verified by the
 //! ingest before it logs one and by every auditor and browser after.
 
 use crate::body::{Beacon, Encryption, Share, Tally, V1};
@@ -79,7 +79,7 @@ pub fn decrypt_sums(variant: &kinds::Variant, ballots: &[&[Ciphertext]], agg: &[
     Ok(sums)
 }
 
-/// Builds the tally a single decrypter publishes: decryption shares with
+/// Builds the tally a single authority publishes: decryption shares with
 /// their proofs, the values found by discrete logarithm, the signature.
 pub fn build_elgamal<R: RngCore + CryptoRng>(
     poll: &PollState,
@@ -92,7 +92,7 @@ pub fn build_elgamal<R: RngCore + CryptoRng>(
     let counted = poll.counted(due.upto);
     let n = counted.len() as u64;
     let mut values = vec![0i64; variant.values()];
-    let mut share = Share { trustee: 1, d: vec![], proofs: vec![] };
+    let mut share = Share { authority: 1, d: vec![], proofs: vec![] };
     let agg = if n > 0 { aggregate(&counted, variant.chunks()) } else { vec![] };
     if n > 0 {
         let cts: Vec<&[Ciphertext]> = counted.iter().map(|b| b.ct.as_slice()).collect();
@@ -153,8 +153,8 @@ pub fn verify_elgamal(poll: &PollState, t: &Tally, body: &[u8], due: &Due) -> Re
 /// the aggregates from the tally itself; the auditor and the ingest with
 /// the aggregates they recomputed from the log.
 pub fn verify_shares(encryption: &Encryption, t: &Tally, body: &[u8], n_values: usize, chunks: usize, per: usize, agg: &[(Point, Point)]) -> Result<(), String> {
-    let Encryption::Elgamal { pk, decrypter, .. } = encryption else { return Err("not an ElGamal poll".into()) };
-    let crate::body::Decrypter::Single { sign_key } = decrypter;
+    let Encryption::Elgamal { pk, authority, .. } = encryption else { return Err("not an ElGamal poll".into()) };
+    let crate::body::Authority::Single { sign_key } = authority;
     sig::verify_tally(sign_key, body)?;
     let pk = grumpkin::from_hex(pk).map_err(|e| e.to_string())?;
     let n = t.counted;
@@ -168,8 +168,8 @@ pub fn verify_shares(encryption: &Encryption, t: &Tally, body: &[u8], n_values: 
     if agg.len() != chunks {
         return Err("one aggregate per chunk".into());
     }
-    let [share] = shares.as_slice() else { return Err("one share: a single decrypter".into()) };
-    if share.trustee != 1 || share.d.len() != chunks || share.proofs.len() != chunks {
+    let [share] = shares.as_slice() else { return Err("one share: a single authority".into()) };
+    if share.authority != 1 || share.d.len() != chunks || share.proofs.len() != chunks {
         return Err("the share's shape".into());
     }
     let sums = digit_sums(&t.values, n, chunks, per)?;

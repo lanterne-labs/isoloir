@@ -28,7 +28,7 @@ passport certificate registry, drand only as a time-lock beacon.
 |---|---|---|
 | Voter (browser) | the voter secret `s` | registers, votes, checks receipts |
 | Ingest (server) | the ledger's log key, its Nostr key | verifies and logs, acknowledges, checkpoints, mirrors |
-| Decrypter (`trustee`) | a poll's decryption key, or nothing (tlock) | publishes decryptions when the poll's rule says so |
+| Authority (`authority`) | a poll's decryption key, or nothing (tlock) | publishes decryptions when the poll's rule says so |
 | Channels | nothing | carry messages; a relay sees who posts what, from which address (a direct channel: the operator does) |
 | Auditor | nothing | recomputes everything from the log, the relays, the mirror |
 
@@ -55,7 +55,7 @@ relay does.
   `m ∈ F` with randomness `ρ` is `(ρ·G, m·G + ρ·PK)`. Additively
   homomorphic per component.
 - **SHA-256** for bodies, the log and Fiat–Shamir challenges outside
-  circuits; **Ed25519** for the log key and decrypter signatures;
+  circuits; **Ed25519** for the log key and authority signatures;
   **BIP340 Schnorr on secp256k1** for registration keys and Nostr events.
 - **Encodings** (all lower-case hex, `0x`-prefixed where a field or point):
   - a field element: `0x` + 64 hex digits, value < r;
@@ -231,7 +231,7 @@ slots must be empty.
 correction of a margin goes from −1 to +1). Each is written as the digit
 `v + 2`, and digits go P per **chunk**: `chunk = Σ d_k·2^(32k)`. P
 follows from how the poll is decrypted, never from a setting: a single
-decrypter may open each ballot (its digits are in [0, 4]: one table
+authority may open each ballot (its digits are in [0, 4]: one table
 lookup), sums the digits and proves the aggregate decrypts to the sums,
 so P = 7, the most 32-bit digits below r, and a phone proves three to
 four times fewer ciphertexts; a decryption by aggregate only (a
@@ -250,7 +250,7 @@ reused for each candidate of the other.
 
 ### 7.2 Encryption
 
-- **`elgamal`**: `{"mode":"elgamal","pk":"<point>","decrypter":
+- **`elgamal`**: `{"mode":"elgamal","pk":"<point>","authority":
   {"type":"single","sign_key":"<Ed25519 public key hex>"}}`. Each chunk
   is encrypted under `pk` with its own randomness:
   `(ρ_j·G, chunk_j·G + ρ_j·PK)`. One key per committee, independent of
@@ -321,7 +321,7 @@ reused for each candidate of the other.
   ballot per voter.
 
 A `poll` entry outside the matrix is refused by the ingest and reported
-by the auditor. With a single decrypter, "closed" means the public cannot
+by the auditor. With a single authority, "closed" means the public cannot
 read before the close: the key holder can. Threshold spreads that trust;
 tlock removes it.
 
@@ -376,7 +376,7 @@ pseudonym's last, `duplicate`); `blob` ≤ 4 KiB (tlock); the proof against
 the circuit of the setup with the public inputs rebuilt from the body,
 the setup and the poll (`bad_proof`).
 
-The committee key is reusable across polls because a decrypter only ever
+The committee key is reusable across polls because an authority only ever
 decrypts aggregates it recomputed from one poll's logged ballots, never
 a ciphertext it is handed, and because its proofs carry the poll and the
 log position in their challenge.
@@ -385,7 +385,7 @@ log position in their challenge.
 
 ### 10.1 When
 
-Deterministic over the log, so any decrypter and any auditor agree:
+Deterministic over the log, so any authority and any auditor agree:
 
 - `open`: at a checkpoint at time t, with `changed` the number of
   pseudonyms whose counted ballot changed since the last tally (delta:
@@ -419,7 +419,7 @@ component-wise sum of the counted ciphertexts' chunk j.
 {"v":1,"poll":7,"upto":4810,"checkpoint":233,"final":false,
  "values":[…counts…],"counted":2051,
  "aggregate":[["<A0>","<A1>"],…],
- "shares":[{"trustee":1,"d":["<point>",…],"proofs":[["<c>","<z>"],…]}],
+ "shares":[{"authority":1,"d":["<point>",…],"proofs":[["<c>","<z>"],…]}],
  "sig":"<Ed25519, hex>"}
 ```
 
@@ -432,10 +432,10 @@ For each chunk j with aggregate `(A0_j, A1_j)`: each share gives
 `log_G(PK_i) = log_{A0_j}(d_ij)`, with challenge
 `SHA-256("isoloir/1/dleq" ‖ poll ‖ upto ‖ j ‖ G ‖ PK_i ‖ A0_j ‖ d_ij ‖ a ‖ b) mod q`
 (points in their 32-byte encodings, integers as 8-byte big-endian). The
-decryption is `D_j = Σ λ_i·d_ij` (Lagrange at 0 over the trustees
-present; one trustee: `D_j = d_1j`), and the values must satisfy
+decryption is `D_j = Σ λ_i·d_ij` (Lagrange at 0 over the authorities
+present; one authority: `D_j = d_1j`), and the values must satisfy
 `A1_j − D_j = pack(values)_j·G`. `sig` signs `SHA-256("isoloir/1/tally\n"
-‖ canonical body without sig)` under the decrypter's `sign_key`.
+‖ canonical body without sig)` under the authority's `sign_key`.
 
 ### 10.4 The `tally` entry (tlock)
 
@@ -608,7 +608,7 @@ the entry's log position, its body as a string, the checkpoint whose
 note a reader verifies it against, that checkpoint's log size, and the
 RFC 6962 inclusion proof (hex hashes) of leaf `seq` in the first `size`
 leaves. A reader accepts a setup or a tally only with its proof: the
-mirror cannot serve an ingest key, a channel, a decrypter key or a result
+mirror cannot serve an ingest key, a channel, an authority key or a result
 the log does not hold.
 
 ## 16. The audit
@@ -634,7 +634,7 @@ checkpoint's commit are the log's.
 |---|---|---|---|---|
 | Public | yes (uid is public) | no | closed elgamal: aggregates only; open: tally differences, down to one ballot at low traffic or `k_real` 1 (§10.1); tlock: every ballot at the round | linked: per pseudonym, with the minute of each post; delta: the count of corrections per tally window |
 | Ingest | yes | no, but it chooses what each checkpoint holds (§10.1) | as public | as public |
-| Decrypter (elgamal) | yes | no | could decrypt any ballot of any poll under its key | as public |
+| Authority (elgamal) | yes | no | could decrypt any ballot of any poll under its key | as public |
 | Relay | yes | address and time of the post; under tlock, the content at the round | as public | as public |
 | Mirror host | no | the address that asks for a checkpoint's entries or a shard (browsers fetch windows, not one checkpoint) | as public | as public |
 | Network observer | no | address ↔ relay ↔ time; defeated only by Tor or a VPN, which the app may recommend | as public | as public |

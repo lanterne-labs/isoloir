@@ -1,7 +1,7 @@
 //! The matrix of allowed polls (SPEC §8), the checks of a setup on its
 //! own, and the rules of setup succession (SPEC §13).
 
-use crate::body::{Channel, ChannelState, Decrypter, Encryption, KindSpec, LedgerSetup, PollSetup, Publish, RegistrySetup, Revote};
+use crate::body::{Channel, ChannelState, Authority, Encryption, KindSpec, LedgerSetup, PollSetup, Publish, RegistrySetup, Revote};
 use crate::kinds::{self, Class};
 use isoloir_core::grumpkin;
 
@@ -116,10 +116,10 @@ pub fn check_poll(p: &PollSetup, registry: &RegistrySetup) -> Result<kinds::Vari
         return Err("a blackout ends after it starts".into());
     }
     match &p.encryption {
-        Encryption::Elgamal { pk, decrypter } => {
+        Encryption::Elgamal { pk, authority } => {
             let _ = grumpkin::from_hex(pk).map_err(|e| format!("pk: {e}"))?;
-            match decrypter {
-                Decrypter::Single { sign_key } => {
+            match authority {
+                Authority::Single { sign_key } => {
                     if hex::decode(sign_key).map(|b| b.len()) != Ok(32) {
                         return Err("sign_key: 32 bytes of hex".into());
                     }
@@ -231,7 +231,7 @@ mod tests {
     use super::*;
 
     fn elgamal() -> Encryption {
-        Encryption::Elgamal { pk: String::new(), decrypter: Decrypter::Single { sign_key: String::new() } }
+        Encryption::Elgamal { pk: String::new(), authority: Authority::Single { sign_key: String::new() } }
     }
     fn tlock() -> Encryption {
         Encryption::Tlock { chain: String::new(), public_key: String::new(), period: 3, genesis: 0, round: 1 }
