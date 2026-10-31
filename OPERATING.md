@@ -63,8 +63,11 @@ isoloir ingest --mirror-dir /app/mirror --mirror-git git@github.com:org/ledger-d
 With a `direct` channel in the ledger, add `--listen 0.0.0.0:8080` and
 put the endpoint behind TLS at the URL the ledger names.
 
-Environment: `DATABASE_URL`, `ISOLOIR_LOG_SEED`, `ISOLOIR_NOSTR_KEY`,
-`ISOLOIR_MIRROR_GIT` (or `--mirror-git`), `ISOLOIR_BB`, `ISOLOIR_ETH_RPC`
+Environment: `DATABASE_URL`, `ISOLOIR_LOG_SEED` (32 bytes of hex, or a
+C2SP `PRIVATE+KEY+<origin>+…` string such as Go's note package writes),
+`ISOLOIR_NOSTR_KEY`, `ISOLOIR_MIRROR_GIT` (or `--mirror-git`),
+`ISOLOIR_MIRROR_SSH_KEY` (the private half of a write deploy key of the
+mirror's repository), `ISOLOIR_BB`, `ISOLOIR_ETH_RPC`
 (optional, for passport certificate roots), `PORT` (serves `/v1/health`
 and the direct channel when the ledger lists one). The ingest refuses to
 start when its keys are not the ledger's. One instance per database: a
