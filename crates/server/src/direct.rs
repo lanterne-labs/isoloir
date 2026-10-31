@@ -53,12 +53,29 @@ struct Ctx {
     store: Store,
 }
 
+/// Health only (a ledger without a direct channel): `GET /v1/health`
+/// answers 200 with the last checkpoint's index and time, 503 when the
+/// store does not answer.
+pub fn health_router(store: Store) -> Router {
+    Router::new().route("/v1/health", get(health)).with_state(Ctx { hub: DirectHub::new(""), inbound: mpsc::channel(1).0, store })
+}
+
+async fn health(State(c): State<Ctx>) -> Response {
+    match c.store.checkpoints().await {
+        Ok(cps) => {
+            let last = cps.last().map(|(i, n)| serde_json::json!({"index": i, "time": n.lines().find_map(|l| l.strip_prefix("time ").and_then(|t| t.parse::<u64>().ok()))}));
+            Json(serde_json::json!({"ok": true, "checkpoint": last})).into_response()
+        }
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    }
+}
+
 /// The routes: `POST /v1/messages`, `GET /v1/acks/{id}`, `GET /v1/health`.
 pub fn router(hub: Arc<DirectHub>, inbound: mpsc::Sender<Incoming>, store: Store) -> Router {
     Router::new()
         .route("/v1/messages", post(message))
         .route("/v1/acks/{id}", get(ack))
-        .route("/v1/health", get(|| async { "ok" }))
+        .route("/v1/health", get(health))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(MAX_BODY))
         // Browsers post from the app's origin.
         .layer(tower_http::cors::CorsLayer::permissive())

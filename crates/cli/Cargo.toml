@@ -17,6 +17,7 @@ isoloir-zk.workspace = true
 isoloir-decrypt.workspace = true
 isoloir-relay.workspace = true
 isoloir-server.workspace = true
+isoloir-stamps.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }
 axum = "0.8"

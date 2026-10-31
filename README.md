@@ -59,13 +59,17 @@ isoloir keygen nostr                              # ISOLOIR_NOSTR_KEY, ingest
 isoloir keygen decrypter --out dec.json           # pk, sign_key
 isoloir circuits choice4_elgamal_linked_d20 --mirror mirror   # prints the vk hash
 export DATABASE_URL=postgresql://localhost/isoloir_trial ISOLOIR_LOG_SEED=… ISOLOIR_NOSTR_KEY=…
+isoloir check registry registry.json && isoloir check poll poll.json --registry registry.json
 isoloir genesis ledger.json && isoloir ingest --mirror-dir mirror --dev --no-stamps &
 isoloir submit registry registry.json && isoloir submit poll poll.json
 S=$(isoloir voter secret); isoloir voter register --mirror mirror --registry 1 --secret $S --uid alice
 isoloir voter vote --mirror mirror --poll 5 --secret $S --choice 0
 isoloir trustee --mirror mirror --log-key "…" --keys dec.json --db $DATABASE_URL --once
-isoloir audit --mirror mirror --log-key "…" --relays
+isoloir audit --mirror mirror --log-key "…" --relays --skip-passports
 ```
+
+Run it from the repository root (`circuits/` is where variants are
+built from); create the database first.
 
 The setup files are JSON bodies as SPEC §4.1, §5 and §7 show
 (`provider: "dev"` for a trial registry). `crates/server/tests/ingest.rs`

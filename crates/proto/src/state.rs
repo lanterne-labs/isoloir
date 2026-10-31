@@ -331,12 +331,15 @@ impl State {
                         }
                     }
                     Pseudonym::Delta { ident } => {
-                        if !st.idents.insert(ident.clone()) {
+                        // Every check before any change: a refused entry
+                        // leaves the state as it was.
+                        if st.idents.contains(ident) {
                             return Err(format!("ballot {seq}: ident used twice"));
                         }
                         let cmt = field::from_hex(b.cmt.as_deref().unwrap_or("")).map_err(|e| e.to_string())?;
                         let leaf = delta_leaf(&field::from_hex(ident).map_err(|e| e.to_string())?, &cmt);
                         st.btree.as_mut().ok_or("delta ballot in a poll without a ballot tree")?.push(leaf).map_err(|e| e.to_string())?;
+                        st.idents.insert(ident.clone());
                     }
                 }
                 st.ballots.push(LoggedBallot { seq, hash: encoding::body_hash(bytes), pseudonym, ct, vcmt, blob });

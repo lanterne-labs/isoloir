@@ -205,7 +205,13 @@ pub fn poll_successor(old: &PollSetup, new: &PollSetup, now: u64) -> Result<(), 
         return Err("closes: later only, and in the future".into());
     }
     match (&old.publish, &new.publish) {
-        (Publish::Open { .. }, Publish::Open { .. }) | (Publish::Closed, Publish::Closed) => {}
+        (Publish::Open { k_real: a, min_gap: g, coin: c }, Publish::Open { k_real: b, min_gap: h, coin: d }) => {
+            // Lowering them mid-poll would let the operator isolate ballots.
+            if b < a || h < g || c != d {
+                return Err("k_real and min_gap only rise, coin never changes".into());
+            }
+        }
+        (Publish::Closed, Publish::Closed) => {}
         _ => return Err("publish.mode never changes".into()),
     }
     // Past and current blackouts stay as they were.

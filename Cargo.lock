@@ -1561,6 +1561,7 @@ dependencies = [
  "isoloir-proto",
  "isoloir-relay",
  "isoloir-server",
+ "isoloir-stamps",
  "isoloir-zk",
  "rand 0.8.8",
  "serde_json",

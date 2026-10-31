@@ -60,10 +60,11 @@ pub fn build_elgamal<R: RngCore + CryptoRng>(
     let agg = if n > 0 { aggregate(&counted, variant.chunks()) } else { vec![] };
     if n > 0 {
         let mut sums = Vec::new();
+        let table = pack::DlogTable::new(n, kinds::value_bound(n));
         for (j, (a0, a1)) in agg.iter().enumerate() {
             let (d, proof) = Dleq::prove(sk, a0, &domain(poll.current().id, due.upto, j), rng);
             let m = (Projective::from(*a1) - d).into_affine();
-            let (d0, d1) = pack::dlog_chunk(&m, n, kinds::value_bound(n)).ok_or("a chunk does not decrypt within its bound")?;
+            let (d0, d1) = table.find(&m).ok_or("a chunk does not decrypt within its bound")?;
             sums.push((d0, d1));
             share.d.push(grumpkin::to_hex(&d).map_err(|e| e.to_string())?);
             share.proofs.push([grumpkin::scalar_to_hex(&proof.c), grumpkin::scalar_to_hex(&proof.z)]);

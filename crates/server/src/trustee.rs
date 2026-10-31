@@ -64,14 +64,16 @@ impl Trustee {
     }
 
     /// One round: new checkpoints, then the tallies due. Returns how many
-    /// tallies were published.
+    /// tallies were published. A failure of the log's source, of drand or
+    /// of the output is returned to be retried; a log that does not verify
+    /// is `LogFault`, which the caller must not retry past.
     pub async fn step(&mut self, now: u64) -> anyhow::Result<usize> {
         let next = self.auditor.state.last_checkpoint().map(|c| c.index + 1).unwrap_or(1);
         for (note, entries) in self.source.from(next).await? {
-            self.auditor.checkpoint(&note, &entries).map_err(|e| anyhow::anyhow!(e))?;
+            self.auditor.checkpoint(&note, &entries).map_err(|e| LogFault(e))?;
         }
         if !self.auditor.report.problems.is_empty() {
-            anyhow::bail!("the log does not verify: {:?}", self.auditor.report.problems);
+            return Err(LogFault(format!("the log does not verify: {:?}", self.auditor.report.problems)).into());
         }
         if self.tag.is_none() {
             self.tag = self.auditor.state.ledger().map(|l| tag(&l.origin));
@@ -86,7 +88,14 @@ impl Trustee {
             let p = &self.auditor.state.polls[&id];
             let t = match &p.current().encryption {
                 Encryption::Elgamal { pk, .. } => match &self.keys {
-                    Some(k) if &k.pk == pk => tally::build_elgamal(p, &due, &k.sk, &k.sign_seed, &mut self.rng).map_err(|e| anyhow::anyhow!(e))?,
+                    Some(k) if &k.pk == pk => match tally::build_elgamal(p, &due, &k.sk, &k.sign_seed, &mut self.rng) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            // Kept in `published`: not retried every round.
+                            tracing::error!(poll = id, checkpoint = due.checkpoint, error = %e, "the tally could not be built");
+                            continue;
+                        }
+                    },
                     _ => continue,
                 },
                 Encryption::Tlock { chain, period, genesis, round, .. } => {
@@ -125,6 +134,18 @@ impl Trustee {
         &self.auditor.report
     }
 }
+
+/// The log does not verify: the trustee must not go on.
+#[derive(Debug)]
+pub struct LogFault(pub String);
+
+impl std::fmt::Display for LogFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for LogFault {}
 
 /// The beacon of a round from a drand HTTP API.
 pub async fn fetch_beacon(base: &str, chain: &str, round: u64) -> anyhow::Result<Beacon> {

@@ -75,10 +75,11 @@ impl<'a> Auditor<'a> {
         if hashes.windows(2).any(|w| w[0] > w[1]) {
             self.report.problem(format!("checkpoint {index}: entries not in body-hash order"));
         }
-        // Accepted messages, judged against the state at the start of the
-        // checkpoint: at its time, or at the previous one's (the window of
-        // arrival) for time-dependent rules.
-        let before = self.state.clone();
+        // Messages are judged against the state at the start of the
+        // checkpoint (what the ingest saw when it judged them: at its
+        // time, or at the previous one's for time-dependent rules). The
+        // state is not cloned: the judge reads it, and nothing is applied
+        // before every entry was judged.
         let judge_at = |kind: EntryKind, b: &[u8], st: &State, checkers: &Checkers| -> Verdict {
             let v = judge::judge(st, &Pending::default(), kind, b, cp.time, checkers);
             match (&v, prev_time) {
@@ -86,20 +87,25 @@ impl<'a> Auditor<'a> {
                 _ => v,
             }
         };
+        // Refusals the pre-checkpoint state would accept: judged again
+        // after the checkpoint's entries (a rule such as the seq gap
+        // depends on what arrived first, which the log does not say).
+        let mut recheck: Vec<(u64, EntryKind, Vec<u8>, crate::Reason)> = vec![];
         for (i, (kind, b)) in entries.iter().enumerate() {
             let seq = start + i as u64;
             match kind {
-                EntryKind::Register | EntryKind::Ballot => match judge_at(*kind, b, &before, &self.checkers) {
+                EntryKind::Register | EntryKind::Ballot => match judge_at(*kind, b, &self.state, &self.checkers) {
                     Verdict::Accept => {}
                     Verdict::Reject(r) => self.report.problem(format!("entry {seq} ({}): logged, but {}", kind.as_str(), r.as_str())),
-                    Verdict::Defer(e) => self.report.warnings.push(format!("entry {seq}: not checked ({e})")),
+                    // A check that could not run is not a pass.
+                    Verdict::Defer(e) => self.report.problem(format!("entry {seq}: not checked ({e})")),
                 },
                 EntryKind::Tally => {
                     if let Ok(Body::Tally(t)) = body::decode(EntryKind::Tally, b) {
-                        match t.checkpoint.and_then(|c| policy::due_at(&before, t.poll, c)) {
+                        match t.checkpoint.and_then(|c| policy::due_at(&self.state, t.poll, c)) {
                             None => self.report.problem(format!("entry {seq}: a tally that was not due")),
                             Some(_) => {
-                                if let Some(e) = judge::tally_problem(&before, &t, b, &self.checkers) {
+                                if let Some(e) = judge::tally_problem(&self.state, &t, b, &self.checkers) {
                                     self.report.problem(format!("entry {seq}: tally: {e}"));
                                 }
                             }
@@ -107,12 +113,31 @@ impl<'a> Auditor<'a> {
                     }
                 }
                 EntryKind::Ledger | EntryKind::Registry | EntryKind::Poll => {
-                    if let Err(e) = judge::judge_setup(&before, *kind, b, cp.time) {
+                    if let Err(e) = judge::judge_setup(&self.state, *kind, b, cp.time) {
                         self.report.problem(format!("entry {seq}: setup: {e}"));
                     }
                 }
-                // Checked as they are applied, after the ballots before them.
-                EntryKind::Close | EntryKind::Reject => {}
+                EntryKind::Reject => {
+                    let Ok(Body::Reject(r)) = body::decode(EntryKind::Reject, b) else { continue };
+                    // Without its raw body a refusal cannot be judged again:
+                    // only a message too large to keep may lack it.
+                    let (Some(raw), Some(k)) = (r.raw.as_deref().and_then(|x| encoding::unb64(x).ok()), r.kind.as_deref().and_then(EntryKind::parse)) else {
+                        if r.reason != crate::Reason::Malformed {
+                            self.report.problem(format!("entry {seq}: a refusal ({}) without its raw body", r.reason.as_str()));
+                        }
+                        continue;
+                    };
+                    if encoding::body_hash(&raw) != r.hash {
+                        self.report.problem(format!("entry {seq}: a reject whose raw body is not its hash"));
+                        continue;
+                    }
+                    match judge_at(k, &raw, &self.state, &self.checkers) {
+                        Verdict::Accept => recheck.push((seq, k, raw, r.reason)),
+                        Verdict::Defer(e) => self.report.problem(format!("entry {seq}: a refusal not checked ({e})")),
+                        Verdict::Reject(_) => {}
+                    }
+                }
+                EntryKind::Close => {}
             }
         }
         // Apply: conflicts between entries of the same checkpoint show here.
@@ -144,21 +169,9 @@ impl<'a> Auditor<'a> {
                 _ => {}
             }
         }
-        // Refusals, judged again against the state at the end of the
-        // checkpoint (a conflicting message may be logged in it).
-        for (i, (kind, b)) in entries.iter().enumerate() {
-            if *kind != EntryKind::Reject {
-                continue;
-            }
-            let Ok(Body::Reject(r)) = body::decode(EntryKind::Reject, b) else { continue };
-            let (Some(raw), Some(k)) = (r.raw.as_deref().and_then(|x| encoding::unb64(x).ok()), r.kind.as_deref().and_then(EntryKind::parse)) else { continue };
-            if encoding::body_hash(&raw) != r.hash {
-                self.report.problem(format!("entry {}: a reject whose raw body is not its hash", start + i as u64));
-                continue;
-            }
-            let v = judge_at(k, &raw, &self.state, &self.checkers);
-            if v == Verdict::Accept {
-                self.report.problem(format!("entry {}: refused as {}, but the message is valid", start + i as u64, r.reason.as_str()));
+        for (seq, k, raw, reason) in recheck {
+            if judge_at(k, &raw, &self.state, &self.checkers) == Verdict::Accept {
+                self.report.problem(format!("entry {seq}: refused as {}, but the message is valid", reason.as_str()));
             }
         }
         if let Err(e) = self.state.record(&cp) {
@@ -204,7 +217,18 @@ pub fn check_relays(state: &State, events: &[crate::sig::Event], ingest: &str, g
             problems.push(format!("event {} (kind {}) is on a relay and was never judged", e.id, e.kind));
         }
     }
-    for a in events.iter().filter(|e| e.kind == 7102 && e.pubkey == ingest && e.verify()) {
+    // Acks found on the relays, and those voters attached to complaints.
+    let from_complaints: Vec<crate::sig::Event> = events
+        .iter()
+        .filter(|e| e.kind == 7106 && e.verify())
+        .filter_map(|e| serde_json::from_str::<serde_json::Value>(&e.content).ok())
+        .filter_map(|v| serde_json::from_value::<crate::sig::Event>(v.get("ack")?.clone()).ok())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    for a in events.iter().chain(from_complaints.iter()).filter(|e| e.kind == 7102 && e.pubkey == ingest && e.verify()) {
+        if !seen.insert(a.id.clone()) {
+            continue;
+        }
         let Ok(ack) = decode_ack(a.content.as_bytes()) else { continue };
         if ack.outcome != Outcome::Accepted {
             continue;

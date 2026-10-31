@@ -27,6 +27,9 @@ pub trait Passports {
     fn verify(&self, eligibility: &Eligibility, proof: &Value, custom_data: &str, proof_date: u64) -> Result<Option<String>, String>;
 }
 
+/// How far above the last seq a linked ballot may go.
+pub const SEQ_GAP: u64 = 16;
+
 /// The verifiers a judge needs.
 pub struct Checkers<'a> {
     pub proofs: &'a dyn Proofs,
@@ -123,6 +126,10 @@ fn register(state: &State, pending: &Pending, bytes: &[u8], now: u64, c: &Checke
     if reg.ids.contains_key(&r.id) || pending.ids.contains(&(r.registry, r.id.clone())) {
         return reject(Reason::IdUsed);
     }
+    let waiting = pending.ids.iter().filter(|(g, _)| *g == r.registry).count() as u64;
+    if reg.tree.len() as u64 + waiting >= 1u64 << setup.depth {
+        return reject(Reason::Full);
+    }
     let binding = sig::registration_binding(r.registry, &key);
     match c.passports.verify(&setup.eligibility, &r.proof, &binding, r.proof_date) {
         Ok(Some(uid)) if uid == r.uid => Ok(()),
@@ -162,6 +169,11 @@ fn ballot(state: &State, pending: &Pending, bytes: &[u8], now: u64, c: &Checkers
                     return reject(Reason::StaleSeq);
                 }
             }
+            // A seq is a counter: a huge one would make a ballot final and
+            // turn it into a receipt (no later ballot could replace it).
+            if s as u64 > last.map(|l| l as u64 + 1).unwrap_or(0) + SEQ_GAP {
+                return reject(Reason::SeqGap);
+            }
         }
         Revote::Delta => {
             let broot = field::from_hex(b.broot.as_deref().expect("shape")).map_err(|_| Verdict::Reject(Reason::Malformed))?;
@@ -171,6 +183,11 @@ fn ballot(state: &State, pending: &Pending, bytes: &[u8], now: u64, c: &Checkers
             let i = b.ident.clone().expect("shape");
             if p.idents.contains(&i) || pending.idents.contains(&(b.poll, i)) {
                 return reject(Reason::Duplicate);
+            }
+            let waiting = pending.idents.iter().filter(|(q, _)| *q == b.poll).count() as u64;
+            let cap = 1u64 << setup.ballot_depth.unwrap_or(32);
+            if p.btree.as_ref().map_or(0, |t| t.len() as u64) + waiting >= cap {
+                return reject(Reason::Full);
             }
         }
     }

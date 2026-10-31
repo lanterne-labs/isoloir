@@ -1,0 +1,8 @@
+target/
+js/node_modules/
+js/dist/
+js/wasm/
+zkverifier/node_modules/
+circuits/build/*/target/
+circuits/lib/target/
+.git/

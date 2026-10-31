@@ -550,3 +550,108 @@ fn a_ranked_poll_with_margins() {
     l.audit(Checkers { proofs: &proofs, passports: &DevPassports, tlock: None });
     let _ = m;
 }
+
+/// The rules the review added: a seq far above the last is refused, a
+/// full tree refuses, k_real cannot be lowered, and an audit that cannot
+/// check a proof fails instead of passing.
+#[test]
+fn review_rules() {
+    use isoloir_proto::judge::{Proofs, SEQ_GAP};
+    let tools = Tools::find().expect("nargo and bb");
+    let circuits = Circuits::repo();
+    let name = "choice4_elgamal_linked_d20";
+    let built = circuits.build(&tools, name).unwrap();
+    let vkdir = tempfile::tempdir().unwrap();
+    isoloir_zk::install(&built, vkdir.path()).unwrap();
+    let proofs = BbProofs::new(tools.bb.clone(), vkdir.path().to_path_buf());
+    let prover = Prover::new(tools, circuits);
+    let checkers = Checkers { proofs: &proofs, passports: &DevPassports, tlock: None };
+    let mut rng = rand::rngs::StdRng::seed_from_u64(51);
+    let mut l = Ledger::new(1_800_000_000);
+    // A registry of depth 1: two leaves, then full.
+    l.setup(Body::Registry(RegistrySetup {
+        v: 1,
+        id: 1,
+        version: 1,
+        name: "tiny".into(),
+        eligibility: Eligibility { provider: "dev".into(), domain: "d".into(), scope: "s".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false },
+        validity: 3600,
+        depth: 1,
+    }));
+    l.checkpoint();
+    let voters: Vec<Fr> = (0..3).map(|_| grumpkin::random_fr(&mut rng)).collect();
+    let verdicts: Vec<Verdict> = voters
+        .iter()
+        .enumerate()
+        .map(|(i, s)| l.post(EntryKind::Register, client::register_body(1, s, &format!("f{i}"), json!({"uid": format!("f{i}")}), l.now, &[0x80 + i as u8; 32]), &checkers))
+        .collect();
+    assert_eq!(verdicts, vec![Verdict::Accept, Verdict::Accept, Verdict::Reject(Reason::Full)]);
+    l.checkpoint();
+    // The poll's circuit variant must match the registry depth: d1.
+    let name1 = "choice4_elgamal_linked_d1";
+    let built1 = l_build(&prover, name1);
+    isoloir_zk::install(&built1, vkdir.path()).unwrap();
+    let sk = grumpkin::random_scalar(&mut rng);
+    let pk = grumpkin::to_hex(&(Projective::from(grumpkin::generator()) * sk).into()).unwrap();
+    let seed = [8u8; 32];
+    let poll = PollSetup {
+        v: 1,
+        id: 4,
+        version: 1,
+        registry: 1,
+        title: "rules".into(),
+        kind: KindSpec::Choice { options: vec!["Oui".into(), "Non".into()], blank: false },
+        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) } },
+        publish: Publish::Open { k_real: 5, min_gap: 60, coin: true },
+        revote: Revote::Linked,
+        opens: l.now,
+        closes: l.now + 86_400,
+        blackouts: vec![],
+        circuit: CircuitRef { name: name1.into(), vk_hash: built1.vk_hash.clone() },
+        ballot_depth: None,
+    };
+    l.setup(Body::Poll(poll.clone()));
+    l.checkpoint();
+    // Lowering k_real or min_gap, or changing the coin: refused.
+    for bad in [
+        PollSetup { version: 2, publish: Publish::Open { k_real: 4, min_gap: 60, coin: true }, ..poll.clone() },
+        PollSetup { version: 2, publish: Publish::Open { k_real: 5, min_gap: 0, coin: true }, ..poll.clone() },
+        PollSetup { version: 2, publish: Publish::Open { k_real: 5, min_gap: 60, coin: false }, ..poll.clone() },
+    ] {
+        assert!(judge::judge_setup(&l.state, EntryKind::Poll, &Body::Poll(bad).encode(), l.now).is_err());
+    }
+    assert!(judge::judge_setup(&l.state, EntryKind::Poll, &Body::Poll(PollSetup { version: 2, publish: Publish::Open { k_real: 50, min_gap: 600, coin: true }, ..poll.clone() }).encode(), l.now).is_ok());
+    let setup_seq = l.state.polls[&4].setups[0].0;
+    let variant = Variant::parse(name1).unwrap();
+    let cast = |l: &mut Ledger, s: &Fr, seq: u32, rng: &mut rand::rngs::StdRng| {
+        let m = member(&l.state, 1, s);
+        let d = client::draft(&poll, setup_seq, &variant, &m, s, &Choice::Pick(Some(0)), &Revoting::Linked { seq }, None, rng).unwrap();
+        let p = prover.prove(name1, &d.inputs).unwrap();
+        l.post(EntryKind::Ballot, d.finish(&p.proof), &checkers)
+    };
+    // A first ballot with a huge seq, then within the gap.
+    assert_eq!(cast(&mut l, &voters[0], u32::MAX, &mut rng), Verdict::Reject(Reason::SeqGap));
+    assert_eq!(cast(&mut l, &voters[0], SEQ_GAP as u32, &mut rng), Verdict::Accept);
+    l.checkpoint();
+    assert_eq!(cast(&mut l, &voters[0], SEQ_GAP as u32 * 2 + 2, &mut rng), Verdict::Reject(Reason::SeqGap));
+    assert_eq!(cast(&mut l, &voters[0], SEQ_GAP as u32 + 1, &mut rng), Verdict::Accept);
+    l.checkpoint();
+    l.audit(Checkers { proofs: &proofs, passports: &DevPassports, tlock: None });
+    // An auditor without the verification key cannot pass the log.
+    struct NoKeys;
+    impl Proofs for NoKeys {
+        fn verify(&self, _: &CircuitRef, _: &[u8], _: &[[u8; 32]]) -> Result<bool, String> {
+            Err("no vk".into())
+        }
+    }
+    let mut a = isoloir_proto::audit::Auditor::new(Some(&l.signer.verifier()), Checkers { proofs: &NoKeys, passports: &DevPassports, tlock: None }).unwrap();
+    for (n, es) in &l.notes {
+        a.checkpoint(n, es).unwrap();
+    }
+    let (_, report) = a.finish();
+    assert!(report.problems.iter().any(|p| p.contains("not checked")), "{:?}", report.problems);
+}
+
+fn l_build(prover: &Prover, name: &str) -> isoloir_zk::Built {
+    prover.circuits.build(&prover.tools, name).unwrap()
+}

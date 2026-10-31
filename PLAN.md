@@ -43,7 +43,7 @@ An isoloir is the voting booth: the curtain you vote behind, unseen.
 The Noir circuits (`circuits/ballot`, `circuits/keygen`), copied into this
 repo and adapted for §4. The spec as the design document, forked as
 `SPEC.md` v3 with the deltas below. The relay transport (Nostr kinds
-7020–7026), the signed acknowledgements, the checkpoints (C2SP note,
+7100–7106), the signed acknowledgements, the checkpoints (C2SP note,
 Ed25519), the RFC 6962 log, the OpenTimestamps stamps, the git mirror read
 through jsDelivr by commit, the receipts and complaints, the device link,
 the key in a passkey or 12 words, the registration key the passport proof
@@ -166,7 +166,7 @@ per voter and the sequence rule, as v2); **delta** (§4.6).
 | single or threshold, closed | single choice | allowed | allowed | allowed |
 | single or threshold, closed | multiple choices | allowed | allowed | allowed |
 | tlock, open | any | forbidden | forbidden | forbidden |
-| tlock, closed | single choice | allowed | forbidden | allowed |
+| tlock, closed | single choice | allowed | forbidden | forbidden |
 | tlock, closed | multiple choices | forbidden | forbidden | forbidden |
 
 - tlock, open: nothing opens before the round, so live results are
@@ -313,7 +313,7 @@ which stays on the Go implementation; M0 is the only step that touches
 
 ## 10. Status (2026-10-31)
 
-Built and tested (`cargo test --workspace`, 65 tests; the circuits'
+Built and tested (`cargo test --workspace`, 73 tests; the circuits'
 `nargo test`; a trial through the `isoloir` command on a local relay and
 Postgres):
 
@@ -335,6 +335,21 @@ registries reusable across polls; plaintexts are non-negative digits
 end their checkpoint; tallies name their aggregates so browsers check
 them alone; refusals keep their raw body so auditors judge them again;
 the tlock blob's hash is a public input of the proof.
+
+Reviewed (2026-10-31, four independent reviews: security, privacy,
+features, usability) and fixed in the same day: setups and tallies on
+the mirror carry inclusion proofs; an audit that cannot check a proof
+fails; refusals keep their body; the ingest heartbeats and rounds ack
+times; k_real only rises; seq gaps and full trees are refused; tlock
+re-votes are forbidden; bb and ZKPassport failures defer instead of
+refusing; the trustee verifies passports and retries; channels follow
+the ledger's current version; the mirror clones itself; the spec's §17
+says what each party learns, including the mirror host, the network and
+whoever holds the secret. Left as documented limits: an open poll with a
+small k_real publishes ballots as they come (the operator's choice); a
+network observer links address to relay (Tor); the whole log in memory
+(fine to about 100k ballots); the registry tree rebuilt in the browser
+(fine to about 100k voters).
 
 Open:
 - M3 done: `isoloir-wasm` (the protocol through WebAssembly) and `@isoloir/web`
