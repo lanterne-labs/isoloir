@@ -9,3 +9,8 @@ pub mod relays;
 pub mod source;
 pub mod store;
 pub mod trustee;
+
+/// The OpenTimestamps calendars the ingest submits to.
+pub fn stamps_calendars() -> Vec<String> {
+    isoloir_stamps::default_calendars()
+}

@@ -1,0 +1,14 @@
+{
+	"name": "zkverifier",
+	"private": true,
+	"version": "0.0.1",
+	"type": "module",
+	"description": "Verifies the ZKPassport proofs of an isoloir registration, run by the ingest.",
+	"license": "MIT OR Apache-2.0",
+	"engines": {
+		"node": ">=20"
+	},
+	"dependencies": {
+		"@zkpassport/sdk": "0.18.2"
+	}
+}
