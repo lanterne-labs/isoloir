@@ -323,6 +323,10 @@ pub struct Tally {
     pub counted: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<u64>,
+    /// ElGamal: the aggregate of each chunk over the counted ballots, so
+    /// that a reader can check the shares without the whole log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate: Option<Vec<[String; 2]>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shares: Option<Vec<Share>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

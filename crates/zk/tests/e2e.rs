@@ -461,3 +461,88 @@ fn a_tlock_poll_end_to_end() {
     l.checkpoint();
     l.audit(Checkers { proofs: &proofs, passports: &DevPassports, tlock: Some(&opener) });
 }
+
+/// Ranked ballots with margins: the circuit's values and the Rust ones
+/// agree, through a decrypted tally.
+#[test]
+fn a_ranked_poll_with_margins() {
+    let tools = Tools::find().expect("nargo and bb");
+    let circuits = Circuits::repo();
+    let name = "rankedm12_elgamal_linked_d20";
+    let built = circuits.build(&tools, name).unwrap();
+    let vkdir = tempfile::tempdir().unwrap();
+    isoloir_zk::install(&built, vkdir.path()).unwrap();
+    let proofs = BbProofs::new(tools.bb.clone(), vkdir.path().to_path_buf());
+    let prover = Prover::new(tools, circuits);
+    let checkers = Checkers { proofs: &proofs, passports: &DevPassports, tlock: None };
+    let mut rng = rand::rngs::StdRng::seed_from_u64(12);
+    let mut l = Ledger::new(1_800_000_000);
+    l.setup(Body::Registry(RegistrySetup {
+        v: 1,
+        id: 1,
+        version: 1,
+        name: "test".into(),
+        eligibility: Eligibility { provider: "dev".into(), domain: "test.example".into(), scope: "t".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false },
+        validity: 3600,
+        depth: 20,
+    }));
+    l.checkpoint();
+    let voters: Vec<Fr> = (0..3).map(|_| grumpkin::random_fr(&mut rng)).collect();
+    for (i, s) in voters.iter().enumerate() {
+        let body = client::register_body(1, s, &format!("r{i}"), json!({"uid": format!("r{i}")}), l.now, &[0x30 + i as u8; 32]);
+        assert_eq!(l.post(EntryKind::Register, body, &checkers), Verdict::Accept);
+    }
+    let sk = grumpkin::random_scalar(&mut rng);
+    let pk = grumpkin::to_hex(&(Projective::from(grumpkin::generator()) * sk).into()).unwrap();
+    let seed = [6u8; 32];
+    let options: Vec<String> = ["A", "B", "C", "D", "E"].iter().map(|s| s.to_string()).collect();
+    let kind = KindSpec::Ranked { options, blank: true, depth: 3, margins: true };
+    let poll = PollSetup {
+        v: 1,
+        id: 3,
+        version: 1,
+        registry: 1,
+        title: "ranked".into(),
+        kind: kind.clone(),
+        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) } },
+        publish: Publish::Closed,
+        revote: Revote::Linked,
+        opens: l.now,
+        closes: l.now + 86_400,
+        blackouts: vec![],
+        circuit: CircuitRef { name: name.into(), vk_hash: built.vk_hash.clone() },
+        ballot_depth: None,
+    };
+    l.setup(Body::Poll(poll.clone()));
+    l.checkpoint();
+    let setup_seq = l.state.polls[&3].setups[0].0;
+    let variant = Variant::parse(name).unwrap();
+    // B > A > blank; C; D > E > A. The blank is slot 5.
+    let rankings = [vec![1u32, 0, 5], vec![2], vec![3, 4, 0]];
+    let mut want = vec![0i64; variant.values()];
+    for (s, r) in voters.iter().zip(&rankings) {
+        let choice = Choice::Rank(r.clone());
+        want.iter_mut().zip(isoloir_proto::kinds::values(&kind, &variant, &choice).unwrap()).for_each(|(a, v)| *a += v);
+        let m = member(&l.state, 1, s);
+        let d = client::draft(&poll, setup_seq, &variant, &m, s, &choice, &Revoting::Linked { seq: 0 }, None, &mut rng).unwrap();
+        let p = prover.prove(name, &d.inputs).unwrap();
+        assert_eq!(l.post(EntryKind::Ballot, d.finish(&p.proof), &checkers), Verdict::Accept);
+    }
+    // The blank before another option is refused by the circuit.
+    let m = member(&l.state, 1, &voters[0]);
+    let bad = Choice::Rank(vec![5, 1]);
+    assert!(isoloir_proto::kinds::values(&kind, &variant, &bad).is_err());
+    l.checkpoint();
+    l.now = poll.closes;
+    l.queue.push((EntryKind::Close, Body::Close(Close { v: 1, poll: 3, at: poll.closes, last: l.state.polls[&3].ballots.last().unwrap().seq }).encode()));
+    let cp = l.checkpoint();
+    let due = policy::due_at(&l.state, 3, cp.index).unwrap();
+    let t = tally::build_elgamal(&l.state.polls[&3], &due, &sk, &seed, &mut rng).unwrap();
+    assert_eq!(t.values, want);
+    // first: A 0, B 1, C 1, D 1; margins: A before B? (0,1) = −1 +0... checked through want.
+    assert_eq!(&t.values[..6], &[0, 1, 1, 1, 0, 0]);
+    assert_eq!(l.post(EntryKind::Tally, canonical::to_vec(&t).unwrap(), &checkers), Verdict::Accept);
+    l.checkpoint();
+    l.audit(Checkers { proofs: &proofs, passports: &DevPassports, tlock: None });
+    let _ = m;
+}

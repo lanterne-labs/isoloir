@@ -57,9 +57,10 @@ pub fn build_elgamal<R: RngCore + CryptoRng>(
     let n = counted.len() as u64;
     let mut values = vec![0i64; variant.values()];
     let mut share = Share { trustee: 1, d: vec![], proofs: vec![] };
+    let agg = if n > 0 { aggregate(&counted, variant.chunks()) } else { vec![] };
     if n > 0 {
         let mut sums = Vec::new();
-        for (j, (a0, a1)) in aggregate(&counted, variant.chunks()).iter().enumerate() {
+        for (j, (a0, a1)) in agg.iter().enumerate() {
             let (d, proof) = Dleq::prove(sk, a0, &domain(poll.current().id, due.upto, j), rng);
             let m = (Projective::from(*a1) - d).into_affine();
             let (d0, d1) = pack::dlog_chunk(&m, n, kinds::value_bound(n)).ok_or("a chunk does not decrypt within its bound")?;
@@ -77,6 +78,7 @@ pub fn build_elgamal<R: RngCore + CryptoRng>(
         values,
         counted: n,
         checkpoint: Some(due.checkpoint),
+        aggregate: Some(agg.iter().map(|(a, b)| [grumpkin::to_hex(a).expect("finite"), grumpkin::to_hex(b).expect("finite")]).collect()),
         shares: Some(if n > 0 { vec![share] } else { vec![] }),
         beacon: None,
         void: None,
@@ -99,26 +101,45 @@ pub fn verify_elgamal(poll: &PollState, t: &Tally, body: &[u8], due: &Due) -> Re
     if t.checkpoint != Some(due.checkpoint) || t.beacon.is_some() || t.void.is_some() {
         return Err("the fields of an ElGamal tally".into());
     }
-    let Encryption::Elgamal { pk, decrypter } = &poll.current().encryption else { return Err("not an ElGamal poll".into()) };
+    // The aggregates the tally names are the log's.
+    let counted_now = poll.counted(due.upto);
+    if t.counted != counted_now.len() as u64 {
+        return Err(format!("counted {} (the log: {})", t.counted, counted_now.len()));
+    }
+    let agg = if counted_now.is_empty() { vec![] } else { aggregate(&counted_now, poll.variant.chunks()) };
+    let named: Vec<[String; 2]> = agg.iter().map(|(a, b)| [grumpkin::to_hex(a).unwrap_or_default(), grumpkin::to_hex(b).unwrap_or_default()]).collect();
+    if t.aggregate.as_ref() != Some(&named) {
+        return Err("the aggregates are not the log's".into());
+    }
+    verify_shares(&poll.current().encryption, t, body, poll.variant.values(), poll.variant.chunks(), &agg)
+}
+
+/// Checks an ElGamal tally against the aggregates it names: the
+/// signature, the shares' proofs, the values. A browser runs this with
+/// the aggregates from the tally itself; the auditor and the ingest with
+/// the aggregates they recomputed from the log.
+pub fn verify_shares(encryption: &Encryption, t: &Tally, body: &[u8], n_values: usize, chunks: usize, agg: &[(Point, Point)]) -> Result<(), String> {
+    let Encryption::Elgamal { pk, decrypter } = encryption else { return Err("not an ElGamal poll".into()) };
     let crate::body::Decrypter::Single { sign_key } = decrypter;
     sig::verify_tally(sign_key, body)?;
     let pk = grumpkin::from_hex(pk).map_err(|e| e.to_string())?;
-    let variant = poll.variant;
-    let counted = poll.counted(due.upto);
-    let n = counted.len() as u64;
-    if t.counted != n || t.values.len() != variant.values() {
-        return Err(format!("counted {} (the log: {n}), {} values", t.counted, t.values.len()));
+    let n = t.counted;
+    if t.values.len() != n_values {
+        return Err(format!("{} values", t.values.len()));
     }
     let shares = t.shares.as_ref().ok_or("no shares")?;
     if n == 0 {
-        return if shares.is_empty() && t.values.iter().all(|v| *v == 0) { Ok(()) } else { Err("no ballot: no share, zero values".into()) };
+        return if shares.is_empty() && agg.is_empty() && t.values.iter().all(|v| *v == 0) { Ok(()) } else { Err("no ballot: no share, zero values".into()) };
+    }
+    if agg.len() != chunks {
+        return Err("one aggregate per chunk".into());
     }
     let [share] = shares.as_slice() else { return Err("one share: a single decrypter".into()) };
-    if share.trustee != 1 || share.d.len() != variant.chunks() || share.proofs.len() != variant.chunks() {
+    if share.trustee != 1 || share.d.len() != chunks || share.proofs.len() != chunks {
         return Err("the share's shape".into());
     }
-    let sums = digit_sums(&t.values, n, variant.chunks())?;
-    for (j, (a0, a1)) in aggregate(&counted, variant.chunks()).iter().enumerate() {
+    let sums = digit_sums(&t.values, n, chunks)?;
+    for (j, (a0, a1)) in agg.iter().enumerate() {
         let d = grumpkin::from_hex(&share.d[j]).map_err(|e| e.to_string())?;
         let proof = Dleq {
             c: grumpkin::scalar_from_hex(&share.proofs[j][0]).map_err(|e| e.to_string())?,
@@ -197,6 +218,7 @@ pub fn build_tlock(poll: &PollState, due: &Due, beacon: &Beacon, opener: &dyn Tl
         values,
         counted,
         checkpoint: Some(due.checkpoint),
+        aggregate: None,
         shares: None,
         beacon: Some(beacon.clone()),
         void: Some(void),

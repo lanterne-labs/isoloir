@@ -373,10 +373,15 @@ component-wise sum of the counted ciphertexts' chunk j.
 
 ```json
 {"v":1,"poll":7,"upto":4810,"checkpoint":233,"final":false,
- "values":[…counts…],
+ "values":[…counts…],"counted":2051,
+ "aggregate":[["<A0>","<A1>"],…],
  "shares":[{"trustee":1,"d":["<point>",…],"proofs":[["<c>","<z>"],…]}],
  "sig":"<Ed25519, hex>"}
 ```
+
+`aggregate` repeats the aggregates so that a browser can check the
+shares, the values and the signature from the tally alone; the ingest and
+the auditor check that they are the log's.
 
 For each chunk j with aggregate `(A0_j, A1_j)`: each share gives
 `d_ij = sk_i·A0_j` and a Chaum–Pedersen proof that
