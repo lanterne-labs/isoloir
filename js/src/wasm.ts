@@ -20,6 +20,9 @@ export interface IsoloirWasm {
 	new_words(lang: string): string;
 	normalize_words(words: string, lang: string): string;
 	secret_from_words(words: string, lang: string): string;
+	check_words(words: string, lang: string): string;
+	canonical_word(word: string, lang: string): string;
+	verify_logged(seq: number, kind: string, body: string, path_json: string, size: number, root_b64: string): boolean;
 	relay_ranking(s: string, urls_json: string): string;
 	new_reg_secret(): string;
 	reg_pubkey(sk_hex: string): string;
@@ -72,6 +75,16 @@ export interface DeltaChain {
 	next: number;
 	/** The last ballot found: its number, choice and position in the ballot tree. */
 	previous: { i: number; choice: Choice; index: number } | null;
+}
+
+export interface WordsCheck {
+	ok: boolean;
+	count: number;
+	/** 1-based positions of the words not on the list. */
+	unknown: number[];
+	checksum: boolean;
+	/** The phrase in the list's spelling, when every word is on it. */
+	words: string | null;
 }
 
 /** The message of whatever wasm threw. */
@@ -132,6 +145,17 @@ export class Core {
 	}
 	secretFromWords(words: string, lang: string): string {
 		return this.w.secret_from_words(words, lang);
+	}
+	/** What is wrong with a phrase (1-based positions of the words not on the list). */
+	checkWords(words: string, lang: string): WordsCheck {
+		return JSON.parse(this.w.check_words(words, lang)) as WordsCheck;
+	}
+	/** A word in the list's spelling (case and accents folded), or null. */
+	canonicalWord(word: string, lang: string): string | null {
+		return this.w.canonical_word(word, lang) || null;
+	}
+	verifyLogged(seq: number, kind: string, body: string, path: string[], size: number, root: string): boolean {
+		return this.w.verify_logged(seq, kind, body, json(path), size, root);
 	}
 	relayRanking(s: string, urls: string[]): string[] {
 		return JSON.parse(this.w.relay_ranking(s, json(urls))) as string[];

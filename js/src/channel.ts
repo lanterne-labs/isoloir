@@ -10,6 +10,7 @@
 //           later); GET {url}/v1/acks/{id}: 200 the ack, 404 none yet
 
 import { IsoloirError } from './errors.js';
+import { withTimeout } from './mirror.js';
 import { WebSocketTransport, type Filter, type RelayTransport, type SubscribeOptions } from './relay.js';
 import type { Ack, Channel, NostrEvent } from './types.js';
 import type { Core } from './wasm.js';
@@ -123,7 +124,7 @@ export interface HttpResponse {
 	text(): Promise<string>;
 }
 
-export type HttpFetch = (url: string, init?: { method?: string; headers?: Record<string, string>; body?: string; credentials?: string; cache?: string }) => Promise<HttpResponse>;
+export type HttpFetch = (url: string, init?: { method?: string; headers?: Record<string, string>; body?: string; credentials?: string; cache?: string; signal?: AbortSignal }) => Promise<HttpResponse>;
 
 const defaultFetch: HttpFetch = (url, init) => fetch(url, init as RequestInit);
 
@@ -132,6 +133,8 @@ export interface DirectOptions {
 	pollMs?: number;
 	/** How long a publish (no ack awaited) waits for the response. */
 	publishTimeoutMs?: number;
+	/** How long a GET may take (default 10 s); a POST may take the ack wait plus this. */
+	requestTimeoutMs?: number;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -141,6 +144,7 @@ export class DirectChannel implements IngestChannel {
 	private readonly base: string;
 	private readonly pollMs: number;
 	private readonly publishTimeoutMs: number;
+	private readonly requestTimeoutMs: number;
 
 	constructor(
 		readonly url: string,
@@ -150,18 +154,25 @@ export class DirectChannel implements IngestChannel {
 		this.base = url.replace(/\/$/, '');
 		this.pollMs = opts.pollMs ?? 2000;
 		this.publishTimeoutMs = opts.publishTimeoutMs ?? 10_000;
+		this.requestTimeoutMs = opts.requestTimeoutMs ?? 10_000;
 	}
 
-	private post(event: NostrEvent): Promise<HttpResponse> {
-		return this.http(`${this.base}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(event), credentials: 'omit' });
+	/** POST /v1/messages; the endpoint holds it up to 55 s while the ingest judges. */
+	private post(event: NostrEvent, timeoutMs: number): Promise<{ status: number; text: string }> {
+		return withTimeout(timeoutMs, async (signal) => {
+			const r = await this.http(`${this.base}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(event), credentials: 'omit', signal });
+			return { status: r.status, text: await r.text().catch(() => '') };
+		});
 	}
 
 	/** GET /v1/acks/{id}: the ack, or null (404). */
-	private async get(eventId: string): Promise<NostrEvent | null> {
-		const r = await this.http(`${this.base}/v1/acks/${eventId}`, { credentials: 'omit', cache: 'no-store' });
-		if (r.status === 404) return null;
-		if (r.status !== 200) throw new Error(`${this.url}: HTTP ${r.status}`);
-		return JSON.parse(await r.text()) as NostrEvent;
+	private get(eventId: string): Promise<NostrEvent | null> {
+		return withTimeout(this.requestTimeoutMs, async (signal) => {
+			const r = await this.http(`${this.base}/v1/acks/${eventId}`, { credentials: 'omit', cache: 'no-store', signal });
+			if (r.status === 404) return null;
+			if (r.status !== 200) throw new Error(`${this.url}: HTTP ${r.status}`);
+			return JSON.parse(await r.text()) as NostrEvent;
+		});
 	}
 
 	private async getMatching(eventId: string, match: AckMatch): Promise<NostrEvent | null> {
@@ -175,9 +186,9 @@ export class DirectChannel implements IngestChannel {
 
 	async send(event: NostrEvent, opts: SendOptions): Promise<NostrEvent | null> {
 		const deadline = Date.now() + opts.waitMs;
-		let res: HttpResponse;
+		let res: { status: number; text: string };
 		try {
-			res = await this.post(event);
+			res = await this.post(event, opts.waitMs + this.requestTimeoutMs);
 		} catch (e) {
 			// The response was lost, not necessarily the message: ask for its ack.
 			const ack = await this.getMatching(event.id, opts.match);
@@ -190,7 +201,7 @@ export class DirectChannel implements IngestChannel {
 		if (res.status === 200) {
 			opts.onPosted?.();
 			try {
-				const ack = JSON.parse(await res.text()) as NostrEvent;
+				const ack = JSON.parse(res.text) as NostrEvent;
 				if (opts.match.accept(ack)) return ack;
 			} catch {
 				// not an ack: ask again below
@@ -199,8 +210,7 @@ export class DirectChannel implements IngestChannel {
 			// Judged later (a deferred check): the ack comes by GET.
 			opts.onPosted?.();
 		} else {
-			const why = await res.text().catch(() => '');
-			throw new Error(`${this.url} refused: HTTP ${res.status} ${why}`.trim());
+			throw new Error(`${this.url} refused: HTTP ${res.status} ${res.text}`.trim());
 		}
 		while (Date.now() < deadline) {
 			await sleep(Math.max(0, Math.min(this.pollMs, deadline - Date.now())));
@@ -218,16 +228,16 @@ export class DirectChannel implements IngestChannel {
 		// The endpoint holds a request it does not acknowledge (a complaint)
 		// for up to a minute: once sent, the message is there.
 		let timer: ReturnType<typeof setTimeout> | undefined;
-		const sent = this.post(event).then(async (r) => {
+		const sent = this.post(event, 60_000 + this.requestTimeoutMs).then((r) => {
 			if (r.status !== 200 && r.status !== 202) throw new Error(`${this.url} refused: HTTP ${r.status}`);
 		});
+		sent.catch(() => undefined);
 		const waited = new Promise<void>((r) => (timer = setTimeout(r, this.publishTimeoutMs)));
 		try {
 			await Promise.race([sent, waited]);
 		} finally {
 			clearTimeout(timer);
 		}
-		sent.catch(() => undefined);
 	}
 }
 
@@ -253,7 +263,8 @@ export interface PostProgress {
 
 export interface PostOptions {
 	ackTimeoutMs: number;
-	onPosted?: (channel: string) => void;
+	/** A channel took this envelope (keep it: its ack may come later). */
+	onPosted?: (channel: string, envelope: NostrEvent) => void;
 	onProgress?: (p: PostProgress) => void;
 }
 
@@ -261,7 +272,12 @@ export interface Acked {
 	channel: string;
 	ack: Ack;
 	ackEvent: NostrEvent;
+	/** The envelope the ack names. */
+	envelope: NostrEvent;
 }
+
+/** Makes an envelope of a body: a fresh throwaway key and the current time. */
+export type Envelope = () => NostrEvent;
 
 /** The match of an envelope's ack: the ingest's signature, the envelope id, the body's hash. */
 export function ackMatch(core: Core, event: NostrEvent, ingest: string): AckMatch {
@@ -281,14 +297,16 @@ export function ackMatch(core: Core, event: NostrEvent, ingest: string): AckMatc
 }
 
 /**
- * Posts a signed envelope to the channels in turn and waits for the
- * ingest's ack on each (SPEC §11.1, §11.2): `ackTimeoutMs` (60 s) on one,
- * then the next gets the same envelope (same id: the ingest judges a
- * message once and acks it again). Throws no_relay when no channel took
+ * Posts a body to the channels in turn and waits for the ingest's ack on
+ * each (SPEC §11.1, §11.2): `ackTimeoutMs` (60 s) on one, then the next.
+ * Every attempt wraps the body in a fresh envelope (a new key, the time
+ * of the attempt): relays and the ingest read by `since`, so an envelope
+ * dated minutes ago would never be seen; the ingest answers the same body
+ * under any envelope with the same outcome. Acks are matched by the
+ * envelope's id and the body's hash. Throws no_relay when no channel took
  * it, no_ack when some did and none answered.
  */
-export async function postWithAck(core: Core, channels: IngestChannel[], event: NostrEvent, ingest: string, opts: PostOptions): Promise<Acked> {
-	const match = ackMatch(core, event, ingest);
+export async function postWithAck(core: Core, channels: IngestChannel[], envelope: Envelope, ingest: string, opts: PostOptions): Promise<Acked> {
 	let posted = 0;
 	let lastErr = 'no channel';
 	let n = 0;
@@ -296,6 +314,8 @@ export async function postWithAck(core: Core, channels: IngestChannel[], event: 
 		n++;
 		const at = { channel: ch.url, type: ch.type, n, of: channels.length };
 		opts.onProgress?.({ ...at, stage: 'posting' });
+		const event = envelope();
+		const match = ackMatch(core, event, ingest);
 		let ack: NostrEvent | null;
 		try {
 			ack = await ch.send(event, {
@@ -303,7 +323,7 @@ export async function postWithAck(core: Core, channels: IngestChannel[], event: 
 				match,
 				onPosted: () => {
 					posted++;
-					opts.onPosted?.(ch.url);
+					opts.onPosted?.(ch.url, event);
 					opts.onProgress?.({ ...at, stage: 'waiting' });
 				}
 			});
@@ -311,18 +331,17 @@ export async function postWithAck(core: Core, channels: IngestChannel[], event: 
 			lastErr = e instanceof Error ? e.message : String(e);
 			continue;
 		}
-		if (ack) return { channel: ch.url, ack: core.readAck(ack, ingest), ackEvent: ack };
+		if (ack) return { channel: ch.url, ack: core.readAck(ack, ingest), ackEvent: ack, envelope: event };
 		lastErr = `${ch.url}: no acknowledgement`;
 	}
 	throw new IsoloirError(posted > 0 ? 'no_ack' : 'no_relay', lastErr);
 }
 
-/** The ack of an envelope posted before, from whichever channel has it. */
-export async function findAck(core: Core, channels: IngestChannel[], event: NostrEvent, ingest: string, waitMs: number): Promise<Acked | null> {
-	const match = ackMatch(core, event, ingest);
-	for (const ch of channels) {
-		const ack = await ch.ackOf(event.id, { waitMs, match }).catch(() => null);
-		if (ack) return { channel: ch.url, ack: core.readAck(ack, ingest), ackEvent: ack };
+/** The ack of an envelope posted before, asked of the channel that took it. */
+export async function findAck(core: Core, channel: IngestChannel, events: NostrEvent[], ingest: string, waitMs: number): Promise<Acked | null> {
+	for (const event of events) {
+		const ack = await channel.ackOf(event.id, { waitMs, match: ackMatch(core, event, ingest) }).catch(() => null);
+		if (ack) return { channel: channel.url, ack: core.readAck(ack, ingest), ackEvent: ack, envelope: event };
 	}
 	return null;
 }

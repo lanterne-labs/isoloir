@@ -106,7 +106,7 @@ describe('the wasm core from node', () => {
 		});
 		const ev = core.signEvent('', 1, core.kinds.ballot, [], '{"v":1}');
 		const seen: string[] = [];
-		const r = await postWithAck(core, ['wss://x', 'wss://y'].map((u) => new NostrChannel(u, relays)), ev, ingestPub, { ackTimeoutMs: 50, onPosted: (u) => seen.push(u) });
+		const r = await postWithAck(core, ['wss://x', 'wss://y'].map((u) => new NostrChannel(u, relays)), () => core.signEvent('', 1, core.kinds.ballot, [], '{"v":1}'), ingestPub, { ackTimeoutMs: 50, onPosted: (u) => seen.push(u) });
 		expect(r.channel).toBe('wss://y');
 		expect(seen).toEqual(['wss://x', 'wss://y']);
 		// A forged ack (another key) does not count.
@@ -115,7 +115,7 @@ describe('the wasm core from node', () => {
 			const ack = core.canonical({ v: 1, of: e.id, hash: core.bodyHash(e.content), outcome: 'accepted', checkpoint: 1 });
 			void relays2.publish('wss://z', core.signEvent('98'.repeat(32), 1, core.kinds.ack, [['e', e.id]], ack));
 		});
-		await expect(postWithAck(core, [new NostrChannel('wss://z', relays2)], ev, ingestPub, { ackTimeoutMs: 50 })).rejects.toMatchObject({ code: 'no_ack' });
+		await expect(postWithAck(core, [new NostrChannel('wss://z', relays2)], () => ev, ingestPub, { ackTimeoutMs: 50 })).rejects.toMatchObject({ code: 'no_ack' });
 	});
 });
 
@@ -126,5 +126,34 @@ describe('the browser build', () => {
 		const w = await loadWasm(readFileSync(new URL('../wasm/web/isoloir_wasm_bg.wasm', import.meta.url)));
 		expect(w.protocol()).toBe('isoloir/1');
 		expect(w.new_reg_secret()).toMatch(/^[0-9a-f]{64}$/);
+	});
+});
+
+describe('the log and the store', () => {
+	it('proves an entry in a checkpoint log', () => {
+		const log = [['ledger', '{"a":1}'], ['poll', '{"b":2}'], ['tally', '{"c":3}']];
+		const p = JSON.parse(wasm.dev_log_proof(JSON.stringify(log), 1, 3)) as { root: string; path: string[] };
+		expect(core.verifyLogged(1, 'poll', '{"b":2}', p.path, 3, p.root)).toBe(true);
+		expect(core.verifyLogged(1, 'poll', '{"b":3}', p.path, 3, p.root)).toBe(false);
+		expect(core.verifyLogged(2, 'poll', '{"b":2}', p.path, 3, p.root)).toBe(false);
+		expect(() => core.verifyLogged(1, 'poll', '{"b":2}', ['zz'], 3, p.root)).toThrow();
+	});
+
+	it('asks the browser to persist the store', async () => {
+		const { defaultStore } = await import('../src/storage.js');
+		const g = globalThis as Record<string, unknown>;
+		const m = new Map<string, string>();
+		g.localStorage = { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => m.set(k, v), removeItem: (k: string) => m.delete(k) };
+		const nav = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+		Object.defineProperty(globalThis, 'navigator', { value: { storage: { persisted: async () => false, persist: async () => true } }, configurable: true });
+		try {
+			const s = defaultStore();
+			s.set('a', '1');
+			expect(m.get('a')).toBe('1');
+			expect(await s.persist!()).toBe('persistent');
+		} finally {
+			delete g.localStorage;
+			if (nav) Object.defineProperty(globalThis, 'navigator', nav);
+		}
 	});
 });

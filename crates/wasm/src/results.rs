@@ -5,7 +5,7 @@
 
 use crate::api::R;
 use isoloir_proto::body::{KindSpec, PollSetup};
-use isoloir_proto::kinds::{self, Family, Variant};
+use isoloir_proto::kinds::{self, Chain, Family, Variant};
 use serde_json::{json, Value};
 
 fn label(options: &[String], slot: usize) -> Value {
@@ -26,19 +26,27 @@ pub fn of(p: &PollSetup, v: &Variant, values: &[i64], counted: u64) -> R<Value> 
                 .map(|k| json!({ "slot": k, "label": label(options, k), "blank": *blank && k == options.len(), "count": values[k] }))
                 .collect();
             let picked: i64 = values[..active].iter().sum();
+            // Linked: one counted ballot per voter, so those that pick no
+            // slot are counted − picked. Delta: `counted` counts the
+            // corrections, not the voters: the withdrawals are unknown.
+            let none = match v.chain {
+                Chain::Linked => Some(counted as i64 - picked),
+                Chain::Delta => None,
+            };
             Ok(json!({
                 "type": "choice",
                 "counted": counted,
+                "ballots": if v.chain == Chain::Delta { "corrections" } else { "voters" },
                 "slots": slots,
                 "blank": if *blank { Some(values[options.len()]) } else { None },
-                "none": counted as i64 - picked,
+                "none": none,
             }))
         }
         KindSpec::Ranked { options, blank, .. } => {
             let slots: Vec<Value> = (0..active)
                 .map(|k| json!({ "slot": k, "label": label(options, k), "blank": *blank && k == options.len(), "first": values[k], "ranked": values[m + k] }))
                 .collect();
-            let mut res = json!({ "type": "ranked", "counted": counted, "slots": slots });
+            let mut res = json!({ "type": "ranked", "counted": counted, "ballots": if v.chain == Chain::Delta { "corrections" } else { "voters" }, "slots": slots });
             if v.family == Family::RankedMargins {
                 // margin[i][j] for i < j, in the circuit's slot order.
                 let mut mat = vec![vec![0i64; active]; active];

@@ -153,3 +153,20 @@ pub fn tlock_open(signature_hex: &str, blob_b64: &str) -> R<String> {
     let p = isoloir_decrypt::tlock::open(&sig, &blob).ok_or("the blob does not open")?;
     String::from_utf8(p).map_err(err)
 }
+
+/// The RFC 6962 root of the first `n` entries of a log (`[[kind, body], …]`
+/// in seq order) and, for `i < n`, the inclusion proof of entry `i`.
+pub fn log_proof(entries_json: &str, i: u32, n: u32) -> R<String> {
+    use isoloir_proto::log::{self, Log};
+    let entries: Vec<(String, String)> = serde_json::from_str(entries_json).map_err(err)?;
+    let mut l = Log::new();
+    for (seq, (k, b)) in entries.iter().enumerate().take(n as usize) {
+        l.push(log::leaf_hash(&log::leaf_data(seq as u64, k, b.as_bytes())));
+    }
+    if l.len() != n as u64 {
+        return Err(format!("{n} entries asked, {} given", l.len()));
+    }
+    let root = if n == 0 { log::empty_root() } else { log::root_of(&l.leaves()[..n as usize]) };
+    let path: Vec<String> = if i < n { l.inclusion(i as usize, n as usize).iter().map(hex::encode).collect() } else { vec![] };
+    Ok(serde_json::json!({ "root": STANDARD.encode(root), "path": path }).to_string())
+}

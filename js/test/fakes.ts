@@ -18,6 +18,7 @@ export interface DevWasm extends IsoloirWasm {
 	dev_decrypter(seed: string): string;
 	dev_ed25519_public(seed: string): string;
 	dev_build_tally(req: string): string;
+	dev_log_proof(entries: string, i: number, n: number): string;
 	dev_tlock_chain(seed: number, round: number): string;
 	dev_tlock_open(signature: string, blob: string): string;
 }
@@ -39,14 +40,19 @@ export const MIRROR = 'https://mirror.test';
 export class FakeMirror {
 	readonly files = new Map<string, string>();
 	reads: string[] = [];
+	/** Paths whose fetch never answers (until aborted). */
+	readonly hang = new Set<string>();
 
 	put(path: string, v: string | unknown) {
 		this.files.set(path, typeof v === 'string' ? v : JSON.stringify(v));
 	}
 
-	fetch: Fetcher = async (url) => {
+	fetch: Fetcher = async (url, init) => {
 		const path = url.slice(MIRROR.length + 1);
 		this.reads.push(path);
+		if (this.hang.has(path)) {
+			return new Promise((_, reject) => init?.signal?.addEventListener('abort', () => reject(new Error('aborted'))));
+		}
 		const f = this.files.get(path);
 		return f === undefined ? { status: 404, ok: false, text: async () => '' } : { status: 200, ok: true, text: async () => f };
 	};
@@ -78,6 +84,8 @@ function matches(f: Filter, e: NostrEvent): boolean {
 
 export class FakeRelays implements RelayTransport {
 	readonly relays = new Map<string, FakeRelay>();
+	/** Every subscription made, by whom it was asked of. */
+	readonly subscriptions: { url: string; filter: Filter }[] = [];
 
 	constructor(urls: string[]) {
 		for (const u of urls) this.relays.set(u, { events: [], subs: new Set(), down: false, dropAcks: false });
@@ -100,6 +108,7 @@ export class FakeRelays implements RelayTransport {
 	}
 
 	subscribe(url: string, filter: Filter, onEvent: (e: NostrEvent) => void, opts: SubscribeOptions = {}): () => void {
+		this.subscriptions.push({ url, filter });
 		const r = this.relays.get(url);
 		if (!r || r.down) {
 			queueMicrotask(() => opts.onDown?.());
@@ -129,7 +138,6 @@ interface Pending {
 	hash: string;
 }
 
-const ZERO_ROOT = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=';
 const SHARD = 1024;
 
 export interface Decrypter {
@@ -169,6 +177,14 @@ export class FakeIngest {
 
 	/** Envelopes the direct endpoint took while the ingest was silent. */
 	readonly backlog: NostrEvent[] = [];
+	/** Every entry of the log, in seq order: [kind, body]. */
+	readonly log: [string, string][] = [];
+	/** The accepted bodies and the checkpoint their ack named: a body is answered once, under any envelope. */
+	readonly accepted = new Map<string, number>();
+	/** Envelopes dated before this are never seen (the ingest reads relays by cursor − 120 s). */
+	minCreatedAt = 0;
+	/** The setup files, every version. */
+	readonly setupFiles = new Map<string, { seq: number; body: string; checkpoint: number; size: number; path: string[] }[]>();
 
 	constructor(
 		readonly relays: FakeRelays,
@@ -194,11 +210,11 @@ export class FakeIngest {
 		const entries = setups.map((s) => {
 			const body = core.canonical(s.body);
 			const seq = this.seq++;
-			// As crates/server/src/mirror.rs writes them.
-			mirror.put(s.path, s.kind === 'ledger' ? { seq, body } : { setups: [{ seq, body }] });
-			return { seq, kind: s.kind, body };
+			this.log.push([s.kind, body]);
+			return { seq, kind: s.kind, body, path: s.path };
 		});
 		this.publishCheckpoint(entries);
+		for (const e of entries) this.writeSetup(e.path, e.seq, e.body, this.index);
 		for (const url of this.relayUrls()) {
 			relays.subscribe(url, { kinds: [core.kinds.register, core.kinds.ballot], '#t': [TAG] }, (e) => this.onRelay(url, e));
 		}
@@ -222,6 +238,19 @@ export class FakeIngest {
 		for (const e of this.backlog.splice(0)) this.judge(e);
 	}
 
+	/** The inclusion proof of entry `seq` in checkpoint `checkpoint`'s log (its size). */
+	proof(seq: number, size: number): { root: string; path: string[] } {
+		return JSON.parse(wasm.dev_log_proof(JSON.stringify(this.log.slice(0, size)), seq, size)) as { root: string; path: string[] };
+	}
+
+	/** Adds a version to a setup file, as crates/server/src/mirror.rs writes it. */
+	writeSetup(path: string, seq: number, body: string, checkpoint: number, size = this.seq) {
+		const list = this.setupFiles.get(path) ?? [];
+		list.push({ seq, body, checkpoint, size, path: this.proof(seq, size).path });
+		this.setupFiles.set(path, list);
+		this.mirror.put(path, { setups: list });
+	}
+
 	poll(id: number): PollSetup {
 		const p = this.polls.find((x) => x.id === id);
 		if (!p) throw new Error(`no poll ${id}`);
@@ -230,16 +259,21 @@ export class FakeIngest {
 
 	/** Judges an envelope once; returns its signed ack (the same on every channel), null when silent. */
 	judge(e: NostrEvent): NostrEvent | null {
-		if (this.silent) return null;
+		if (this.silent || e.created_at < this.minCreatedAt) return null;
 		const prior = this.acks.get(e.id);
 		if (prior) return prior;
 		const kind = e.kind === core.kinds.register ? 'register' : 'ballot';
 		const hash = core.bodyHash(e.content);
-		const reason = kind === 'register' ? this.checkRegister(e.content) : this.checkBallot(e.content);
+		// The same body under another envelope: the same outcome (crates/server/src/ingest.rs).
+		const before = this.accepted.get(hash);
+		const reason = before !== undefined ? null : kind === 'register' ? this.checkRegister(e.content) : this.checkBallot(e.content);
 		const ack = reason
 			? { v: 1, of: e.id, hash, outcome: 'rejected', reason }
-			: { v: 1, of: e.id, hash, outcome: 'accepted', checkpoint: this.index + 1 };
-		if (!reason) this.pending.push({ kind, body: e.content, hash });
+			: { v: 1, of: e.id, hash, outcome: 'accepted', checkpoint: before ?? this.index + 1 };
+		if (!reason && before === undefined) {
+			this.pending.push({ kind, body: e.content, hash });
+			this.accepted.set(hash, this.index + 1);
+		}
 		const ev = core.signEvent(this.secret, this.now(), core.kinds.ack, [['t', TAG], ['e', e.id]], core.canonical(ack));
 		this.acks.set(e.id, ev);
 		return ev;
@@ -285,13 +319,18 @@ export class FakeIngest {
 	}
 
 	/** Logs the pending messages in body hash order and publishes a signed checkpoint and the mirror's files. */
-	checkpoint(): void {
+	checkpoint(extra: { kind: string; body: string }[] = []): void {
 		const batch = [...this.pending].sort((a, b) => (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0));
 		this.pending = [];
 		const entries: { seq: number; kind: string; body: string }[] = [];
+		for (const x of extra) {
+			entries.push({ seq: this.seq++, kind: x.kind, body: x.body });
+			this.log.push([x.kind, x.body]);
+		}
 		for (const m of batch) {
 			if (this.withhold.has(m.hash)) continue;
 			const seq = this.seq++;
+			this.log.push([m.kind, m.body]);
 			entries.push({ seq, kind: m.kind, body: m.body });
 			if (m.kind === 'register') {
 				const b = JSON.parse(m.body) as { uid: string; id: string };
@@ -327,7 +366,7 @@ export class FakeIngest {
 				return { poll: p.id, size: l.length, root: core.treeRoot(p.ballot_depth!, l) };
 			})
 			.filter((b) => b.size > 0);
-		const cp = { origin: ORIGIN, size: this.seq, root: ZERO_ROOT, index: this.index, time: this.now(), registries: [{ id: 1, size: this.leaves.length, root: regRoot }], ballots, mirror: null };
+		const cp = { origin: ORIGIN, size: this.seq, root: this.proof(0, this.seq).root, index: this.index, time: this.now(), registries: [{ id: 1, size: this.leaves.length, root: regRoot }], ballots, mirror: null };
 		const note = wasm.dev_sign_checkpoint(this.logSeed, JSON.stringify(cp));
 		const m = this.mirror;
 		m.put(`entries/${this.index}.json`, entries);
@@ -355,8 +394,16 @@ export class FakeIngest {
 	tally(pollId: number): string {
 		const ballots = [...(this.counted.get(pollId)?.values() ?? [])];
 		const req = { poll: this.poll(pollId), upto: this.seq - 1, checkpoint: this.index, final: false, ballots, sk: this.decrypter.sk, sign_seed: this.decrypter.sign_seed, seed: '44'.repeat(32) };
-		const body = wasm.dev_build_tally(JSON.stringify(req));
-		this.mirror.put(`polls/${pollId}/tallies/latest.json`, { seq: this.seq, body });
+		return this.logTally(pollId, wasm.dev_build_tally(JSON.stringify(req)));
+	}
+
+	/** Logs a tally body as it is (a decrypter's, or a forged one) and mirrors it with its proof. */
+	logTally(pollId: number, body: string): string {
+		const seq = this.seq;
+		// Logged, then mirrored with its proof (crates/server/src/mirror.rs).
+		this.checkpoint([{ kind: 'tally', body }]);
+		const proof = this.proof(seq, this.seq);
+		this.mirror.put(`polls/${pollId}/tallies/latest.json`, { seq, body, checkpoint: this.index, size: this.seq, path: proof.path });
 		return body;
 	}
 }
@@ -385,6 +432,8 @@ export class FakeDirect {
 	deferMs: number | null = null;
 	/** POSTs answered with this status (a refusal of the endpoint itself). */
 	refuseStatus: number | null = null;
+	/** Requests that never answer (until aborted). */
+	hang = false;
 	readonly received: NostrEvent[] = [];
 	readonly requests: string[] = [];
 
@@ -397,6 +446,7 @@ export class FakeDirect {
 		const path = url.slice(this.url.length);
 		const method = init?.method ?? 'GET';
 		this.requests.push(`${method} ${path}`);
+		if (this.hang) return new Promise((_, reject) => init?.signal?.addEventListener('abort', () => reject(new Error('aborted'))));
 		const json = (status: number, v: unknown) => ({ status, ok: status < 300, text: async () => JSON.stringify(v) });
 		if (method === 'GET') {
 			const m = /^\/v1\/acks\/([0-9a-f]{64})$/.exec(path);
@@ -425,12 +475,12 @@ export class FakeDirect {
 	};
 }
 
-export function world(channels: Channel[] = RELAYS.map(nostr)) {
+export function world(channels: Channel[] = RELAYS.map(nostr), now?: () => number) {
 	const relays = new FakeRelays(channels.filter((c) => c.type === 'nostr').map((c) => c.url));
 	const mirror = new FakeMirror();
-	const ingest = new FakeIngest(relays, mirror, channels);
+	const ingest = new FakeIngest(relays, mirror, channels, now);
 	const endpoint = new FakeDirect(channels.find((c) => c.type === 'direct')?.url ?? DIRECT, ingest);
-	const factory: ChannelFactory = (c) => (c.type === 'nostr' ? new NostrChannel(c.url, relays) : new DirectChannel(c.url, endpoint.fetch, { pollMs: 10, publishTimeoutMs: 200 }));
+	const factory: ChannelFactory = (c) => (c.type === 'nostr' ? new NostrChannel(c.url, relays) : new DirectChannel(c.url, endpoint.fetch, { pollMs: 10, publishTimeoutMs: 200, requestTimeoutMs: 100 }));
 	return { relays, mirror, ingest, direct: endpoint, channels: factory };
 }
 

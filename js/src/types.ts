@@ -77,12 +77,25 @@ export interface PollSetup {
 	ballot_depth?: number;
 }
 
-/** A setup as the mirror serves it: the body and the seq of its entry. */
+/** A logged entry as the mirror serves it, with its inclusion proof in checkpoint `checkpoint`'s log. */
+export interface Logged {
+	seq: number;
+	/** The body's text, as logged. */
+	body: string;
+	checkpoint: number;
+	/** The log size the proof is for: the checkpoint's. */
+	size: number;
+	/** The RFC 6962 inclusion proof, 64 hex digits per hash. */
+	path: string[];
+}
+
+/** A setup proven in the log: the body, the seq of its entry, the checkpoint that proves it. */
 export interface Setup<T> {
-	seq: number | null;
+	seq: number;
 	body: T;
 	/** The body's canonical text (what the log holds). */
 	text: string;
+	checkpoint: number;
 }
 
 /** A voter's choice: one slot or none (single choice), or a ranking. */
@@ -159,13 +172,16 @@ export interface ChoiceResults {
 	counted: number;
 	slots: { slot: number; label: string | null; blank: boolean; count: number }[];
 	blank: number | null;
-	/** Counted ballots that pick no slot (withdrawals). */
-	none: number;
+	/** voters (none, linked: one counted ballot each) or corrections (delta: `counted` counts corrections). */
+	ballots: 'voters' | 'corrections';
+	/** Counted ballots that pick no slot (withdrawals); null in delta polls, where it is unknown. */
+	none: number | null;
 }
 
 export interface RankedResults {
 	type: 'ranked';
 	counted: number;
+	ballots: 'voters' | 'corrections';
 	slots: { slot: number; label: string | null; blank: boolean; first: number; ranked: number }[];
 	/** margins[i][j]: ballots ranking i before j minus those ranking j before i. */
 	margins?: number[][];
@@ -179,6 +195,8 @@ export interface TallyVerdict {
 	ok: boolean;
 	/** shares: signature, decryption proofs and values (ElGamal); beacon: the drand beacon only (tlock). */
 	checked: 'shares' | 'beacon';
+	/** tlock: whether the beacon is the round's (ok stays false: the openings are an auditor's to check). */
+	beacon_ok: boolean;
 	error: string | null;
 	tally: {
 		v: 1;
