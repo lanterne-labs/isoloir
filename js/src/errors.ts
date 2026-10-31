@@ -1,31 +1,99 @@
 // What went wrong, named: every failure the session meets carries a code
-// the app translates, and a detail for the curious (never a secret).
-//
-// Codes of the session: not_ready, no_setup, log_key (the mirror's
-// checkpoint does not verify under the pinned key), mirror, no_relay
-// (no channel took the message), no_ack (channels took it, none
-// answered), link_unavailable (the ledger has no Nostr relay: no device
-// link),
-// stale_proof (scan the passport again), not_registered, no_path (the
-// mirror and the checkpoint disagree on the tree), previous_pending
-// (a delta correction waits for its previous ballot in the tree),
-// backup_required, bad_choice, prover, prover_mismatch, not_open, closed,
-// passkey_cancelled, passkey_unsupported, passkey_noprf, passkey_failed,
-// bad_words, link_expired, stopped. A refusal by the ingest is its reason
-// (SPEC §12), prefixed `reg:` for registrations.
+// the app translates, a detail for the curious (never a secret), and for
+// some codes structured data (the positions of wrong words).
+
+/** The ingest's reasons (SPEC §12), in acks. */
+export type IngestReason =
+	| 'malformed'
+	| 'version'
+	| 'unknown'
+	| 'not_open'
+	| 'closed'
+	| 'bad_sig'
+	| 'stale_date'
+	| 'uid_used'
+	| 'id_used'
+	| 'bad_proof'
+	| 'old_root'
+	| 'revote_off'
+	| 'stale_seq'
+	| 'duplicate'
+	| 'not_due'
+	| 'bad_tally'
+	| 'bad_setup'
+	| 'rejected';
+
+/** The session's own codes. */
+export type SessionErrorCode =
+	/** Called before init(), or without what the call needs. */
+	| 'not_ready'
+	/** The mirror has no usable setup (missing, malformed, of another origin). */
+	| 'no_setup'
+	/** A setup or a tally the mirror serves is not proven in the signed log. */
+	| 'unproven'
+	/** A checkpoint does not verify under the pinned key, or the ledger names another log key. */
+	| 'log_key'
+	/** The mirror cannot be read (network, HTTP, timeout). */
+	| 'mirror'
+	/** The newest checkpoint is older than 30 minutes: no ballot is drafted against it. */
+	| 'stale_mirror'
+	/** No channel took the message. */
+	| 'no_relay'
+	/** Channels took it, none acknowledged it. */
+	| 'no_ack'
+	/** The scanned proof is too old: scan again (the same registration key). */
+	| 'stale_proof'
+	| 'not_registered'
+	/** The mirror and the checkpoint disagree on a tree. */
+	| 'no_path'
+	/** A delta correction waits for its previous ballot in the ballot tree. */
+	| 'previous_pending'
+	/** No registration and no ballot before a backup is confirmed. */
+	| 'backup_required'
+	| 'bad_choice'
+	| 'prover'
+	| 'prover_mismatch'
+	/** A ballot waits for its ack: resend or discard it first. */
+	| 'pending'
+	| 'cast_retries'
+	| 'key_exists'
+	| 'passkey_cancelled'
+	| 'passkey_unsupported'
+	| 'passkey_noprf'
+	/** The passkey is not synced (backup state 0): it is no backup, use the words. */
+	| 'passkey_not_backed_up'
+	| 'passkey_failed'
+	/** Words not on the list (data.unknown: 1-based positions), not twelve, or a bad checksum. */
+	| 'bad_words'
+	/** The ledger has no Nostr relay: no device link. */
+	| 'link_unavailable'
+	/** A device link code that is not a public key. */
+	| 'bad_link_key'
+	| 'link_expired'
+	| 'stopped';
+
+export type IsoloirErrorCode = SessionErrorCode | IngestReason | `reg:${IngestReason}`;
 
 export class IsoloirError extends Error {
 	constructor(
-		readonly code: string,
-		readonly detail = ''
+		readonly code: IsoloirErrorCode,
+		readonly detail = '',
+		readonly data?: Record<string, unknown>
 	) {
 		super(detail ? `${code}: ${detail}` : code);
 		this.name = 'IsoloirError';
 	}
 }
 
-export function toIsoloirError(e: unknown, fallback = 'unknown'): IsoloirError {
+export function toIsoloirError(e: unknown, fallback: IsoloirErrorCode = 'unknown'): IsoloirError {
 	if (e instanceof IsoloirError) return e;
 	const msg = e instanceof Error ? e.message : String(e);
 	return new IsoloirError(fallback, msg);
+}
+
+const REASONS: readonly string[] = ['malformed', 'version', 'unknown', 'not_open', 'closed', 'bad_sig', 'stale_date', 'uid_used', 'id_used', 'bad_proof', 'old_root', 'revote_off', 'stale_seq', 'duplicate', 'not_due', 'bad_tally', 'bad_setup', 'rejected'];
+
+/** An ack's reason as a code (an unknown one is 'rejected'). */
+export function reasonOf(r: string | undefined): IngestReason {
+	return (r && REASONS.includes(r) ? r : 'rejected') as IngestReason;
 }

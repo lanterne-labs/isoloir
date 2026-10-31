@@ -14,9 +14,12 @@ export interface CredentialsApi {
 export interface PasskeyOptions {
 	/** The relying party: the page's host by default. */
 	rpId?: string;
+	/** The names the platform shows: the registry's name by default. */
 	rpName?: string;
 	userName?: string;
 	credentials?: CredentialsApi;
+	/** Whether the platform supports PRF (default: PublicKeyCredential.getClientCapabilities; unknown with injected credentials). */
+	prfCapability?: () => Promise<boolean | null>;
 	random?: (n: number) => Uint8Array;
 }
 
@@ -44,6 +47,27 @@ function passkeyError(e: unknown): IsoloirError {
 	if (name === 'NotAllowedError' || name === 'AbortError') return new IsoloirError('passkey_cancelled');
 	if (name === 'NotSupportedError' || name === 'SecurityError') return new IsoloirError('passkey_unsupported', name);
 	return new IsoloirError('passkey_failed', e instanceof Error ? e.message : String(e));
+}
+
+/**
+ * The backup state (BS, flag bit 4) of authenticator data: whether the
+ * passkey is synced off the device. Null when the platform does not give
+ * the data.
+ */
+export function backupState(authData: ArrayBuffer | ArrayBufferView | null | undefined): boolean | null {
+	if (!authData) return null;
+	const b = bytesOf(authData);
+	if (b.length < 33) return null;
+	return (b[32] & 0x10) !== 0;
+}
+
+function authDataOf(cred: PublicKeyCredential): ArrayBuffer | null {
+	const r = cred.response as { getAuthenticatorData?: () => ArrayBuffer; authenticatorData?: ArrayBuffer } | undefined;
+	try {
+		return r?.getAuthenticatorData?.() ?? r?.authenticatorData ?? null;
+	} catch {
+		return null;
+	}
 }
 
 interface PrfResults {
@@ -83,6 +107,10 @@ export async function prfCapability(): Promise<boolean | null> {
  * any passkey of this relying party (a restore).
  */
 export async function assertPrf(input: Uint8Array, opts: PasskeyOptions = {}, credentialId?: string): Promise<Uint8Array> {
+	return (await assertPrfWithState(input, opts, credentialId)).prf;
+}
+
+async function assertPrfWithState(input: Uint8Array, opts: PasskeyOptions, credentialId?: string): Promise<{ prf: Uint8Array; backedUp: boolean | null }> {
 	let cred: Credential | null;
 	try {
 		cred = await credentials(opts).get({
@@ -101,16 +129,19 @@ export async function assertPrf(input: Uint8Array, opts: PasskeyOptions = {}, cr
 	const ext = (cred as PublicKeyCredential).getClientExtensionResults() as PrfResults;
 	const first = ext.prf?.results?.first;
 	if (!first) throw new IsoloirError('passkey_noprf');
-	return bytesOf(first);
+	return { prf: bytesOf(first), backedUp: backupState(authDataOf(cred as PublicKeyCredential)) };
 }
 
 /**
  * Creates a passkey and reads its PRF output (one prompt where the
  * platform evaluates PRF at creation, else a second for an assertion).
  * Throws passkey_noprf when the platform gives none: the words are then
- * the way.
+ * the way. `backedUp` is the passkey's backup state (synced or not; null
+ * when the platform does not say).
  */
-export async function createPrf(input: Uint8Array, opts: PasskeyOptions = {}): Promise<{ prf: Uint8Array; credentialId: string }> {
+export async function createPrf(input: Uint8Array, opts: PasskeyOptions = {}): Promise<{ prf: Uint8Array; credentialId: string; backedUp: boolean | null }> {
+	// A platform that says it has no PRF gets no passkey (it would be an orphan).
+	if ((await (opts.prfCapability ?? (opts.credentials ? async () => null : prfCapability))()) === false) throw new IsoloirError('passkey_noprf');
 	let cred: Credential | null;
 	try {
 		cred = await credentials(opts).create({
@@ -134,6 +165,9 @@ export async function createPrf(input: Uint8Array, opts: PasskeyOptions = {}): P
 	const ext = pk.getClientExtensionResults() as PrfResults;
 	if (!ext.prf?.enabled && !ext.prf?.results?.first) throw new IsoloirError('passkey_noprf');
 	const credentialId = b64url(new Uint8Array(pk.rawId));
-	const first = ext.prf.results?.first;
-	return { prf: first ? bytesOf(first) : await assertPrf(input, opts, credentialId), credentialId };
+	const first = ext.prf?.results?.first;
+	const created = backupState(authDataOf(pk));
+	if (first) return { prf: bytesOf(first), credentialId, backedUp: created };
+	const asserted = await assertPrfWithState(input, opts, credentialId);
+	return { prf: asserted.prf, credentialId, backedUp: asserted.backedUp ?? created };
 }

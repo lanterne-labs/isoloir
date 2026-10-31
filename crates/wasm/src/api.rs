@@ -535,6 +535,34 @@ pub fn verify_note(note: &str, verifier_key: &str) -> R<String> {
     Ok(out(&checkpoint_json(&c)))
 }
 
+// ----------------------------------------------------------------- log
+
+fn hash32(s: &str) -> R<[u8; 32]> {
+    let h = s.strip_prefix("0x").unwrap_or(s);
+    if h.len() != 64 {
+        return Err("a hash is 64 hex digits".into());
+    }
+    hex::decode(h).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| "a hash is 64 hex digits".to_string())
+}
+
+/// Whether an entry (`seq`, `kind`, `body`) is leaf `seq` of the log of a
+/// checkpoint (its `size` and base64 `root`), by its RFC 6962 inclusion
+/// proof (SPEC §4): what a browser checks before it trusts a setup or a
+/// tally the mirror serves.
+pub fn verify_logged(seq: u64, kind: &str, body: &str, path_json: &str, size: u64, root_b64: &str) -> R<bool> {
+    use base64::Engine;
+    use isoloir_proto::log;
+    let path: Vec<String> = parse(path_json, "path")?;
+    let path: Vec<[u8; 32]> = path.iter().map(|h| hash32(h)).collect::<R<_>>()?;
+    let root: [u8; 32] = base64::engine::general_purpose::STANDARD
+        .decode(root_b64)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or("root: 32 bytes of base64")?;
+    let leaf = log::leaf_hash(&log::leaf_data(seq, kind, body.as_bytes()));
+    Ok(log::verify_inclusion(&leaf, seq, size, &path, &root))
+}
+
 // -------------------------------------------------------------- nostr
 
 /// Signs a Nostr event. An empty `sk_hex` signs with a fresh throwaway key
@@ -614,14 +642,18 @@ pub fn verify_tally(poll_json: &str, tally_text: &str) -> R<String> {
                 Some(b) => isoloir_decrypt::tlock::DrandTlock.verify_beacon(&p.encryption, b),
                 None => false,
             };
-            ("beacon", if ok { Ok(()) } else { Err("the beacon does not verify".to_string()) })
+            // The openings need every ballot of the log: an auditor checks
+            // them. A browser can only say the beacon is the round's.
+            ("beacon", if ok { Err("beacon verified; the openings are not checked in the browser".to_string()) } else { Err("the beacon does not verify".to_string()) })
         }
     };
     let res = results::of(&p, &v, &t.values, t.counted)?;
     let tv: Value = serde_json::from_str(tally_text).map_err(err)?;
+    let beacon_ok = checked == "beacon" && verdict.as_ref().err().is_some_and(|e| e.starts_with("beacon verified"));
     Ok(out(&json!({
         "ok": verdict.is_ok(),
         "checked": checked,
+        "beacon_ok": beacon_ok,
         "error": verdict.err(),
         "tally": tv,
         "results": res,

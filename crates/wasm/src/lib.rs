@@ -110,6 +110,22 @@ mod bind {
     }
 
     #[wasm_bindgen]
+    pub fn check_words(words: &str, lang: &str) -> Out {
+        js(words::check_words(words, lang))
+    }
+
+    /// One word in the list's spelling, or an empty string when it is not on the list.
+    #[wasm_bindgen]
+    pub fn canonical_word(word: &str, lang: &str) -> Out {
+        js(words::canonical_word(word, lang).map(|w| w.unwrap_or_default()))
+    }
+
+    #[wasm_bindgen]
+    pub fn verify_logged(seq: f64, kind: &str, body: &str, path_json: &str, size: f64, root_b64: &str) -> Result<bool, JsError> {
+        api::verify_logged(u64_of(seq, "seq")?, kind, body, path_json, u64_of(size, "size")?, root_b64).map_err(|e| JsError::new(&e))
+    }
+
+    #[wasm_bindgen]
     pub fn relay_ranking(s: &str, urls_json: &str) -> Out {
         js(api::relay_ranking(s, urls_json))
     }
@@ -277,6 +293,11 @@ mod bind {
         #[wasm_bindgen]
         pub fn dev_tlock_open(signature: &str, blob: &str) -> Out {
             js(dev::tlock_open(signature, blob))
+        }
+
+        #[wasm_bindgen]
+        pub fn dev_log_proof(entries_json: &str, i: u32, n: u32) -> Out {
+            js(dev::log_proof(entries_json, i, n))
         }
 
         #[wasm_bindgen]

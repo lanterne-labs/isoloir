@@ -228,3 +228,51 @@ fn ranked_results() {
     assert_eq!(r["margins"][0][1], json!(-1));
     assert_eq!(r["condorcet"], json!(1));
 }
+
+#[cfg(feature = "dev")]
+#[test]
+fn logged_entries() {
+    let entries = json!([["ledger", "{\"a\":1}"], ["poll", "{\"b\":2}"], ["tally", "{\"c\":3}"]]).to_string();
+    for n in 1..=3u32 {
+        for i in 0..n {
+            let p = v(&crate::dev::log_proof(&entries, i, n).unwrap());
+            let kinds = ["ledger", "poll", "tally"];
+            let bodies = ["{\"a\":1}", "{\"b\":2}", "{\"c\":3}"];
+            let (root, path) = (p["root"].as_str().unwrap(), p["path"].to_string());
+            assert!(api::verify_logged(i as u64, kinds[i as usize], bodies[i as usize], &path, n as u64, root).unwrap(), "{i} of {n}");
+            assert!(!api::verify_logged(i as u64, kinds[i as usize], "{\"x\":0}", &path, n as u64, root).unwrap());
+            assert!(!api::verify_logged(i as u64, "close", bodies[i as usize], &path, n as u64, root).unwrap());
+        }
+    }
+}
+
+#[test]
+fn delta_results_do_not_count_withdrawals() {
+    let (poll, _) = elgamal_poll("delta", "choice4_elgamal_delta_d20_b22", Some(22));
+    let r = v(&api::tally_results(&poll.to_string(), "[1,0,0,0]", 3).unwrap());
+    assert_eq!(r["none"], Value::Null);
+    assert_eq!(r["ballots"], json!("corrections"));
+    let (poll, _) = elgamal_poll("linked", "choice4_elgamal_linked_d20", None);
+    let r = v(&api::tally_results(&poll.to_string(), "[1,0,0,0]", 3).unwrap());
+    assert_eq!(r["none"], json!(2));
+}
+
+#[test]
+fn a_tlock_tally_is_never_ok_in_the_browser() {
+    let chain = TestChain::new(3);
+    let poll = json!({
+        "v": 1, "id": 8, "version": 1, "registry": 1, "title": "t",
+        "kind": {"type": "choice", "options": ["Oui", "Non"], "blank": false},
+        "encryption": {"mode": "tlock", "chain": "c", "public_key": hex::encode(chain.public_key()), "period": 3, "genesis": 0, "round": 100},
+        "publish": {"mode": "closed"}, "revote": "none", "opens": 0, "closes": 2_000_000_000u64,
+        "circuit": {"name": "choice4_tlock_linked_d20", "vk_hash": format!("0x{}", "0".repeat(64))},
+    });
+    let tally = |sig: Vec<u8>| {
+        isoloir_core::canonical::to_string(&json!({"v": 1, "poll": 8, "upto": 5, "final": true, "values": [0, 1, 0, 0], "counted": 1,
+            "beacon": {"round": 100, "signature": hex::encode(sig)}, "void": []})).unwrap()
+    };
+    let r = v(&api::verify_tally(&poll.to_string(), &tally(chain.sign(100))).unwrap());
+    assert_eq!((r["ok"].clone(), r["checked"].clone(), r["beacon_ok"].clone()), (json!(false), json!("beacon"), json!(true)));
+    let r = v(&api::verify_tally(&poll.to_string(), &tally(chain.sign(101))).unwrap());
+    assert_eq!((r["ok"].clone(), r["beacon_ok"].clone()), (json!(false), json!(false)));
+}

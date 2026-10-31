@@ -4,21 +4,27 @@
 // read at the checkpoint's commit (its `mirror` token) where a source
 // serves by commit, so a reader can prove which files it was served.
 //
+// A setup or a tally is used only once proven in the log: its file names
+// the checkpoint c whose log holds it and the RFC 6962 inclusion proof of
+// its leaf; c's note is fetched and verified under the pinned key, and
+// the proof checked against c's root by the wasm core. A mirror cannot
+// serve another ingest key, other channels or another poll key.
+//
 // File formats this reader expects (the ingest writes them):
 //   checkpoint.txt, checkpoints/<i>.txt   a signed note
 //   entries/<i>.json                       [{seq, kind, body}], body the logged text (or its JSON)
-//   setup/ledger.json                      {seq, body}
-//   registries/<id>.json, polls/<id>.json  {setups: [{seq, body}, …]}: every version, the last in force
-//                                          (a bare {seq, body}, or the body alone, are read too)
+//   setup/ledger.json, registries/<id>.json, polls/<id>.json
+//                                          {setups: [{seq, body, checkpoint, size, path}, …]}: every
+//                                          version in order, the last in force
 //   registries/<id>/leaves/<k>.json        ["0x…", …] leaves 1024·k … 1024·k+1023
 //   registries/<id>/positions/<pp>.json    {"0x<leaf>": position}, pp the leaf's first two hex digits
 //   polls/<id>/pseudonyms/<pp>.json        {"0x<nullifier>": last seq}
 //   polls/<id>/ballots/<k>.json            ["0x…", …] ballot tree leaves, 1024 per file
-//   polls/<id>/tallies/latest.json         {seq, body} (or the bare body)
+//   polls/<id>/tallies/latest.json         {seq, body, checkpoint, size, path}
 //   circuits/<name>/artifact.json          the compiled Noir circuit
 
 import { IsoloirError } from './errors.js';
-import type { Checkpoint, Entry, Setup } from './types.js';
+import type { Checkpoint, Entry, Logged, Setup } from './types.js';
 import type { Core } from './wasm.js';
 
 export const SHARD = 1024;
@@ -29,7 +35,24 @@ export interface FetchResponse {
 	text(): Promise<string>;
 }
 
-export type Fetcher = (url: string, init?: { cache?: string; credentials?: string }) => Promise<FetchResponse>;
+export type Fetcher = (url: string, init?: { cache?: string; credentials?: string; signal?: AbortSignal }) => Promise<FetchResponse>;
+
+/** A fetch that gives up after `ms`: a hung request never freezes the session. */
+export async function withTimeout<T>(ms: number, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+	const ctl = new AbortController();
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => {
+			ctl.abort();
+			reject(new Error(`timeout after ${ms} ms`));
+		}, ms);
+	});
+	try {
+		return await Promise.race([run(ctl.signal), timeout]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
 
 export interface MirrorSource {
 	/** The address of a path at a commit token ('' for the latest files). */
@@ -62,7 +85,8 @@ export class Mirror {
 		private readonly core: Core,
 		private readonly sources: MirrorSource[],
 		private readonly verifierKey: string,
-		fetcher?: Fetcher
+		fetcher?: Fetcher,
+		private readonly timeoutMs = 15_000
 	) {
 		if (sources.length === 0) throw new IsoloirError('no_setup', 'no mirror source');
 		this.fetcher = fetcher ?? ((url, init) => fetch(url, init as RequestInit));
@@ -81,13 +105,17 @@ export class Mirror {
 		let missing = false;
 		for (const a of this.attempts(token)) {
 			try {
-				const res = await this.fetcher(a.source.url(path, a.token), { credentials: 'omit', cache: a.token ? 'force-cache' : 'no-cache' });
-				if (res.status === 404) {
+				const got = await withTimeout(this.timeoutMs, async (signal) => {
+					const res = await this.fetcher(a.source.url(path, a.token), { credentials: 'omit', cache: a.token ? 'force-cache' : 'no-cache', signal });
+					if (res.status === 404) return null;
+					if (!res.ok) throw new Error(`HTTP ${res.status}`);
+					return await res.text();
+				});
+				if (got === null) {
 					missing = true;
 					continue;
 				}
-				if (!res.ok) throw new Error(`HTTP ${res.status}`);
-				return await res.text();
+				return got;
 			} catch (e) {
 				lastErr = e;
 			}
@@ -142,26 +170,42 @@ export class Mirror {
 		return list.map((e) => ({ seq: e.seq, kind: e.kind, body: typeof e.body === 'string' ? e.body : this.core.canonical(e.body) }));
 	}
 
-	/** A setup file (SPEC §15): its body, checked by the wasm core, and its seq. */
-	async setup<T>(path: string, kind: string, token = ''): Promise<Setup<T> | null> {
-		let raw = await this.json<Record<string, unknown>>(path, token);
-		if (raw === null) return null;
-		if (Array.isArray(raw.setups)) {
-			const last = raw.setups[raw.setups.length - 1] as Record<string, unknown> | undefined;
-			if (!last) return null;
-			raw = last;
+	/**
+	 * Proves an entry in the log: checkpoint c's note (verified under the
+	 * pinned key) has the size the proof is for, and the proof leads from
+	 * the entry's leaf to its root. Throws unproven otherwise.
+	 */
+	async prove(rec: Logged, kind: string, what: string): Promise<Checkpoint> {
+		if (!Number.isInteger(rec.seq) || !Number.isInteger(rec.checkpoint) || !Number.isInteger(rec.size) || !Array.isArray(rec.path) || typeof rec.body !== 'string') {
+			throw new IsoloirError('unproven', `${what}: no inclusion proof`);
 		}
-		const wrapped = 'body' in raw && !('v' in raw);
-		const inner = wrapped ? raw.body : raw;
-		const text = typeof inner === 'string' ? inner : this.core.canonical(inner);
+		const cp = await this.checkpoint(rec.checkpoint);
+		if (!cp) throw new IsoloirError('unproven', `${what}: checkpoint ${rec.checkpoint} is not on the mirror`);
+		if (cp.size !== rec.size) throw new IsoloirError('unproven', `${what}: a proof for ${rec.size} entries, checkpoint ${rec.checkpoint} has ${cp.size}`);
+		let ok = false;
+		try {
+			ok = this.core.verifyLogged(rec.seq, kind, rec.body, rec.path, rec.size, cp.root);
+		} catch (e) {
+			throw new IsoloirError('unproven', `${what}: ${e instanceof Error ? e.message : String(e)}`);
+		}
+		if (!ok) throw new IsoloirError('unproven', `${what}: the inclusion proof does not hold`);
+		return cp;
+	}
+
+	/** A setup file (SPEC §15): its last version, proven in the log, decoded by the wasm core. */
+	async setup<T>(path: string, kind: string, token = ''): Promise<Setup<T> | null> {
+		const raw = await this.json<{ setups?: Logged[] }>(path, token);
+		if (raw === null) return null;
+		const last = Array.isArray(raw.setups) ? raw.setups[raw.setups.length - 1] : undefined;
+		if (!last) throw new IsoloirError('no_setup', `${path}: no setup`);
+		await this.prove(last, kind, path);
 		let body: T;
 		try {
-			body = this.core.decodeBody<T>(kind, text);
+			body = this.core.decodeBody<T>(kind, last.body);
 		} catch (e) {
 			throw new IsoloirError('no_setup', `${path}: ${e instanceof Error ? e.message : String(e)}`);
 		}
-		const seq = wrapped && typeof raw.seq === 'number' ? raw.seq : null;
-		return { seq, body, text };
+		return { seq: last.seq, body, text: last.body, checkpoint: last.checkpoint };
 	}
 
 	/** The first `size` leaves of a sharded tree file set. */
@@ -188,14 +232,12 @@ export class Mirror {
 		return shard?.[nullifier] ?? null;
 	}
 
-	/** The latest tally's body text. */
-	async latestTally(poll: number, token = ''): Promise<string | null> {
-		const text = await this.text(`polls/${poll}/tallies/latest.json`, token);
-		if (text === null) return null;
-		const t = text.trim();
-		const v = JSON.parse(t) as Record<string, unknown>;
-		if ('v' in v) return t;
-		if (typeof v.body === 'string') return v.body;
-		return this.core.canonical(v.body);
+	/** The latest tally: its body text and seq, proven in the log. */
+	async latestTally(poll: number, token = ''): Promise<{ seq: number; body: string; checkpoint: number } | null> {
+		const path = `polls/${poll}/tallies/latest.json`;
+		const rec = await this.json<Logged>(path, token);
+		if (rec === null) return null;
+		await this.prove(rec, 'tally', path);
+		return { seq: rec.seq, body: rec.body, checkpoint: rec.checkpoint };
 	}
 }

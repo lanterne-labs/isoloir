@@ -4,34 +4,42 @@
 // endpoint: channel.ts), as the ledger setup on the mirror lists them;
 // every protocol rule is the wasm core's. TypeScript only orchestrates:
 //
-//   key        a passkey's PRF, 12 words, or a device link (SPEC §14)
+//   setups     the ledger, the registry, the poll and every tally are
+//              used only once proven in the signed log (mirror.ts)
+//   key        a passkey's PRF (synced passkeys only), 12 words, or a
+//              device link the receiver confirmed (SPEC §14); no
+//              registration and no ballot before a backup
 //   register   the registration key is drawn before the passport scan,
 //              the proof waits for the key, then the body is signed and
 //              posted (SPEC §6)
-//   post       a signed event to the key's channel, the ingest's signed
-//              ack awaited 60 s, then the next channel (SPEC §11.1); the event
-//              and the ack are kept, so a missed ack is a resend of the
-//              same event, never a lost message
-//   receipt    the acked body's hash among the entries of the checkpoint
-//              the ack named; missing: a complaint (SPEC §11.3)
-//   ballot     drafted by wasm, proven by the Prover, re-votes for linked
-//              and delta polls (SPEC §7.4)
-//   results    the latest tally, verified by wasm (SPEC §10.3)
+//   post       the body in a fresh envelope on the key's channel, the
+//              ingest's signed ack awaited 60 s, then the next channel
+//              (SPEC §11.1); the body and the ack are kept, so a missed
+//              ack is a resend, never a lost message
+//   receipt    the entries of every checkpoint since the post, read in
+//              order (a window that does not depend on the ack); an acked
+//              body missing from the checkpoint its ack named is a
+//              complaint (SPEC §11.3)
+//   ballot     drafted by wasm against a checkpoint at most 30 minutes
+//              old, proven by the Prover, re-votes for linked and delta
+//              polls (SPEC §7.4)
+//   results    the latest tally, proven in the log and verified by wasm
 //
 // One rule above the others: the voter is never stuck. Every wait is a
 // named state, every failure a code (errors.ts) with a next step.
 
 import { Emitter, ServerClock } from './events.js';
-import { IsoloirError, toIsoloirError } from './errors.js';
+import { IsoloirError, reasonOf, toIsoloirError } from './errors.js';
 import { Mirror, dirSource, type Fetcher, type MirrorSource } from './mirror.js';
 import { createPrf, assertPrf, prfInput, type PasskeyOptions } from './passkey.js';
 import type { Prover } from './prover.js';
 import { defaultChannelFactory, findAck, postWithAck, type Acked, type ChannelFactory, type IngestChannel, type PostProgress } from './channel.js';
-import { defaultStore, readJSON, writeJSON, type KeyValueStore } from './storage.js';
+import { defaultStore, readJSON, writeJSON, type KeyValueStore, type StorageMode } from './storage.js';
 import type {
 	Channel,
 	Checkpoint,
 	Choice,
+	Entry,
 	KindInfo,
 	LedgerSetup,
 	NostrEvent,
@@ -67,6 +75,7 @@ export interface SessionConfig {
 	 */
 	channels?: ChannelFactory;
 	prover?: Prover;
+	/** WebAuthn options; the names shown default to the registry's name. */
 	passkey?: PasskeyOptions;
 	/** The word list of the 12 words: 'en' (default) or 'fr'. */
 	wordsLang?: string;
@@ -75,7 +84,11 @@ export interface SessionConfig {
 	publishTimeoutMs?: number;
 	/** How often the direct endpoint is asked for a pending ack (default 2 s). */
 	directPollMs?: number;
-	/** How often the mirror is read while something waits (0: never; the app calls refresh()). */
+	/** How long a mirror file may take (default 15 s). */
+	mirrorTimeoutMs?: number;
+	/** The oldest checkpoint a ballot is drafted against, by the local clock (default 30 min). */
+	maxCheckpointAgeMs?: number;
+	/** How often the mirror is read (0: never; the app calls refresh()). */
 	refreshMs?: number;
 	/** Follow the ingest's checkpoint events on a relay, when the ledger has one (default true). */
 	watchRelays?: boolean;
@@ -89,14 +102,20 @@ export interface SessionConfig {
 
 export type PostState = 'kept' | 'sent' | 'acked' | 'verified' | 'missing' | 'rejected';
 
-/** A message as the device keeps it: the signed event (resent as it is), the ack, the receipt. */
+/** A message as the device keeps it: the body (resent in fresh envelopes), the ack, the receipt. */
 export interface PostRecord {
-	event: NostrEvent;
+	/** The body as signed and logged. */
+	body: string;
 	hash: string;
 	state: PostState;
+	/** The last envelope posted, and every envelope a channel took (their acks may come later). */
+	event: NostrEvent;
+	envelopes?: NostrEvent[];
 	/** The channel (its URL) that took it, then the one that acked it. */
 	channel?: string;
 	sentAt?: number;
+	/** The newest checkpoint when it was first posted: its receipt is looked for after it. */
+	since?: number;
 	ack?: { event: NostrEvent; checkpoint: number | null };
 	reason?: string;
 	/** Where the body was found: its log seq and checkpoint. */
@@ -109,6 +128,8 @@ export interface PostRecord {
 
 export interface RegistrationRecord extends PostRecord {
 	proofDate: number;
+	/** A registration that replaced an earlier one of the same key (a stale proof scanned again). */
+	replaced?: boolean;
 }
 
 export interface BallotRecord extends PostRecord {
@@ -142,6 +163,7 @@ export interface StoredKey {
 	source: KeySource;
 	words?: string;
 	credentialId?: string;
+	/** What copies of the key exist: confirmed words, a synced passkey, devices that confirmed a link. */
 	backups: { words: boolean; passkey: boolean; linked: number };
 	leaf: string;
 	position: number;
@@ -167,6 +189,14 @@ interface LinkPayload {
 	words?: string;
 	position: number;
 	polls: Record<string, { seq?: number; delta?: DeltaRecord }>;
+	/** The sender's reply key: the receiver confirms the adoption sealed for it. */
+	reply?: string;
+}
+
+interface LinkConfirmation {
+	v: 1;
+	confirm: string;
+	leaf: string;
 }
 
 // ------------------------------------------------------------ state
@@ -197,6 +227,12 @@ export interface BallotView {
 	kept?: boolean;
 }
 
+/** The answer to a check of the words: `wrong` the 1-based positions that do not match. */
+export interface WordsConfirmation {
+	ok: boolean;
+	wrong: number[];
+}
+
 export interface SessionState {
 	phase: Phase;
 	error: { code: string; detail: string } | null;
@@ -206,6 +242,8 @@ export interface SessionState {
 	kind: KindInfo | null;
 	pollStatus: 'none' | 'upcoming' | 'open' | 'closed';
 	checkpoint: Checkpoint | null;
+	/** How old the newest checkpoint is by the local clock, seconds; past 30 minutes no ballot is drafted (stale_mirror). */
+	checkpointAge: number | null;
 	key: {
 		leaf: string;
 		source: KeySource;
@@ -217,12 +255,17 @@ export interface SessionState {
 	ballot: BallotView;
 	/** The poll's last ballot from this device, as remembered (linked: its seq; delta: the chain). */
 	revote: { seq: number | null; next: number | null; previousChoice: Choice | null };
+	/** The last tally that verified (never replaced by one that does not). */
 	tally: TallyVerdict | null;
+	/** A newer tally that did not verify, or could not be proven in the log, and why. */
+	tallyUnverified: { verdict: TallyVerdict | null; error: string } | null;
 	prover: 'idle' | 'loading' | 'ready' | 'failed';
 	/** The ledger's active channels. */
 	channels: Channel[];
 	/** Whether a device link can be made (it needs a Nostr relay among the channels). */
 	linkAvailable: boolean;
+	/** How the key is kept by the browser. */
+	storage: StorageMode;
 }
 
 export interface SessionEvents {
@@ -244,8 +287,18 @@ export interface LinkReceiver {
 	done: Promise<void>;
 }
 
+/** A key sent to another device: the code to show, and whether the receiver adopted it. */
+export interface LinkSender {
+	code: string;
+	/** True once the receiver confirmed (the link then counts as a backup); false after 15 minutes or stop(). */
+	confirmed: Promise<boolean>;
+	stop(): void;
+}
+
 const LINK_TIMEOUT = 15 * 60_000;
 const LATE_SEARCH = 16;
+const WINDOW_MAX = 64;
+const ENVELOPES_KEPT = 8;
 
 // ------------------------------------------------------------ session
 
@@ -257,8 +310,10 @@ export class Session {
 	private readonly channelFactory: ChannelFactory;
 	private channels: IngestChannel[] = [];
 	private readonly clock: ServerClock;
+	private readonly local: () => number;
 	private readonly keyName: string;
 	private readonly scanName: string;
+	private readonly cursorName: string;
 	private readonly ackTimeoutMs: number;
 
 	private ledger: Setup<LedgerSetup> | null = null;
@@ -271,9 +326,12 @@ export class Session {
 	private registration: RegistrationView = { state: 'none' };
 	private ballot: BallotView = { state: 'idle' };
 	private tally: TallyVerdict | null = null;
+	private tallyUnverified: SessionState['tallyUnverified'] = null;
 	private proverState: SessionState['prover'] = 'idle';
+	private storageMode: StorageMode = 'best-effort';
 	private member: TreePath | null = null;
 	private seqFloor = -1;
+	private dupRetried = false;
 	private timer: ReturnType<typeof setInterval> | null = null;
 	private stopWatch: (() => void) | null = null;
 	private refreshing: Promise<void> | null = null;
@@ -282,12 +340,14 @@ export class Session {
 	constructor(private readonly config: SessionConfig) {
 		this.core = config.core instanceof Core ? config.core : new Core(config.core);
 		const sources = typeof config.mirror === 'string' ? [dirSource(config.mirror)] : config.mirror;
-		this.mirror = new Mirror(this.core, sources, config.verifierKey, config.fetch);
+		this.mirror = new Mirror(this.core, sources, config.verifierKey, config.fetch, config.mirrorTimeoutMs);
 		this.store = config.store ?? defaultStore();
 		this.channelFactory = config.channels ?? defaultChannelFactory({ publishTimeoutMs: config.publishTimeoutMs, directPollMs: config.directPollMs });
-		this.clock = new ServerClock(config.now ?? (() => Date.now()));
+		this.local = config.now ?? (() => Date.now());
+		this.clock = new ServerClock(this.local);
 		this.keyName = `isoloir/${config.origin}/${config.registry}/key`;
 		this.scanName = `isoloir/${config.origin}/${config.registry}/scan`;
+		this.cursorName = `isoloir/${config.origin}/${config.registry}/cursor`;
 		this.ackTimeoutMs = config.ackTimeoutMs ?? 60_000;
 	}
 
@@ -315,6 +375,7 @@ export class Session {
 			kind: this.kind,
 			pollStatus: this.pollStatus(),
 			checkpoint: this.cp,
+			checkpointAge: this.cp ? Math.max(0, Math.floor(this.local() / 1000) - this.cp.time) : null,
 			key: k
 				? { leaf: k.leaf, source: k.source, backedUp: this.backedUp(k), hasWords: !!k.words, position: k.position >= 0 ? k.position : null }
 				: null,
@@ -326,36 +387,41 @@ export class Session {
 				previousChoice: rec?.delta?.previous?.choice ?? null
 			},
 			tally: this.tally,
+			tallyUnverified: this.tallyUnverified,
 			prover: this.proverState,
 			channels: (this.ledger?.body.channels ?? []).filter((c) => c.state === 'active'),
-			linkAvailable: this.relays().length > 0
+			linkAvailable: this.relays().length > 0,
+			storage: this.storageMode
 		};
 	}
 
-	/** The server's time, ms (from the checkpoints). */
+	/** The server's time, ms (from the checkpoints): the proof date of a scan is this. */
 	serverNow(): number {
 		return this.clock.now();
 	}
 
-	/** Reads the setups and the latest checkpoint, then resumes whatever this device left pending. */
+	/** Reads the setups (each proven in the log) and the latest checkpoint, then resumes whatever this device left pending. */
 	async init(): Promise<void> {
 		this.phaseOverride = 'loading';
 		this.error = null;
 		this.emit();
 		try {
+			this.storageMode = this.store.persist ? await this.store.persist().catch(() => 'best-effort' as const) : 'best-effort';
 			const ledger = await this.mirror.setup<LedgerSetup>('setup/ledger.json', 'ledger');
 			if (!ledger) throw new IsoloirError('no_setup', 'setup/ledger.json');
 			if (ledger.body.origin !== this.config.origin) throw new IsoloirError('no_setup', `the mirror is of ${ledger.body.origin}`);
+			if (ledger.body.log_key !== this.config.verifierKey) throw new IsoloirError('log_key', 'the ledger names another log key');
 			this.ledger = ledger;
 			this.channels = ledger.body.channels.filter((c) => c.state === 'active').map((c) => this.channelFactory(c));
 			if (this.channels.length === 0) throw new IsoloirError('no_setup', 'the ledger has no active channel');
 			const registry = await this.mirror.setup<RegistrySetup>(`registries/${this.config.registry}.json`, 'registry');
 			if (!registry) throw new IsoloirError('no_setup', `registries/${this.config.registry}.json`);
+			if (registry.body.id !== this.config.registry) throw new IsoloirError('no_setup', 'another registry');
 			this.registry = registry;
 			if (this.config.poll !== undefined) {
 				const poll = await this.mirror.setup<PollSetup>(`polls/${this.config.poll}.json`, 'poll');
 				if (!poll) throw new IsoloirError('no_setup', `polls/${this.config.poll}.json`);
-				if (poll.body.registry !== this.config.registry) throw new IsoloirError('no_setup', 'the poll is of another registry');
+				if (poll.body.id !== this.config.poll || poll.body.registry !== this.config.registry) throw new IsoloirError('no_setup', 'the poll is of another registry');
 				this.poll = poll;
 				this.kind = this.core.kindInfo(poll.body);
 			}
@@ -389,6 +455,7 @@ export class Session {
 	forgetKey(): void {
 		this.store.remove(this.keyName);
 		this.store.remove(this.scanName);
+		this.store.remove(this.cursorName);
 		this.registration = { state: 'none' };
 		this.ballot = { state: 'idle' };
 		this.member = null;
@@ -406,7 +473,7 @@ export class Session {
 		const reg = this.requireRegistry();
 		const k = this.key();
 		let scan = readJSON<ScanRecord>(this.store, this.scanName);
-		if (!scan) {
+		if (!scan || (k?.regSecret && scan.regSecret !== k.regSecret)) {
 			scan = { regSecret: k?.regSecret ?? this.core.newRegSecret() };
 			writeJSON(this.store, this.scanName, scan);
 		}
@@ -441,7 +508,7 @@ export class Session {
 	/** A new key from 12 fresh words; returns them (show them, then confirmWords). */
 	createKeyFromWords(): string {
 		this.requireNoKey();
-		const lang = this.config.wordsLang ?? 'en';
+		const lang = this.lang();
 		const words = this.core.newWords(lang);
 		const key = this.newKey(this.core.secretFromWords(words, lang), 'words');
 		key.words = words;
@@ -455,28 +522,59 @@ export class Session {
 		return this.key()?.words ?? null;
 	}
 
-	/** The voter typed the words back: the backup is confirmed when they match. */
-	confirmWords(words: string): boolean {
-		const k = this.key();
-		if (!k?.words) return false;
-		let ok = false;
-		try {
-			ok = this.core.normalizeWords(words, this.config.wordsLang ?? 'en') === this.core.normalizeWords(k.words, this.config.wordsLang ?? 'en');
-		} catch {
-			ok = false;
+	/** Three (or n) distinct random 1-based positions to ask the voter for. */
+	wordChallenge(n = 3): number[] {
+		const all = Array.from({ length: 12 }, (_, i) => i + 1);
+		const r = crypto.getRandomValues(new Uint32Array(12));
+		for (let i = all.length - 1; i > 0; i--) {
+			const j = r[i] % (i + 1);
+			[all[i], all[j]] = [all[j], all[i]];
 		}
+		return all.slice(0, Math.min(n, 12)).sort((a, b) => a - b);
+	}
+
+	/**
+	 * The voter typed the words back: all twelve, or the words at the
+	 * 1-based positions asked (wordChallenge). Case and accents do not
+	 * matter. The backup is confirmed when every one matches.
+	 */
+	confirmWords(words: string): WordsConfirmation;
+	confirmWords(positions: number[], answers: string[]): WordsConfirmation;
+	confirmWords(a: string | number[], answers?: string[]): WordsConfirmation {
+		const k = this.key();
+		if (!k?.words) return { ok: false, wrong: [] };
+		const mine = k.words.split(' ');
+		const lang = this.lang();
+		const positions = typeof a === 'string' ? mine.map((_, i) => i + 1) : a;
+		const given = typeof a === 'string' ? a.trim().split(/\s+/) : (answers ?? []);
+		const wrong: number[] = [];
+		positions.forEach((p, i) => {
+			const w = given[i] !== undefined ? this.core.canonicalWord(given[i], lang) : null;
+			if (!Number.isInteger(p) || p < 1 || p > 12 || w !== mine[p - 1]) wrong.push(p);
+		});
+		const ok = positions.length > 0 && wrong.length === 0 && (typeof a !== 'string' || given.length === 12);
 		if (ok) {
 			k.backups.words = true;
 			this.saveKey(k);
 			this.emit();
 		}
-		return ok;
+		return { ok, wrong };
 	}
 
-	/** A new key from a new passkey's PRF output (nothing to back up). */
+	/**
+	 * A new key from a new passkey's PRF output. Only a synced passkey
+	 * (backup state set) is a backup: otherwise nothing is kept and
+	 * passkey_not_backed_up asks for the words instead.
+	 */
 	async createKeyWithPasskey(): Promise<void> {
 		this.requireNoKey();
-		const { prf, credentialId } = await createPrf(prfInput(this.config.origin, this.config.registry), this.config.passkey);
+		const reg = this.requireRegistry();
+		const { prf, credentialId, backedUp } = await createPrf(prfInput(this.config.origin, this.config.registry), { rpName: reg.name, userName: reg.name, ...this.config.passkey });
+		// A passkey the platform reports as not synced is not a backup: the
+		// words are. A platform that does not report (older authenticators)
+		// is taken at its word, as the approved flow does; the app may ask
+		// for the words too.
+		if (backedUp === false) throw new IsoloirError('passkey_not_backed_up', 'the passkey is not synced');
 		const key = this.newKey(this.core.secretFromPrf(prf), 'passkey');
 		key.credentialId = credentialId;
 		key.backups.passkey = true;
@@ -486,15 +584,19 @@ export class Session {
 
 	/**
 	 * Signs and posts the registration with the scanned proof (SPEC §6,
-	 * step 3). The signed event is kept before it is posted: a missed ack
-	 * is a resend (resendRegistration), never a burnt passport.
+	 * step 3), once the key is backed up. The body is kept before it is
+	 * posted: a missed ack is a resend (resendRegistration), never a burnt
+	 * passport. A kept registration whose proof went stale is replaced by
+	 * one of a fresh scan of the same registration key.
 	 */
 	async submitRegistration(): Promise<void> {
 		const reg = this.requireRegistry();
 		const k = this.requireKey();
 		if (k.position >= 0) return;
-		if (k.registration && k.registration.state !== 'rejected') {
-			if (k.registration.state === 'kept' || k.registration.state === 'sent') return this.resendRegistration();
+		if (!this.backedUp(k)) throw new IsoloirError('backup_required');
+		const r = k.registration;
+		if (r && r.state !== 'rejected') {
+			if (r.state === 'kept' || r.state === 'sent') return this.resendRegistration();
 			return;
 		}
 		const scan = readJSON<ScanRecord>(this.store, this.scanName);
@@ -504,39 +606,56 @@ export class Session {
 			this.emit();
 			throw new IsoloirError('stale_proof');
 		}
-		// Registered already (another device, an earlier visit): nothing to post.
-		if (await this.locate(k)) return;
-		const body = this.core.registerBody({ registry: reg.id, s: k.secret, uid: scan.uid, proof: scan.proof, proof_date: scan.proofDate, reg_secret: scan.regSecret });
-		const event = this.signEvent(this.core.kinds.register, body);
-		k.regSecret = scan.regSecret;
-		k.registration = { event, hash: this.core.bodyHash(body), state: 'kept', proofDate: scan.proofDate };
-		this.saveKey(k);
-		// The key holds the request now; the scan served.
-		this.store.remove(this.scanName);
+		this.recordRegistration(k, reg, scan, false);
 		await this.postRegistration();
 	}
 
-	/** The scan, the key and the post in one call. Returns the words of a words key. */
-	async register(opts: { obtainProof: (req: RegistrationRequest) => Promise<PassportProof>; key: 'passkey' | 'words' }): Promise<{ words?: string }> {
+	/**
+	 * The scan, the key, its backup and the post in one call. A words key
+	 * needs `confirm`: it is given the words and the positions to ask, and
+	 * returns the voter's answers. Returns the words of a words key.
+	 */
+	async register(opts: {
+		obtainProof: (req: RegistrationRequest) => Promise<PassportProof>;
+		key: 'passkey' | 'words';
+		confirm?: (c: { words: string; positions: number[] }) => Promise<string[]>;
+	}): Promise<{ words?: string }> {
 		await this.scanPassport(opts.obtainProof);
 		let words: string | undefined;
 		if (!this.key()) {
 			if (opts.key === 'passkey') await this.createKeyWithPasskey();
 			else words = this.createKeyFromWords();
 		}
+		const k = this.requireKey();
+		if (!this.backedUp(k)) {
+			if (!k.words || !opts.confirm) throw new IsoloirError('backup_required');
+			const positions = this.wordChallenge();
+			const c = this.confirmWords(positions, await opts.confirm({ words: k.words, positions }));
+			if (!c.ok) throw new IsoloirError('bad_words', 'the words typed back do not match', { wrong: c.wrong });
+		}
 		await this.submitRegistration();
 		return { words };
 	}
 
-	/** Posts the kept registration again (the same event) while its proof is fresh. */
+	/**
+	 * Posts the kept registration again (the same body, a fresh envelope)
+	 * while its proof is fresh; with a stale proof and a fresh scan of the
+	 * same registration key, a new registration replaces it.
+	 */
 	async resendRegistration(): Promise<void> {
 		const k = this.requireKey();
+		if (!this.backedUp(k)) throw new IsoloirError('backup_required');
 		const r = k.registration;
 		if (!r || (r.state !== 'kept' && r.state !== 'sent')) throw new IsoloirError('not_ready', 'no registration waits');
 		if (!this.proofFresh(r.proofDate)) {
-			this.registration = { state: 'failed', reason: 'stale_proof', stale: true };
-			this.emit();
-			throw new IsoloirError('stale_proof');
+			const scan = readJSON<ScanRecord>(this.store, this.scanName);
+			if (scan?.proof && scan.uid && scan.proofDate !== undefined && this.proofFresh(scan.proofDate) && scan.regSecret === k.regSecret) {
+				this.recordRegistration(k, this.requireRegistry(), scan, true);
+			} else {
+				this.registration = { state: 'failed', reason: 'stale_proof', stale: true };
+				this.emit();
+				throw new IsoloirError('stale_proof');
+			}
 		}
 		await this.postRegistration();
 	}
@@ -546,17 +665,17 @@ export class Session {
 	/** The key of 12 words, found again: registered, it votes from this device. */
 	async restoreFromWords(words: string): Promise<void> {
 		this.requireNoKey();
-		const lang = this.config.wordsLang ?? 'en';
-		let s: string;
-		let norm: string;
-		try {
-			norm = this.core.normalizeWords(words, lang);
-			s = this.core.secretFromWords(norm, lang);
-		} catch (e) {
-			throw new IsoloirError('bad_words', messageOf(e));
+		const lang = this.lang();
+		const check = this.core.checkWords(words, lang);
+		if (!check.ok || !check.words) {
+			throw new IsoloirError('bad_words', check.unknown.length ? `not on the list at ${check.unknown.join(', ')}` : check.count !== 12 ? `${check.count} words` : 'the checksum does not hold', {
+				unknown: check.unknown,
+				count: check.count,
+				checksum: check.checksum
+			});
 		}
-		const key = this.newKey(s, 'words');
-		key.words = norm;
+		const key = this.newKey(this.core.secretFromWords(check.words, lang), 'words');
+		key.words = check.words;
 		key.backups.words = true;
 		await this.adopt(key, null);
 	}
@@ -564,7 +683,8 @@ export class Session {
 	/** The key of a passkey of this site (any device of the ecosystem). */
 	async restoreWithPasskey(): Promise<void> {
 		this.requireNoKey();
-		const prf = await assertPrf(prfInput(this.config.origin, this.config.registry), this.config.passkey);
+		const reg = this.requireRegistry();
+		const prf = await assertPrf(prfInput(this.config.origin, this.config.registry), { rpName: reg.name, userName: reg.name, ...this.config.passkey });
 		const key = this.newKey(this.core.secretFromPrf(prf), 'passkey');
 		key.backups.passkey = true;
 		await this.adopt(key, null);
@@ -574,7 +694,8 @@ export class Session {
 	 * Waits for a key from another device (SPEC §14): show `publicKey`;
 	 * when a payload arrives, its six digits come as a 'link-offer' event;
 	 * the voter compares them with the sender's and `answer(true)` adopts
-	 * the key. Ends after 15 minutes.
+	 * the key, then confirms it to the sender. Ends after 15 minutes.
+	 * Needs a Nostr relay among the ledger's channels (link_unavailable).
 	 */
 	receiveLink(): LinkReceiver {
 		const relays = this.relays();
@@ -619,7 +740,9 @@ export class Session {
 				taken = true;
 				clearTimeout(expiry);
 				stopAll();
-				this.adoptLinked(p.payload).then(settle.resolve, (e: unknown) => settle.reject(toIsoloirError(e)));
+				this.adoptLinked(p.payload)
+					.then(() => this.confirmLink(p.payload, p.code))
+					.then(settle.resolve, (e: unknown) => settle.reject(toIsoloirError(e)));
 			},
 			stop: () => {
 				clearTimeout(expiry);
@@ -631,30 +754,68 @@ export class Session {
 	}
 
 	/**
-	 * Sends this device's key to a device that shows `receiverPublic`;
-	 * returns the six digits to show here, for the voter to compare.
+	 * Sends this device's key to a device that shows `receiverPublic`
+	 * (33-byte compressed key, hex). Show `code` for the voter to compare;
+	 * `confirmed` resolves true once the receiver adopted the key: only
+	 * then does the link count as a backup.
 	 */
-	async sendKeyTo(receiverPublic: string): Promise<string> {
+	async sendKeyTo(receiverPublic: string): Promise<LinkSender> {
 		const k = this.requireKey();
-		const relays = this.ranking(k).filter((c) => c.type === 'nostr');
+		const relays = this.ranking(k, 'nostr');
 		if (relays.length === 0) throw new IsoloirError('link_unavailable', 'the ledger has no Nostr relay');
+		if (typeof receiverPublic !== 'string' || !/^0[23][0-9a-f]{64}$/.test(receiverPublic)) throw new IsoloirError('bad_link_key', 'not a compressed secp256k1 public key');
+		const reply = this.core.linkReceiver();
 		const polls: LinkPayload['polls'] = {};
 		for (const [id, p] of Object.entries(k.polls)) polls[id] = { seq: p.seq, delta: p.delta };
-		const payload: LinkPayload = { v: 1, origin: this.config.origin, registry: this.config.registry, secret: k.secret, source: k.source, words: k.words, position: k.position, polls };
-		const sealed = this.core.linkSeal(receiverPublic, JSON.stringify(payload));
+		const payload: LinkPayload = { v: 1, origin: this.config.origin, registry: this.config.registry, secret: k.secret, source: k.source, words: k.words, position: k.position, polls, reply: reply.public };
+		let sealed: { sealed: string; code: string };
+		try {
+			sealed = this.core.linkSeal(receiverPublic, JSON.stringify(payload));
+		} catch (e) {
+			throw new IsoloirError('bad_link_key', messageOf(e));
+		}
+		// Listen for the confirmation before the key leaves.
+		const stops: (() => void)[] = [];
+		let resolve: (ok: boolean) => void = () => {};
+		const confirmed = new Promise<boolean>((r) => (resolve = r));
+		const finish = (ok: boolean) => {
+			clearTimeout(expiry);
+			stops.splice(0).forEach((s) => s());
+			resolve(ok);
+		};
+		const expiry = setTimeout(() => finish(false), LINK_TIMEOUT);
+		const since = Math.floor(this.clock.now() / 1000) - 600;
+		for (const relay of this.relays()) {
+			stops.push(
+				relay.subscribe!({ kinds: [this.core.kinds.link], '#t': [linkTag(reply.public)], since }, (e) => {
+					try {
+						const got = this.core.linkOpen(reply.secret, e.content);
+						const c = JSON.parse(got.payload) as LinkConfirmation;
+						if (c.v !== 1 || c.confirm !== sealed.code || c.leaf !== k.leaf) return;
+						const kk = this.key();
+						if (kk && kk.leaf === k.leaf) {
+							kk.backups.linked++;
+							this.saveKey(kk);
+							this.emit();
+						}
+						finish(true);
+					} catch {
+						// not for this link
+					}
+				})
+			);
+		}
 		const event = this.signEvent(this.core.kinds.link, sealed.sealed, [['t', linkTag(receiverPublic)]]);
 		let lastErr = 'no relay';
 		for (const relay of relays) {
 			try {
 				await relay.publish(event);
-				k.backups.linked++;
-				this.saveKey(k);
-				this.emit();
-				return sealed.code;
+				return { code: sealed.code, confirmed, stop: () => finish(false) };
 			} catch (e) {
 				lastErr = messageOf(e);
 			}
 		}
+		finish(false);
 		throw new IsoloirError('no_relay', lastErr);
 	}
 
@@ -662,9 +823,9 @@ export class Session {
 
 	/**
 	 * Casts a choice: drafts it with the wasm core against the latest
-	 * checkpoint, proves it, keeps it, posts it and waits for the ack. A
-	 * re-vote continues the key's chain (linked: the next seq; delta: the
-	 * correction of the previous ballot).
+	 * checkpoint (at most 30 minutes old), proves it, keeps it, posts it
+	 * and waits for the ack. A re-vote continues the key's chain (linked:
+	 * the next seq; delta: the correction of the previous ballot).
 	 */
 	async cast(choice: Choice): Promise<void> {
 		const k = this.requireKey();
@@ -683,16 +844,21 @@ export class Session {
 		const rec0 = this.pollRecord(k);
 		if (rec0.ballot && (rec0.ballot.state === 'kept' || rec0.ballot.state === 'sent')) throw new IsoloirError('pending', 'a ballot waits for its ack: resendBallot()');
 		this.seqFloor = -1;
+		this.dupRetried = false;
 		try {
 			for (let attempt = 0; attempt < 3; attempt++) {
 				this.ballot = { state: 'drafting', choice };
 				this.emit();
 				await this.refreshCheckpoint();
 				const cp = this.requireCheckpoint();
-				const member = await this.memberPath(cp, k);
-				const rec = this.pollRecord(k);
-				const revoting = await this.revoting(cp, k, rec);
-				const draft = this.core.draftBallot({ poll: poll.body, setup_seq: poll.seq, member: { root: member.root, path: member.path, index: member.index }, s: k.secret, choice, revoting });
+				// A mirror serving an old root would single the voter out.
+				const age = this.local() - cp.time * 1000;
+				if (age > (this.config.maxCheckpointAgeMs ?? 30 * 60_000)) throw new IsoloirError('stale_mirror', `the newest checkpoint is ${Math.round(age / 60_000)} minutes old`);
+				const kk = this.requireKey();
+				const member = await this.memberPath(cp, kk);
+				const rec = this.pollRecord(kk);
+				const revoting = await this.revoting(cp, kk, rec);
+				const draft = this.core.draftBallot({ poll: poll.body, setup_seq: poll.seq, member: { root: member.root, path: member.path, index: member.index }, s: kk.secret, choice, revoting });
 				this.ballot = { state: 'proving', choice };
 				this.proverState = 'loading';
 				this.emit();
@@ -710,7 +876,7 @@ export class Session {
 					const got = proof.publicInputs.map(fieldHex);
 					if (got.length !== want.length || got.some((x, i) => x !== want[i])) throw new IsoloirError('prover_mismatch', 'the proof is not of the ballot drafted');
 				}
-				const record: BallotRecord = { event: this.signEvent(this.core.kinds.ballot, body), hash: this.core.bodyHash(body), state: 'kept', choice, root: member.root };
+				const record: BallotRecord = { body, event: this.signEvent(this.core.kinds.ballot, body), hash: this.core.bodyHash(body), state: 'kept', choice, root: member.root, since: cp.index };
 				if ('seq' in revoting) record.ballotSeq = revoting.seq;
 				else {
 					record.i = revoting.i;
@@ -718,8 +884,8 @@ export class Session {
 					record.leaf = this.core.deltaLeaf(b.ident, b.cmt);
 				}
 				rec.ballot = record;
-				this.saveKey(k);
-				if ((await this.submitBallot(false)) === 'done') return;
+				this.saveKey(kk);
+				if ((await this.submitBallot()) === 'done') return;
 			}
 			throw new IsoloirError('cast_retries');
 		} catch (e) {
@@ -734,12 +900,13 @@ export class Session {
 		}
 	}
 
-	/** Posts the kept ballot again (the same event: the ingest judges it once). */
+	/** Posts the kept ballot again (the same body in a fresh envelope: the ingest answers a body once). */
 	async resendBallot(): Promise<void> {
 		const rec = this.pollRecord();
 		const b = rec?.ballot;
 		if (!b || (b.state !== 'kept' && b.state !== 'sent')) throw new IsoloirError('not_ready', 'no ballot waits');
-		const verdict = await this.submitBallot(true);
+		this.dupRetried = false;
+		const verdict = await this.submitBallot();
 		if (verdict === 'retry') await this.cast(b.choice);
 	}
 
@@ -784,10 +951,7 @@ export class Session {
 			const cp = this.cp;
 			if (!cp) return;
 			const k = this.key();
-			if (k) {
-				await this.checkRegistration(cp, k);
-				await this.checkBallot(cp, k);
-			}
+			if (k) await this.readReceipts(cp, k);
 			if (this.poll) await this.refreshTally();
 		} catch (e) {
 			const err = toIsoloirError(e, 'mirror');
@@ -801,26 +965,41 @@ export class Session {
 		}
 	}
 
-	/** The latest tally of the poll, verified by the wasm core. */
+	/**
+	 * The latest tally of the poll, proven in the log and verified by the
+	 * wasm core. The state keeps the last one that verified; a newer one
+	 * that does not (or a tlock tally, whose openings only an auditor can
+	 * check) goes to `tallyUnverified`.
+	 */
 	async refreshTally(): Promise<TallyVerdict | null> {
 		const poll = this.requirePoll();
-		const text = await this.mirror.latestTally(poll.body.id, this.token());
-		if (text === null) return null;
-		let v: TallyVerdict;
+		let verdict: TallyVerdict;
 		try {
-			v = this.core.verifyTally(poll.body, text);
+			const t = await this.mirror.latestTally(poll.body.id, this.token());
+			if (t === null) return null;
+			verdict = this.core.verifyTally(poll.body, t.body);
 		} catch (e) {
-			this.log('warn', 'tally refused', { detail: messageOf(e) });
-			return this.tally;
+			const err = toIsoloirError(e);
+			if (err.code === 'mirror') throw err;
+			this.tallyUnverified = { verdict: null, error: err.detail || err.code };
+			this.log('warn', 'tally refused', { code: err.code });
+			this.emit();
+			return null;
 		}
-		if (!v.ok) this.log('error', 'the tally does not verify', { error: v.error });
-		const changed = !this.tally || this.tally.tally.upto !== v.tally.upto || this.tally.ok !== v.ok;
-		this.tally = v;
-		if (changed) {
-			this.events.emit('tally', v);
+		if (verdict.ok) {
+			const changed = this.tally?.tally.upto !== verdict.tally.upto;
+			this.tally = verdict;
+			this.tallyUnverified = null;
+			if (changed) {
+				this.events.emit('tally', verdict);
+				this.emit();
+			}
+		} else {
+			this.log('error', 'the tally does not verify', { error: verdict.error });
+			this.tallyUnverified = { verdict, error: verdict.error ?? 'unverified' };
 			this.emit();
 		}
-		return v;
+		return verdict;
 	}
 
 	// ======================================================= internals
@@ -831,6 +1010,10 @@ export class Session {
 
 	private emit() {
 		this.events.emit('state', this.state());
+	}
+
+	private lang(): string {
+		return this.config.wordsLang ?? 'en';
 	}
 
 	private key(): StoredKey | null {
@@ -856,11 +1039,9 @@ export class Session {
 		return this.registry.body;
 	}
 
-	private requirePoll(): Setup<PollSetup> & { seq: number } {
-		const p = this.poll;
-		if (!p) throw new IsoloirError('not_ready', 'no poll');
-		if (p.seq === null) throw new IsoloirError('no_setup', 'the mirror does not name the poll entry seq');
-		return p as Setup<PollSetup> & { seq: number };
+	private requirePoll(): Setup<PollSetup> {
+		if (!this.poll) throw new IsoloirError('not_ready', 'no poll');
+		return this.poll;
 	}
 
 	private requireCheckpoint(): Checkpoint {
@@ -924,16 +1105,30 @@ export class Session {
 		return this.channels.filter((c) => c.type === 'nostr' && c.subscribe);
 	}
 
-	/** The key's order of the active channels (SPEC §11.1): relay_ranking over their URLs. */
-	private ranking(k: StoredKey): IngestChannel[] {
-		const order = this.core.relayRanking(k.secret, this.channels.map((c) => c.url));
-		return order.map((u) => this.channels.find((c) => c.url === u)!);
+	/**
+	 * The key's order of the channels it posts to (SPEC §11.1):
+	 * relay_ranking over their URLs. The relays when the ledger has some
+	 * (the direct endpoint shows the operator the voter's address), the
+	 * direct endpoints when it has none.
+	 */
+	private ranking(k: StoredKey, only?: 'nostr'): IngestChannel[] {
+		const relays = this.relays();
+		const pool = only === 'nostr' || relays.length > 0 ? relays : this.channels;
+		const order = this.core.relayRanking(k.secret, pool.map((c) => c.url));
+		return order.map((u) => pool.find((c) => c.url === u)!);
 	}
 
-	/** Registrations go to the key's first channel; ballots start at the second, so the two part ways. */
+	/** Ballots go to the key's channels after the first, never to the registration's, unless there is only one. */
 	private ballotChannels(k: StoredKey): IngestChannel[] {
 		const r = this.ranking(k);
-		return r.length > 1 ? [...r.slice(1), r[0]] : r;
+		return r.length > 1 ? r.slice(1) : r;
+	}
+
+	/** The relay that serves live checkpoints: neither the registration's nor the ballots' when there are three or more. */
+	private watchRelays(k: StoredKey | null): IngestChannel[] {
+		if (!k) return this.relays();
+		const r = this.ranking(k, 'nostr');
+		return r.length >= 3 ? r.slice(2) : r.slice(-1);
 	}
 
 	private ingest(): string {
@@ -942,7 +1137,7 @@ export class Session {
 		return i;
 	}
 
-	/** A message event of a fresh throwaway key, dated to the minute on the server's clock. */
+	/** An envelope of a fresh throwaway key, dated to the minute on the server's clock. */
 	private signEvent(kind: number, content: string, extraTags: string[][] = []): NostrEvent {
 		const createdAt = Math.floor(this.clock.now() / 60_000) * 60;
 		return this.core.signEvent('', createdAt, kind, [['t', `isoloir/1/${this.config.origin}`], ...extraTags], content);
@@ -997,14 +1192,9 @@ export class Session {
 		if (this.config.watchRelays !== false) this.watchCheckpoints(0);
 	}
 
-	/**
-	 * Follows the ingest's checkpoint events on a relay; a relay that fails
-	 * gives way to the next. Without a relay among the channels, the
-	 * mirror is read on the timer instead.
-	 */
+	/** Follows the ingest's checkpoint events on a relay; a relay that fails gives way to the next. */
 	private watchCheckpoints(skip: number) {
-		const k = this.key();
-		const relays = (k ? this.ballotChannels(k) : this.channels).filter((c) => c.type === 'nostr' && c.subscribe);
+		const relays = this.watchRelays(this.key());
 		if (relays.length === 0) return;
 		const relay = relays[skip % relays.length];
 		this.stopWatch?.();
@@ -1024,24 +1214,51 @@ export class Session {
 		);
 	}
 
+	/** Keeps a posted envelope with its record. */
+	private keepEnvelope(r: PostRecord, channel: string, env: NostrEvent) {
+		if (r.state === 'kept') r.state = 'sent';
+		r.channel = channel;
+		r.event = env;
+		r.sentAt ??= this.local();
+		r.envelopes = [...(r.envelopes ?? []), env].slice(-ENVELOPES_KEPT);
+	}
+
 	// ----------------------------------------------- registration flow
+
+	private recordRegistration(k: StoredKey, reg: RegistrySetup, scan: ScanRecord, replacing: boolean) {
+		const body = this.core.registerBody({ registry: reg.id, s: k.secret, uid: scan.uid!, proof: scan.proof, proof_date: scan.proofDate!, reg_secret: scan.regSecret });
+		const old = k.registration;
+		k.regSecret = scan.regSecret;
+		k.registration = {
+			body,
+			event: this.signEvent(this.core.kinds.register, body),
+			hash: this.core.bodyHash(body),
+			state: 'kept',
+			proofDate: scan.proofDate!,
+			since: old?.since ?? this.cp?.index ?? 0,
+			replaced: replacing || old?.replaced || undefined,
+			sentAt: replacing ? old?.sentAt : undefined,
+			envelopes: replacing ? old?.envelopes : undefined
+		};
+		this.saveKey(k);
+		// The key holds the request now; the scan served.
+		this.store.remove(this.scanName);
+	}
 
 	private async postRegistration(): Promise<void> {
 		const k = this.requireKey();
 		const r = k.registration;
 		if (!r) throw new IsoloirError('not_ready');
-		const resend = r.sentAt !== undefined;
+		const resend = r.sentAt !== undefined || !!r.replaced;
 		this.registration = { state: 'posting' };
 		this.emit();
 		try {
-			const res = await postWithAck(this.core, this.ranking(k), r.event, this.ingest(), {
+			const res = await postWithAck(this.core, this.ranking(k), () => this.signEvent(this.core.kinds.register, r.body), this.ingest(), {
 				ackTimeoutMs: this.ackTimeoutMs,
-				onPosted: (channel) => {
+				onPosted: (channel, env) => {
 					const kk = this.requireKey();
 					if (kk.registration) {
-						kk.registration.state = 'sent';
-						kk.registration.channel = channel;
-						kk.registration.sentAt ??= this.clock.now();
+						this.keepEnvelope(kk.registration, channel, env);
 						this.saveKey(kk);
 					}
 				},
@@ -1064,126 +1281,75 @@ export class Session {
 
 	/** Keeps a registration's ack and acts on its outcome. */
 	private async applyRegistrationAck(res: Acked, resend: boolean): Promise<void> {
-		{
-			const kk = this.requireKey();
-			const rec = kk.registration!;
-			rec.channel = res.channel;
-			rec.ack = { event: res.ackEvent, checkpoint: res.ack.checkpoint ?? null };
-			if (res.ack.outcome === 'accepted') rec.state = 'acked';
-			else if (resend && (res.ack.reason === 'uid_used' || res.ack.reason === 'id_used' || res.ack.reason === 'duplicate')) {
-				// A resend of a registration the ingest took: the mirror says where the leaf is.
-				rec.state = 'acked';
-				rec.ack.checkpoint = null;
-			} else {
-				rec.state = 'rejected';
-				rec.reason = res.ack.reason ?? 'rejected';
-			}
-			this.saveKey(kk);
-			this.registration = { state: rec.state === 'rejected' ? 'rejected' : 'acked', checkpoint: rec.ack.checkpoint, reason: rec.reason };
-			this.emit();
-			if (rec.state === 'rejected') throw new IsoloirError(`reg:${rec.reason}`);
-			await this.refresh();
+		const kk = this.requireKey();
+		const rec = kk.registration!;
+		rec.channel = res.channel;
+		rec.event = res.envelope;
+		rec.ack = { event: res.ackEvent, checkpoint: res.ack.checkpoint ?? null };
+		if (res.ack.outcome === 'accepted') rec.state = 'acked';
+		else if (resend && (res.ack.reason === 'uid_used' || res.ack.reason === 'id_used')) {
+			// A registration of this key the ingest took before (an earlier
+			// body): the entries say where the leaf is.
+			rec.state = 'acked';
+			rec.ack.checkpoint = null;
+		} else {
+			rec.state = 'rejected';
+			rec.reason = reasonOf(res.ack.reason);
 		}
+		this.saveKey(kk);
+		this.registration = { state: rec.state === 'rejected' ? 'rejected' : 'acked', checkpoint: rec.ack.checkpoint, reason: rec.reason };
+		this.emit();
+		if (rec.state === 'rejected') throw new IsoloirError(`reg:${reasonOf(rec.reason)}`);
+		await this.refresh();
 	}
 
 	/**
 	 * Messages a previous visit posted and never saw acked: their acks are
-	 * asked for on every channel (a relay's stored events, the direct
-	 * endpoint's GET), so a closed tab does not leave them waiting.
+	 * asked of the channel that took them only (a relay's stored events,
+	 * the direct endpoint's GET), so a closed tab does not leave them
+	 * waiting and no other channel learns of them.
 	 */
 	private async recoverAcks(): Promise<void> {
 		const k = this.key();
 		if (!k) return;
 		const wait = Math.min(this.ackTimeoutMs, 5000);
+		const holder = (url?: string) => this.channels.find((c) => c.url === url);
 		try {
 			const r = k.registration;
-			if (r && r.state === 'sent' && k.position < 0) {
-				const res = await findAck(this.core, this.ranking(k), r.event, this.ingest(), wait);
+			const rc = holder(r?.channel);
+			if (r && r.state === 'sent' && k.position < 0 && rc) {
+				const res = await findAck(this.core, rc, [...(r.envelopes ?? [])].reverse(), this.ingest(), wait);
 				if (res) await this.applyRegistrationAck(res, true).catch(() => undefined);
 			}
 			const b = this.pollRecord(k)?.ballot;
-			if (b && b.state === 'sent') {
-				const res = await findAck(this.core, this.ballotChannels(k), b.event, this.ingest(), wait);
-				if (res && (res.ack.outcome === 'accepted' || res.ack.reason === 'duplicate')) this.applyBallotAck(res);
+			const bc = holder(b?.channel);
+			if (b && b.state === 'sent' && bc) {
+				const res = await findAck(this.core, bc, [...(b.envelopes ?? [])].reverse(), this.ingest(), wait);
+				if (res && res.ack.outcome === 'accepted') this.applyBallotAck(res);
 			}
 		} catch (e) {
 			this.log('warn', 'recovering acks', { detail: messageOf(e) });
 		}
 	}
 
-	/** Finds the key's position on the mirror (its shard), and keeps it. */
-	private async locate(k: StoredKey): Promise<boolean> {
-		const pos = await this.mirror.position(this.config.registry, k.leaf, this.token());
-		if (pos === null) return false;
-		this.setPosition(k, pos);
-		return true;
-	}
-
-	private setPosition(k: StoredKey, pos: number) {
-		k.position = pos;
-		if (k.registration && k.registration.state !== 'verified') k.registration.state = 'verified';
-		this.saveKey(k);
-		this.registration = { state: 'verified', checkpoint: k.registration?.ack?.checkpoint ?? null };
-		this.emit();
-	}
-
-	/** A registration waiting for its position: the positions shard, else its receipt in the named checkpoint. */
-	private async checkRegistration(cp: Checkpoint, k: StoredKey) {
-		if (k.position >= 0) return;
-		const r = k.registration;
-		if (r && (r.state === 'acked' || r.state === 'missing') && r.ack?.checkpoint != null && cp.index >= r.ack.checkpoint) {
-			const found = await this.findReceipt(r, 'register', r.ack.checkpoint, cp);
-			if (found) {
-				const pos = (await this.mirror.position(this.config.registry, k.leaf, this.token())) ?? (await this.positionFromEntries(found.checkpoint, r.hash));
-				if (pos !== null) {
-					Object.assign(r, { logSeq: found.logSeq, foundIn: found.checkpoint, late: found.late || undefined });
-					this.setPosition(k, pos);
-					this.events.emit('receipt', { what: 'registration', checkpoint: found.checkpoint, logSeq: found.logSeq, late: found.late });
-				}
-				return;
-			}
-			if (found === null && r.state === 'acked') await this.complain('registration', k, r);
-			return;
-		}
-		if (r && r.state !== 'rejected') await this.locate(k);
-	}
-
-	/**
-	 * A registration's position from its checkpoint (SPEC §4): the
-	 * registry's size there, less the registrations of that checkpoint,
-	 * plus its rank among them (they take positions in body hash order,
-	 * the entries' order).
-	 */
-	private async positionFromEntries(index: number, hash: string): Promise<number | null> {
-		const [entries, note] = await Promise.all([this.mirror.entries(index, this.token()), this.mirror.checkpoint(index, this.token())]);
-		const size = note?.registries.find((r) => r.id === this.config.registry)?.size;
-		if (!entries || size === undefined) return null;
-		const regs = entries.filter((e) => e.kind === 'register' && (JSON.parse(e.body) as { registry: number }).registry === this.config.registry);
-		const i = regs.findIndex((e) => this.core.bodyHash(e.body) === hash);
-		return i < 0 ? null : size - regs.length + i;
-	}
-
 	// -------------------------------------------------- ballot flow
 
-	private async submitBallot(resend: boolean): Promise<'done' | 'retry'> {
+	private async submitBallot(): Promise<'done' | 'retry'> {
 		const k = this.requireKey();
 		const rec = this.pollRecord(k);
 		const b = rec.ballot;
 		if (!b) throw new IsoloirError('not_ready');
-		const wasSent = b.sentAt !== undefined;
 		this.ballot = { state: 'posting', choice: b.choice, hash: b.hash };
 		this.emit();
-		let res;
+		let res: Acked;
 		try {
-			res = await postWithAck(this.core, this.ballotChannels(k), b.event, this.ingest(), {
+			res = await postWithAck(this.core, this.ballotChannels(k), () => this.signEvent(this.core.kinds.ballot, b.body), this.ingest(), {
 				ackTimeoutMs: this.ackTimeoutMs,
-				onPosted: (channel) => {
+				onPosted: (channel, env) => {
 					const kk = this.requireKey();
 					const bb = this.pollRecord(kk).ballot;
 					if (bb) {
-						bb.state = 'sent';
-						bb.channel = channel;
-						bb.sentAt ??= this.clock.now();
+						this.keepEnvelope(bb, channel, env);
 						this.saveKey(kk);
 					}
 					this.ballot = { ...this.ballot, state: 'sent' };
@@ -1204,26 +1370,39 @@ export class Session {
 		const r = this.pollRecord(kk);
 		const bb = r.ballot!;
 		const reason = res.ack.reason;
-		if (res.ack.outcome === 'accepted' || ((resend || wasSent) && reason === 'duplicate')) {
+		if (res.ack.outcome === 'accepted') {
 			this.applyBallotAck(res);
 			void this.refresh();
 			return 'done';
 		}
-		if (reason === 'stale_seq' || reason === 'old_root' || reason === 'unknown') {
+		const delta = this.requirePoll().body.revote === 'delta';
+		if (reason === 'duplicate' && delta && !this.dupRetried) {
+			// The chain moved on without this device (a discarded ballot that
+			// was logged, another device): find it again in the ballot tree.
+			this.dupRetried = true;
+			delete r.delta;
+			delete r.ballot;
+			this.saveKey(kk);
+			return 'retry';
+		}
+		if (reason === 'stale_seq' || reason === 'old_root') {
 			// Another device voted since, or the anchor aged: draft again.
-			if (reason === 'stale_seq' && bb.ballotSeq !== undefined) this.seqFloor = Math.max(this.seqFloor, bb.ballotSeq);
+			if (reason === 'stale_seq' && bb.ballotSeq !== undefined) {
+				this.seqFloor = Math.max(this.seqFloor, bb.ballotSeq);
+				delete r.seq;
+			}
 			delete r.ballot;
 			this.saveKey(kk);
 			this.member = null;
 			return 'retry';
 		}
 		bb.state = 'rejected';
-		bb.reason = reason ?? 'rejected';
+		bb.reason = reasonOf(reason);
 		bb.ack = { event: res.ackEvent, checkpoint: res.ack.checkpoint ?? null };
 		this.saveKey(kk);
 		this.ballot = this.ballotView(bb);
 		this.emit();
-		throw new IsoloirError(bb.reason);
+		throw new IsoloirError(reasonOf(reason));
 	}
 
 	/** Keeps an accepted ballot's ack and moves the key's chain on. */
@@ -1234,6 +1413,7 @@ export class Session {
 		if (!bb) return;
 		bb.state = 'acked';
 		bb.channel = res.channel;
+		bb.event = res.envelope;
 		bb.ack = { event: res.ackEvent, checkpoint: res.ack.checkpoint ?? null };
 		if (bb.ballotSeq !== undefined) r.seq = Math.max(r.seq ?? -1, bb.ballotSeq);
 		if (bb.i !== undefined) r.delta = { next: bb.i + 1, previous: { choice: bb.choice, leaf: bb.leaf } };
@@ -1259,9 +1439,13 @@ export class Session {
 	private async revoting(cp: Checkpoint, k: StoredKey, rec: PollRecord): Promise<{ seq: number } | { i: number; previous: { choice: Choice; path: string[]; index: number } | null; broot: string }> {
 		const poll = this.requirePoll().body;
 		if (poll.revote !== 'delta') {
-			const nullifier = this.core.nullifier(poll.id, k.secret);
-			const logged = (await this.mirror.pseudonymSeq(poll.id, nullifier, this.token())) ?? -1;
-			const last = Math.max(rec.seq ?? -1, logged, this.seqFloor);
+			// The device's record first; the pseudonym shard only on a device without one.
+			let last = rec.seq ?? -1;
+			if (rec.seq === undefined) {
+				const nullifier = this.core.nullifier(poll.id, k.secret);
+				last = (await this.mirror.pseudonymSeq(poll.id, nullifier, this.token())) ?? -1;
+			}
+			last = Math.max(last, this.seqFloor);
 			if (poll.revote === 'none' && last >= 0) throw new IsoloirError('revote_off');
 			return { seq: last + 1 };
 		}
@@ -1289,43 +1473,84 @@ export class Session {
 		return { i: chain.next, previous: { choice: chain.previous.choice, path: p.path, index }, broot };
 	}
 
-	/** An acked ballot waiting for its receipt. */
-	private async checkBallot(cp: Checkpoint, k: StoredKey) {
-		const rec = this.pollRecord(k);
-		const b = rec.ballot;
-		if (!b || (b.state !== 'acked' && b.state !== 'missing') || b.ack?.checkpoint == null) return;
-		if (cp.index < b.ack.checkpoint) return;
-		const found = await this.findReceipt(b, 'ballot', b.ack.checkpoint, cp);
-		if (found) {
-			Object.assign(b, { state: 'verified', logSeq: found.logSeq, foundIn: found.checkpoint, late: found.late || undefined });
-			this.saveKey(k);
-			this.ballot = this.ballotView(b);
-			this.events.emit('receipt', { what: 'ballot', checkpoint: found.checkpoint, logSeq: found.logSeq, late: found.late });
-			this.emit();
-			return;
-		}
-		if (found === null && b.state === 'acked') await this.complain('ballot', k, b);
+	// ------------------------------------------------------ receipts
+
+	/** Whether a record still looks for its receipt. */
+	private waiting(r: PostRecord | undefined, k: StoredKey, what: 'registration' | 'ballot'): r is PostRecord {
+		if (!r || (r.state !== 'acked' && r.state !== 'missing')) return false;
+		if (what === 'registration' && k.position >= 0) return false;
+		if (r.state === 'missing' && r.ack?.checkpoint != null && (this.cursor() ?? 0) > r.ack.checkpoint + LATE_SEARCH) return false;
+		return true;
+	}
+
+	private cursor(): number | null {
+		return readJSON<number>(this.store, this.cursorName);
 	}
 
 	/**
-	 * Looks for a body's hash among the entries of the checkpoint the ack
-	 * named, then (when missing there) of the later ones. Returns where it
-	 * is, null when the named checkpoint's entries are on the mirror
-	 * without it and no later one has it, undefined while the mirror does
-	 * not have the named checkpoint's entries yet.
+	 * Reads the entries of every checkpoint since the last one read, in
+	 * order, while a registration or a ballot waits for its receipt: the
+	 * same files whatever the ack said, so what is fetched reveals nothing
+	 * about which checkpoint holds the voter's message. A registration's
+	 * position comes from the entries too (the registry's size at its
+	 * checkpoint, its rank among the registrations there).
 	 */
-	private async findReceipt(r: PostRecord, kind: string, named: number, cp: Checkpoint): Promise<{ checkpoint: number; logSeq: number; late: boolean } | null | undefined> {
-		const token = this.token();
-		const first = await this.mirror.entries(named, token);
-		if (first === null) return undefined;
-		const hit = first.find((e) => e.kind === kind && this.core.bodyHash(e.body) === r.hash);
-		if (hit) return { checkpoint: named, logSeq: hit.seq, late: false };
-		for (let i = named + 1; i <= Math.min(cp.index, named + LATE_SEARCH); i++) {
-			const later = await this.mirror.entries(i, token);
-			const h = later?.find((e) => e.kind === kind && this.core.bodyHash(e.body) === r.hash);
-			if (h) return { checkpoint: i, logSeq: h.seq, late: true };
+	private async readReceipts(cp: Checkpoint, k: StoredKey) {
+		const reg = k.registration;
+		const bal = this.pollRecord(k).ballot;
+		const regWaits = this.waiting(reg, k, 'registration');
+		const balWaits = this.waiting(bal, k, 'ballot');
+		if (!regWaits && !balWaits) return;
+		const since = Math.min(regWaits ? (reg!.since ?? 0) : Infinity, balWaits ? (bal!.since ?? 0) : Infinity);
+		const start = Math.max((this.cursor() ?? 0) + 1, since + 1);
+		for (let i = start; i <= cp.index && i < start + WINDOW_MAX; i++) {
+			const entries = await this.mirror.entries(i, this.token());
+			if (entries === null) break;
+			const kr = this.requireKey();
+			const r = kr.registration;
+			if (r && this.waiting(r, kr, 'registration')) {
+				const mine = entries.find((e) => e.kind === 'register' && isLeaf(e.body, this.config.registry, kr.leaf));
+				if (mine) await this.registrationFound(kr, r as RegistrationRecord, i, entries, mine);
+			}
+			const kb = this.requireKey();
+			const b = this.pollRecord(kb).ballot;
+			if (b && this.waiting(b, kb, 'ballot')) {
+				const mine = entries.find((e) => e.kind === 'ballot' && this.core.bodyHash(e.body) === b.hash);
+				if (mine) this.ballotFound(kb, b, i, mine);
+			}
+			writeJSON(this.store, this.cursorName, i);
+			// The checkpoint the ack named was read without the body: a complaint.
+			const kc = this.requireKey();
+			const rc = kc.registration;
+			if (rc && rc.state === 'acked' && kc.position < 0 && rc.ack?.checkpoint === i) await this.complain('registration', kc, rc);
+			const kd = this.requireKey();
+			const bc = this.pollRecord(kd).ballot;
+			if (bc && bc.state === 'acked' && bc.ack?.checkpoint === i) await this.complain('ballot', kd, bc);
 		}
-		return null;
+	}
+
+	private async registrationFound(k: StoredKey, r: RegistrationRecord, index: number, entries: Entry[], mine: Entry) {
+		const note = await this.mirror.checkpoint(index, this.token());
+		const size = note?.registries.find((x) => x.id === this.config.registry)?.size;
+		if (size === undefined) return;
+		const regs = entries.filter((e) => e.kind === 'register' && isLeaf(e.body, this.config.registry, null));
+		const pos = size - regs.length + regs.indexOf(mine);
+		const late = r.ack?.checkpoint != null && index > r.ack.checkpoint;
+		Object.assign(r, { logSeq: mine.seq, foundIn: index, late: late || undefined, state: 'verified' });
+		k.position = pos;
+		this.saveKey(k);
+		this.registration = { state: 'verified', checkpoint: r.ack?.checkpoint ?? null };
+		this.events.emit('receipt', { what: 'registration', checkpoint: index, logSeq: mine.seq, late });
+		this.emit();
+	}
+
+	private ballotFound(k: StoredKey, b: BallotRecord, index: number, mine: Entry) {
+		const late = b.ack?.checkpoint != null && index > b.ack.checkpoint;
+		Object.assign(b, { state: 'verified', logSeq: mine.seq, foundIn: index, late: late || undefined });
+		this.saveKey(k);
+		this.ballot = this.ballotView(b);
+		this.events.emit('receipt', { what: 'ballot', checkpoint: index, logSeq: mine.seq, late });
+		this.emit();
 	}
 
 	/**
@@ -1337,7 +1562,7 @@ export class Session {
 	 */
 	private async complain(what: 'registration' | 'ballot', k: StoredKey, r: PostRecord) {
 		if (!r.ack) return;
-		const content = this.core.complaintBody(r.ack.event, r.event.content);
+		const content = this.core.complaintBody(r.ack.event, r.body);
 		const event = this.signEvent(this.core.kinds.complaint, content);
 		const ids: string[] = [];
 		const relays = this.relays();
@@ -1345,7 +1570,7 @@ export class Session {
 			try {
 				await ch.publish(event);
 				ids.push(`${ch.url} ${event.id}`);
-				if (ch.type === 'nostr') await ch.publish(r.event).catch(() => undefined);
+				if (ch.type === 'nostr') await ch.publish(this.signEvent(r.event.kind, r.body)).catch(() => undefined);
 			} catch (e) {
 				this.log('warn', 'complaint not posted', { channel: ch.url, detail: messageOf(e) });
 			}
@@ -1364,13 +1589,15 @@ export class Session {
 
 	private async adopt(key: StoredKey, hint: LinkPayload | null): Promise<void> {
 		await this.refreshCheckpoint();
-		const pos = await this.mirror.position(this.config.registry, key.leaf, this.token());
+		// A new device: the positions shard (by the leaf's prefix) is the only way.
+		const pos = hint && hint.position >= 0 ? null : await this.mirror.position(this.config.registry, key.leaf, this.token());
 		const known = hint?.position ?? -1;
 		if (pos === null && known < 0) throw new IsoloirError('not_registered');
 		key.position = pos ?? known;
 		if (hint) for (const [id, p] of Object.entries(hint.polls)) key.polls[id] = { seq: p.seq, delta: p.delta };
 		this.saveKey(key);
 		this.store.remove(this.scanName);
+		if (this.cp) writeJSON(this.store, this.cursorName, this.cp.index);
 		this.registration = { state: 'verified' };
 		this.ballot = { state: 'idle' };
 		this.member = null;
@@ -1387,6 +1614,30 @@ export class Session {
 		}
 		if (p.source === 'passkey') key.backups.passkey = true;
 		await this.adopt(key, p);
+	}
+
+	/** Tells the sender the key was adopted (sealed for its reply key). */
+	private async confirmLink(p: LinkPayload, code: string): Promise<void> {
+		if (!p.reply) return;
+		const leaf = this.core.leaf(this.config.registry, p.secret);
+		let sealed: { sealed: string; code: string };
+		try {
+			sealed = this.core.linkSeal(p.reply, JSON.stringify({ v: 1, confirm: code, leaf } satisfies LinkConfirmation));
+		} catch {
+			return;
+		}
+		const event = this.signEvent(this.core.kinds.link, sealed.sealed, [['t', linkTag(p.reply)]]);
+		for (const relay of this.relays()) await relay.publish(event).catch(() => undefined);
+	}
+}
+
+/** Whether a register body is of the registry (and, given, of the leaf). */
+function isLeaf(body: string, registry: number, leaf: string | null): boolean {
+	try {
+		const b = JSON.parse(body) as { registry?: number; id?: string };
+		return b.registry === registry && (leaf === null || b.id === leaf);
+	} catch {
+		return false;
 	}
 }
 
