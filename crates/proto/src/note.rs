@@ -31,6 +31,31 @@ impl Signer {
         Signer { name: name.to_string(), key: SigningKey::from_bytes(seed) }
     }
 
+    /// A signer from a C2SP private key string
+    /// `PRIVATE+KEY+<name>+<key id hex>+<base64(0x01 ‖ seed)>` (what Go's
+    /// `golang.org/x/mod/sumdb/note` writes), checked against its key id.
+    pub fn from_private(s: &str) -> Result<Self, String> {
+        let rest = s.strip_prefix("PRIVATE+KEY+").ok_or("not a PRIVATE+KEY string")?;
+        let mut parts = rest.rsplitn(3, '+');
+        let (kd, id, name) = (parts.next().ok_or("no key data")?, parts.next().ok_or("no key id")?, parts.next().ok_or("no name")?);
+        let kd = STANDARD.decode(kd).map_err(|e| e.to_string())?;
+        if kd.len() != 33 || kd[0] != ALG_ED25519 {
+            return Err("not an Ed25519 key".into());
+        }
+        let seed: [u8; 32] = kd[1..].try_into().unwrap();
+        let signer = Signer::new(name, &seed);
+        let pk = signer.key.verifying_key().to_bytes();
+        if hex::encode(key_id(name, &pk)) != id {
+            return Err("the key id does not match the key".into());
+        }
+        Ok(signer)
+    }
+
+    /// The seed (secret).
+    pub fn seed(&self) -> [u8; 32] {
+        self.key.to_bytes()
+    }
+
     /// The verifier key string.
     pub fn verifier(&self) -> String {
         let pk = self.key.verifying_key().to_bytes();
@@ -197,6 +222,13 @@ mod tests {
         assert_eq!(Checkpoint::parse(text).unwrap(), c);
         let forged = note.replacen("\n12\n", "\n13\n", 1);
         assert!(v.open(&forged).is_err());
+        // The C2SP private key form names the same key.
+        let pk = s.key.verifying_key().to_bytes();
+        let mut kd = vec![ALG_ED25519];
+        kd.extend_from_slice(&s.key.to_bytes());
+        let private = format!("PRIVATE+KEY+example.org/isoloir+{}+{}", hex::encode(key_id("example.org/isoloir", &pk)), STANDARD.encode(kd));
+        assert_eq!(Signer::from_private(&private).unwrap().verifier(), s.verifier());
+        assert!(Signer::from_private(&private.replacen("example.org", "example.com", 1)).is_err());
         let other = Signer::new("example.org/isoloir", &[8u8; 32]);
         assert!(Verifier::parse(&other.verifier()).unwrap().open(&note).is_err());
     }

@@ -58,7 +58,7 @@ impl Mirror {
         }
         let empty = std::fs::read_dir(&self.dir)?.next().is_none();
         if empty {
-            let out = Command::new("git").arg("clone").arg("-q").arg(remote).arg(&self.dir).output()?;
+            let out = git_command().arg("clone").arg("-q").arg(remote).arg(&self.dir).output()?;
             if out.status.success() {
                 return Ok(());
             }
@@ -73,7 +73,7 @@ impl Mirror {
     }
 
     fn git(&self, args: &[&str]) -> anyhow::Result<String> {
-        let out = Command::new("git").arg("-C").arg(&self.dir).args(args).output()?;
+        let out = git_command().arg("-C").arg(&self.dir).args(args).output()?;
         if !out.status.success() {
             anyhow::bail!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
         }
@@ -214,6 +214,47 @@ impl Mirror {
         std::fs::copy(vk, d.join("vk"))?;
         Ok(())
     }
+}
+
+/// `git`, with `ISOLOIR_MIRROR_SSH_KEY` (a private key, for pushing to
+/// the mirror's remote over SSH) when it is set: written once to a file
+/// only the process reads.
+fn git_command() -> Command {
+    let mut c = Command::new("git");
+    if let Some(path) = ssh_key_file() {
+        c.env("GIT_SSH_COMMAND", format!("ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new", path.display()));
+    }
+    c
+}
+
+fn ssh_key_file() -> Option<PathBuf> {
+    static FILE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| {
+        let key = std::env::var("ISOLOIR_MIRROR_SSH_KEY").ok().filter(|k| !k.trim().is_empty())?;
+        let path = std::env::temp_dir().join(format!("isoloir-mirror-key-{}", std::process::id()));
+        let mut body = key.replace("\\n", "\n");
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        let write = || -> std::io::Result<()> {
+            use std::io::Write;
+            #[cfg(unix)]
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            o.mode(0o600);
+            o.open(&path)?.write_all(body.as_bytes())
+        };
+        match write() {
+            Ok(()) => Some(path),
+            Err(e) => {
+                tracing::error!(error = %e, "ISOLOIR_MIRROR_SSH_KEY could not be written");
+                None
+            }
+        }
+    })
+    .clone()
 }
 
 /// An entry with its proof of inclusion in the log at checkpoint `index`

@@ -224,6 +224,22 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_secs()
 }
 
+/// The log key: 32 bytes of hex, or a C2SP `PRIVATE+KEY+…` string (whose
+/// name must be the ledger's origin).
+fn parse_log_key(s: &str, origin: Option<&str>) -> Result<[u8; 32]> {
+    let s = s.trim();
+    if s.starts_with("PRIVATE+KEY+") {
+        let signer = note::Signer::from_private(s).map_err(|e| anyhow::anyhow!("log key: {e}"))?;
+        if let Some(o) = origin {
+            if signer.name != o {
+                bail!("the log key is named {}, the ledger's origin is {o}", signer.name);
+            }
+        }
+        return Ok(signer.seed());
+    }
+    seed(s, "log seed")
+}
+
 fn seed(hexs: &str, what: &str) -> Result<[u8; 32]> {
     hex::decode(hexs.trim()).ok().and_then(|b| b.try_into().ok()).with_context(|| format!("{what}: 32 bytes of hex"))
 }
@@ -275,7 +291,7 @@ async fn main() -> Result<()> {
             let store = Store::connect(&db).await?;
             let bytes = canonical_file(&ledger)?;
             let Body::Ledger(l) = body::decode(EntryKind::Ledger, &bytes).map_err(|r| anyhow::anyhow!("ledger: {}", r.as_str()))? else { unreachable!() };
-            let config = Config { log_seed: seed(&log_seed, "log seed")?, nostr_sk: [0u8; 32] };
+            let config = Config { log_seed: parse_log_key(&log_seed, Some(&l.origin))?, nostr_sk: [0u8; 32] };
             Ingest::genesis(&store, &config, &l, now()).await?;
             println!("ledger {} started", l.origin);
         }
@@ -322,7 +338,7 @@ async fn main() -> Result<()> {
             let bb = Tools::find_bb()?;
             let mirror = Mirror { dir: mirror_dir.clone(), git: mirror_git.or_else(|| std::env::var("ISOLOIR_MIRROR_GIT").ok()) };
             mirror.prepare()?;
-            let config = Config { log_seed: seed(&log_seed, "log seed")?, nostr_sk: seed(&nostr_key, "nostr key")? };
+            let config = Config { log_seed: parse_log_key(&log_seed, Some(&l.origin))?, nostr_sk: seed(&nostr_key, "nostr key")? };
             let mut ing = Ingest::load(
                 store.clone(),
                 config,
