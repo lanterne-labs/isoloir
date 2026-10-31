@@ -147,6 +147,48 @@ item (a spike in M4 measures the constraint count with bb's bignum
 library); if it becomes affordable, it slots in as a fourth mode with
 aggregate-only disclosure.
 
+### 5.1 The matrix
+
+Two ballot classes, declared by the `PollKind`. **Poor**: yes/no (with or
+without a blank), one choice among a handful of options; a few patterns,
+each cast by many voters. **Rich**: ranked, approval of many options,
+graded; hundreds to millions of patterns, so a rare one is a receipt a
+coercer can check in any public list of individual ballots. Three
+re-vote modes, declared by the setup: **none**; **linked** (one pseudonym
+per voter and the sequence rule, as v2); **delta** (§4.6).
+
+| Decryption, publication | Ballot | No re-votes | Re-votes, linked | Re-votes, delta |
+|---|---|---|---|---|
+| single or threshold, open | poor | allowed | allowed | allowed |
+| single or threshold, open | rich | allowed | allowed | allowed |
+| single or threshold, closed | poor | allowed | allowed | allowed |
+| single or threshold, closed | rich | allowed | allowed | allowed |
+| tlock, open | any | forbidden | forbidden | forbidden |
+| tlock, closed | poor | allowed | forbidden | allowed |
+| tlock, closed | rich | forbidden | forbidden | forbidden |
+
+- tlock, open: nothing opens before the round, so live results are
+  impossible by construction.
+- tlock, rich: every individual ballot is public at the close, so a rare
+  pattern is a receipt. Delta ballots do not help: a correction `B − A`
+  is a rare pattern of its own in the open list.
+- tlock, poor, linked re-votes: the ballots are alike, the histories are
+  not: "yes, no, yes, no, yes" under one pseudonym is a sequence a
+  coercer can demand and find. Delta ballots remove the link, and each
+  opened correction is shared by many voters, so that cell is allowed. In
+  tlock mode delta ballots need the circuit to commit to the plaintext
+  (`c = H(values, salt)` as a public input next to `H(blob)`) so a
+  correction can be proven against the previous ballot.
+- Not prohibitions, but to be said in a poll's page: with a single
+  decrypter, "closed" means the public cannot read before the close, the
+  key holder can; threshold spreads that; only tlock removes it. Linked
+  re-votes show the log when and how often a voter changed their mind, in
+  every mode; delta mode hides it.
+
+`Setup::validate` refuses a forbidden cell; the auditor checks the logged
+setup against the matrix too. The presidential pre-poll is "single,
+open, rich, linked": allowed.
+
 **`single`** is the v2 tallier: one process with the key, partial = full
 decryption, DLEQ proof, Ed25519 signature on the entry.
 
