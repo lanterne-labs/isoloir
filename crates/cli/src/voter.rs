@@ -19,7 +19,8 @@ fn read(dir: &Path, p: &str) -> Result<serde_json::Value> {
 
 fn ledger(dir: &Path) -> Result<LedgerSetup> {
     let v = read(dir, "setup/ledger.json")?;
-    match body::decode(EntryKind::Ledger, v["body"].as_str().unwrap_or("").as_bytes()) {
+    let last = v["setups"].as_array().and_then(|a| a.last()).context("no ledger setup")?;
+    match body::decode(EntryKind::Ledger, last["body"].as_str().unwrap_or("").as_bytes()) {
         Ok(Body::Ledger(l)) => Ok(l),
         _ => bail!("mirror: setup/ledger.json"),
     }
