@@ -96,9 +96,9 @@ enum Cmd {
     },
     /// Runs a trustee: verifies the log, publishes the tallies due.
     Trustee {
-        /// The log: a mirror directory or URL.
+        /// The log: a mirror directory or URL; absent, the ingest's database (--db).
         #[arg(long)]
-        mirror: String,
+        mirror: Option<String>,
         #[arg(long)]
         log_key: String,
         /// The decrypter's keys (keygen decrypter); absent: tlock polls only.
@@ -107,7 +107,8 @@ enum Cmd {
         /// A drand HTTP API, for tlock polls.
         #[arg(long, default_value = "https://api.drand.sh")]
         drand: String,
-        /// Verification keys (<dir>/<circuit>/vk); default: the mirror's circuits/ (a local mirror).
+        /// Verification keys (<dir>/<circuit>/vk); default: the mirror's circuits/ (a local
+        /// mirror), else a clone of ISOLOIR_MIRROR_GIT.
         #[arg(long)]
         circuits: Option<PathBuf>,
         /// The ZKPassport verifier script, to check registrations.
@@ -211,7 +212,8 @@ enum Keygen {
         #[arg(long)]
         origin: String,
     },
-    /// A Nostr key (the ingest's): prints the secret and the public key.
+    /// A Nostr key (the ingest's): prints the secret and the public key;
+    /// with ISOLOIR_NOSTR_KEY set, only the public key of that one.
     Nostr,
     /// A decrypter's keys, written to a file; prints the public half.
     Decrypter {
@@ -262,6 +264,10 @@ async fn main() -> Result<()> {
             rand::rngs::OsRng.fill_bytes(&mut s);
             println!("ISOLOIR_LOG_SEED={}", hex::encode(s));
             println!("log_key: {}", note::Signer::new(&origin, &s).verifier());
+        }
+        Cmd::Keygen(Keygen::Nostr) if std::env::var("ISOLOIR_NOSTR_KEY").is_ok() => {
+            let s = seed(&std::env::var("ISOLOIR_NOSTR_KEY")?, "ISOLOIR_NOSTR_KEY")?;
+            println!("ingest: {}", hex::encode(isoloir_proto::sig::xonly(&s)));
         }
         Cmd::Keygen(Keygen::Nostr) => {
             let mut s = [0u8; 32];
@@ -398,10 +404,17 @@ async fn main() -> Result<()> {
         }
         Cmd::Trustee { mirror, log_key, keys, drand, circuits, zkverifier, node, rpc_url, db, nostr_key, every, once } => {
             let bb = Tools::find_bb()?;
-            let vk_dir = match circuits {
-                Some(c) => c,
-                None if mirror.starts_with("http") => bail!("--circuits: where the verification keys are (an HTTP mirror)"),
-                None => PathBuf::from(&mirror).join("circuits"),
+            let vk_dir = match (circuits, &mirror) {
+                (Some(c), _) => c,
+                (None, Some(m)) if !m.starts_with("http") => PathBuf::from(m).join("circuits"),
+                (None, _) => {
+                    // A fresh clone of the mirror's repository: its circuits.
+                    let git = std::env::var("ISOLOIR_MIRROR_GIT").map_err(|_| anyhow::anyhow!("--circuits, or ISOLOIR_MIRROR_GIT to clone them from"))?;
+                    let dir = std::env::temp_dir().join(format!("isoloir-trustee-{}", std::process::id()));
+                    let _ = std::fs::remove_dir_all(&dir);
+                    Mirror { dir: dir.clone(), git: Some(git) }.prepare()?;
+                    dir.join("circuits")
+                }
             };
             let keys = match keys {
                 Some(p) => {
@@ -411,10 +424,10 @@ async fn main() -> Result<()> {
                 }
                 None => None,
             };
-            let output = match (db, nostr_key) {
+            let output = match (db.clone(), nostr_key) {
                 (Some(db), _) => Output::Store(Store::connect(&db).await?),
                 (None, Some(k)) => {
-                    let src = MirrorSource::parse(&mirror);
+                    let src = MirrorSource::parse(mirror.as_deref().context("--mirror, or --db")?);
                     let first = src.from(1).await?.into_iter().next().context("an empty mirror")?;
                     let Some((EntryKind::Ledger, b)) = first.1.first() else { bail!("no ledger entry") };
                     let Ok(Body::Ledger(l)) = body::decode(EntryKind::Ledger, b) else { bail!("ledger") };
@@ -426,8 +439,13 @@ async fn main() -> Result<()> {
                 }
                 (None, None) => bail!("--db or --nostr-key: where tallies go"),
             };
+            let source: Box<dyn LogSource> = match (&mirror, &db) {
+                (Some(m), _) => Box::new(MirrorSource::parse(m)),
+                (None, Some(db)) => Box::new(Store::connect(db).await?),
+                (None, None) => bail!("--mirror or --db: where the log is read"),
+            };
             let mut t = Trustee::new(
-                Box::new(MirrorSource::parse(&mirror)),
+                source,
                 Some(&log_key),
                 Box::new(BbProofs::new(bb, vk_dir)),
                 Box::new(passports(zkverifier, node, rpc_url, true)),
