@@ -77,7 +77,7 @@ relay does.
 ## 4. The ledger and its log
 
 A ledger is one append-only log, identified by its **origin** (an ASCII
-name, e.g. `tartuffe.me/isoloir`). Entries are numbered from 0 (`seq`).
+name, e.g. `vote.example/isoloir`). Entries are numbered from 0 (`seq`).
 
 - **Leaf**: `"isoloir/1\n" ‖ seq ‖ "\n" ‖ kind ‖ "\n" ‖ body`, seq in
   decimal. The log is an RFC 6962 Merkle tree over the leaves (SHA-256,
@@ -120,7 +120,7 @@ The first entry of a log. Later `ledger` entries with `version + 1`
 change what may change (§13).
 
 ```json
-{"v":1,"version":1,"origin":"tartuffe.me/isoloir",
+{"v":1,"version":1,"origin":"vote.example/isoloir",
  "log_key":"<C2SP verifier key>","ingest":"<Nostr pubkey, x-only hex>",
  "channels":[{"type":"nostr","url":"wss://…","state":"active"},
              {"type":"direct","url":"https://vote.example/ingest","state":"active"}],
@@ -574,7 +574,7 @@ again (§16). `raw` is absent only for a body over 256 KiB, refused as
 
 ## 14. The voter secret
 
-As in tartuffe-vote/2 §4.1–4.2: where the platform offers the WebAuthn
+Where the platform offers the WebAuthn
 PRF extension, `s = H(T_prf, prf_lo, prf_hi)` from a passkey's PRF output
 on input `isoloir/1/<origin>/<registry>`; otherwise `s` comes from 12
 words (BIP39, 128 bits) or is carried by a device link (ECDH secp256k1 +

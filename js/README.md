@@ -23,8 +23,8 @@ import { Session, loadWasm } from '@isoloir/web';
 
 const session = new Session({
 	core: await loadWasm(),               // or loadWasm(wasmUrl) when the .wasm is served elsewhere
-	origin: 'tartuffe.me/isoloir',
-	verifierKey: 'tartuffe.me/isoloir+1a2b3c4d+AQ…', // pinned: shipped with the app, never read from the mirror
+	origin: 'vote.example/isoloir',
+	verifierKey: 'vote.example/isoloir+1a2b3c4d+AQ…', // pinned: shipped with the app, never read from the mirror
 	registry: 1,
 	poll: 7,
 	mirror: 'https://mirror.example/isoloir',      // or [jsDelivrSource('owner/repo'), dirSource(...)]
