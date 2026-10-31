@@ -31,12 +31,15 @@ struct Ledger {
     queue: Vec<(EntryKind, Vec<u8>)>,
     now: u64,
     signer: note::Signer,
+    /// Each checkpoint's signed note and entries, for the auditor.
+    notes: Vec<(String, Vec<(EntryKind, Vec<u8>)>)>,
+    posted: u64,
 }
 
 impl Ledger {
     fn new(now: u64) -> Self {
         let signer = note::Signer::new("test.example/isoloir", &[9u8; 32]);
-        let mut l = Ledger { state: State::new(), pending: Pending::default(), queue: vec![], now, signer };
+        let mut l = Ledger { state: State::new(), pending: Pending::default(), queue: vec![], now, signer, notes: vec![], posted: 0 };
         let ledger = LedgerSetup {
             v: 1,
             version: 1,
@@ -60,11 +63,37 @@ impl Ledger {
 
     fn post(&mut self, kind: EntryKind, bytes: Vec<u8>, c: &Checkers) -> Verdict {
         let v = judge::judge(&self.state, &self.pending, kind, &bytes, self.now, c);
-        if v == Verdict::Accept {
-            self.pending.admit(kind, &bytes);
-            self.queue.push((kind, bytes));
+        match v {
+            Verdict::Accept => {
+                self.pending.admit(kind, &bytes);
+                self.queue.push((kind, bytes));
+            }
+            // Every refusal is logged, with the raw body (SPEC §11.4).
+            Verdict::Reject(reason) => {
+                self.posted += 1;
+                let r = Reject {
+                    v: 1,
+                    of: format!("{:064x}", self.posted),
+                    hash: isoloir_core::encoding::body_hash(&bytes),
+                    reason,
+                    kind: Some(kind.as_str().into()),
+                    raw: Some(isoloir_core::encoding::b64(&bytes)),
+                };
+                self.queue.push((EntryKind::Reject, Body::Reject(r).encode()));
+            }
+            Verdict::Defer(_) => {}
         }
         v
+    }
+
+    /// Replays the whole log through an auditor with the same checkers.
+    fn audit(&self, c: Checkers) {
+        let mut a = isoloir_proto::audit::Auditor::new(Some(&self.signer.verifier()), c).unwrap();
+        for (note, entries) in &self.notes {
+            a.checkpoint(note, entries).unwrap();
+        }
+        let (_, report) = a.finish();
+        assert!(report.problems.is_empty(), "audit problems: {:#?}", report.problems);
     }
 
     /// Logs the queue, ordered by body hash, and checkpoints.
@@ -72,8 +101,8 @@ impl Ledger {
         self.now += 20;
         let mut q = std::mem::take(&mut self.queue);
         q.sort_by_key(|(_, b)| isoloir_core::encoding::body_hash(b));
-        for (k, b) in q {
-            self.state.apply(k, &b, self.now).unwrap();
+        for (k, b) in &q {
+            self.state.apply(*k, b, self.now).unwrap();
         }
         self.pending.clear();
         let index = self.state.checkpoints.len() as u64 + 1;
@@ -82,6 +111,7 @@ impl Ledger {
         let text = note::Verifier::parse(&self.signer.verifier()).unwrap().open(&signed).unwrap().to_string();
         let parsed = note::Checkpoint::parse(&text).unwrap();
         self.state.record(&parsed).unwrap();
+        self.notes.push((signed, q));
         parsed
     }
 }
@@ -201,6 +231,22 @@ fn a_yes_no_poll_end_to_end() {
     std::mem::swap(&mut pending, &mut l.pending);
     l.checkpoint();
     assert_eq!(l.state.polls[&7].tallies.len(), 1);
+    l.audit(Checkers { proofs: &proofs, passports: &DevPassports, tlock: None });
+
+    // A log changed after the fact: one refusal turned into the valid
+    // ballot of another voter, under the same signed notes. The replay
+    // diverges from the notes.
+    let mut tampered = l.notes.clone();
+    let (ci, ei) = tampered
+        .iter()
+        .enumerate()
+        .find_map(|(ci, (_, es))| es.iter().position(|(k, _)| *k == EntryKind::Reject).map(|ei| (ci, ei)))
+        .unwrap();
+    let ballot = tampered.iter().flat_map(|(_, es)| es.iter()).find(|(k, _)| *k == EntryKind::Ballot).unwrap().clone();
+    tampered[ci].1[ei] = ballot;
+    let mut a = isoloir_proto::audit::Auditor::new(Some(&l.signer.verifier()), Checkers { proofs: &proofs, passports: &DevPassports, tlock: None }).unwrap();
+    let diverged = tampered.iter().any(|(n, es)| a.checkpoint(n, es).is_err());
+    assert!(diverged || !a.report.problems.is_empty(), "the auditor saw nothing");
 }
 
 #[test]
@@ -294,6 +340,8 @@ fn delta_re_votes_end_to_end() {
     assert_eq!(&t.values[..2], &[0, 2]);
     assert_eq!(t.counted, 3, "every delta ballot counts");
     assert_eq!(l.post(EntryKind::Tally, canonical::to_vec(&t).unwrap(), &checkers), Verdict::Accept);
+    l.checkpoint();
+    l.audit(Checkers { proofs: &proofs, passports: &DevPassports, tlock: None });
 }
 
 #[test]
@@ -410,4 +458,6 @@ fn a_tlock_poll_end_to_end() {
     let mut lie = t.clone();
     lie.values = vec![2, 0, 0, 0];
     assert_eq!(judge::judge(&l.state, &Pending::default(), EntryKind::Tally, &canonical::to_vec(&lie).unwrap(), l.now, &checkers), Verdict::Reject(Reason::BadTally));
+    l.checkpoint();
+    l.audit(Checkers { proofs: &proofs, passports: &DevPassports, tlock: Some(&opener) });
 }

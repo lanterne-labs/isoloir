@@ -4,6 +4,7 @@
 //! tally is due, and the ledger state machine that the ingest and the
 //! auditor share: one implementation of every rule.
 
+pub mod audit;
 pub mod body;
 pub mod client;
 pub mod judge;
