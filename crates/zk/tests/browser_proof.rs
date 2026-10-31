@@ -16,7 +16,7 @@ use std::path::Path;
 #[ignore]
 fn a_browser_proof_verifies_on_the_server() {
     let tools = Tools::find().expect("nargo and bb");
-    let name = "choice4_elgamal_linked_d20";
+    let name = "choice4_single_linked_d20";
     let built = Circuits::repo().build(&tools, name).unwrap();
     let mut rng = rand::rngs::StdRng::seed_from_u64(31);
     let s = grumpkin::random_fr(&mut rng);
@@ -33,7 +33,7 @@ fn a_browser_proof_verifies_on_the_server() {
         registry: 1,
         title: "t".into(),
         kind: KindSpec::Choice { options: vec!["Oui".into(), "Non".into()], blank: true },
-        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: hex::encode([1u8; 32]) }, per_chunk: 2 },
+        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: hex::encode([1u8; 32]) } },
         publish: Publish::Closed,
         revote: Revote::Linked,
         opens: 0,

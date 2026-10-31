@@ -116,7 +116,7 @@ fn notes_and_events() {
 
 #[test]
 fn a_linked_ballot_and_its_tally() {
-    let (poll, keys) = elgamal_poll("linked", "choice4_elgamal_linked_d20", None);
+    let (poll, keys) = elgamal_poll("linked", "choice4_single_linked_d20", None);
     let info = v(&api::kind_info(&poll.to_string()).unwrap());
     assert_eq!(info["slots"], json!(3));
     assert_eq!(info["mask"], json!(7));
@@ -133,8 +133,9 @@ fn a_linked_ballot_and_its_tally() {
         let body = api::finish_ballot(&d["body"].to_string(), b"proof").unwrap();
         assert!(api::decode_body("ballot", &body).is_ok());
         let pi: Vec<String> = serde_json::from_str(&api::public_inputs(&body, &poll.to_string()).unwrap()).unwrap();
-        // registry, poll, setup, mask, root, nullifier, seq, pk.x, pk.y, 2 chunks × 4.
-        assert_eq!(pi.len(), 4 + 1 + 2 + 2 + 2 * 4);
+        // registry, poll, setup, mask, root, nullifier, seq, pk.x, pk.y, 1 chunk × 4
+        // (a single decrypter: seven values per chunk).
+        assert_eq!(pi.len(), 4 + 1 + 2 + 2 + 4);
         bodies.push(body);
     }
     // A choice outside the mask is refused.
@@ -182,7 +183,7 @@ fn a_tlock_ballot() {
 
 #[test]
 fn a_delta_chain_is_recovered() {
-    let (poll, _) = elgamal_poll("delta", "choice4_elgamal_delta_d20_b22", Some(22));
+    let (poll, _) = elgamal_poll("delta", "choice4_single_delta_d20_b22", Some(22));
     let ps = poll.to_string();
     let empty = api::tree_root(22, "[]").unwrap();
     // Ballot 0: pick 1.
@@ -217,7 +218,7 @@ fn ranked_results() {
         "kind": {"type": "ranked", "options": ["a", "b"], "blank": true, "depth": 3, "margins": true},
         "encryption": {"mode": "elgamal", "pk": "0x00", "decrypter": {"type": "single", "sign_key": "00"}},
         "publish": {"mode": "closed"}, "revote": "linked", "opens": 0, "closes": 1,
-        "circuit": {"name": "rankedm12_elgamal_linked_d20", "vk_hash": "0x00"},
+        "circuit": {"name": "rankedm12_single_linked_d20", "vk_hash": "0x00"},
     })
     .to_string();
     let vals: Vec<i64> = serde_json::from_str(&api::choice_values(&poll, r#"{"rank":[1,0]}"#).unwrap()).unwrap();
@@ -248,11 +249,11 @@ fn logged_entries() {
 
 #[test]
 fn delta_results_do_not_count_withdrawals() {
-    let (poll, _) = elgamal_poll("delta", "choice4_elgamal_delta_d20_b22", Some(22));
+    let (poll, _) = elgamal_poll("delta", "choice4_single_delta_d20_b22", Some(22));
     let r = v(&api::tally_results(&poll.to_string(), "[1,0,0,0]", 3).unwrap());
     assert_eq!(r["none"], Value::Null);
     assert_eq!(r["ballots"], json!("corrections"));
-    let (poll, _) = elgamal_poll("linked", "choice4_elgamal_linked_d20", None);
+    let (poll, _) = elgamal_poll("linked", "choice4_single_linked_d20", None);
     let r = v(&api::tally_results(&poll.to_string(), "[1,0,0,0]", 3).unwrap());
     assert_eq!(r["none"], json!(2));
 }

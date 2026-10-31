@@ -116,11 +116,8 @@ pub fn check_poll(p: &PollSetup, registry: &RegistrySetup) -> Result<kinds::Vari
         return Err("a blackout ends after it starts".into());
     }
     match &p.encryption {
-        Encryption::Elgamal { pk, decrypter, per_chunk } => {
+        Encryption::Elgamal { pk, decrypter } => {
             let _ = grumpkin::from_hex(pk).map_err(|e| format!("pk: {e}"))?;
-            if !isoloir_core::pack::PER_CHUNK_CHOICES.contains(&(*per_chunk as usize)) {
-                return Err("per_chunk: 2 or 7".into());
-            }
             match decrypter {
                 Decrypter::Single { sign_key } => {
                     if hex::decode(sign_key).map(|b| b.len()) != Ok(32) {
@@ -234,7 +231,7 @@ mod tests {
     use super::*;
 
     fn elgamal() -> Encryption {
-        Encryption::Elgamal { pk: String::new(), decrypter: Decrypter::Single { sign_key: String::new() }, per_chunk: 2 }
+        Encryption::Elgamal { pk: String::new(), decrypter: Decrypter::Single { sign_key: String::new() } }
     }
     fn tlock() -> Encryption {
         Encryption::Tlock { chain: String::new(), public_key: String::new(), period: 3, genesis: 0, round: 1 }

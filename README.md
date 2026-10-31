@@ -44,7 +44,7 @@ refuses the others.
 | `isoloir-wasm`, `js/` | the browser: the same Rust through WebAssembly, and a framework-free session |
 
 `circuits/` holds the Noir library and `gen.py`, which writes one circuit
-per variant (`choice4_elgamal_linked_d20`, `ranked12_elgamal_delta_d20_b22`…).
+per variant (`choice4_single_linked_d20`, `ranked12_single_delta_d20_b22`…).
 
 ## A local trial in ten commands
 
@@ -57,7 +57,7 @@ isoloir relay &                                   # ws://127.0.0.1:7777, in memo
 isoloir keygen log --origin trial.local/isoloir   # ISOLOIR_LOG_SEED, log_key
 isoloir keygen nostr                              # ISOLOIR_NOSTR_KEY, ingest
 isoloir keygen decrypter --out dec.json           # pk, sign_key
-isoloir circuits choice4_elgamal_linked_d20 --mirror mirror   # prints the vk hash
+isoloir circuits choice4_single_linked_d20 --mirror mirror   # prints the vk hash
 export DATABASE_URL=postgresql://localhost/isoloir_trial ISOLOIR_LOG_SEED=… ISOLOIR_NOSTR_KEY=…
 isoloir check registry registry.json && isoloir check poll poll.json --registry registry.json
 isoloir genesis ledger.json && isoloir ingest --mirror-dir mirror --dev --no-stamps &

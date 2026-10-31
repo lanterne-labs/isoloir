@@ -65,7 +65,7 @@ fn event(kind: u32, tag: &str, body: &[u8], now: u64) -> Event {
 async fn the_ingest_on_postgres() {
     let tools = Tools::find().expect("nargo and bb");
     let circuits = Circuits::repo();
-    let name = "choice4_elgamal_linked_d20";
+    let name = "choice4_single_linked_d20";
     let built = circuits.build(&tools, name).unwrap();
     let mirror_dir = tempfile::tempdir().unwrap();
     let mirror = Mirror { dir: mirror_dir.path().to_path_buf(), git: None };
@@ -156,7 +156,7 @@ async fn the_ingest_on_postgres() {
         registry: 1,
         title: "Oui ou non ?".into(),
         kind: KindSpec::Choice { options: vec!["Oui".into(), "Non".into()], blank: true },
-        encryption: Encryption::Elgamal { pk: keys.pk.clone(), decrypter: Decrypter::Single { sign_key: keys.sign_key.clone() }, per_chunk: 2 },
+        encryption: Encryption::Elgamal { pk: keys.pk.clone(), decrypter: Decrypter::Single { sign_key: keys.sign_key.clone() } },
         publish: Publish::Open { k_real: 1, min_gap: 0, coin: false },
         revote: Revote::Linked,
         opens: now,

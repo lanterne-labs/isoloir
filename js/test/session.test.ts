@@ -173,7 +173,7 @@ describe('ballots', () => {
 		const { s } = await voter(w, { prover });
 		await s.cast({ pick: 0 });
 		expect(s.state().ballot.state).toBe('acked');
-		expect(prover.calls[0].circuit).toBe('choice4_elgamal_linked_d20');
+		expect(prover.calls[0].circuit).toBe('choice4_single_linked_d20');
 		expect(prover.calls[0].inputs.seq).toBe(0);
 		w.ingest.checkpoint();
 		await s.refresh();

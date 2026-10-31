@@ -19,9 +19,6 @@ pub const DIGIT_BITS: u32 = 32;
 /// The largest absolute value of one ballot's value (a correction of a
 /// margin, −1 → +1, is 2).
 pub const OFFSET: i64 = 2;
-/// The values per chunk a poll may choose.
-pub const PER_CHUNK_CHOICES: [usize; 2] = [2, 7];
-
 /// The number of chunks of n values, `per` to a chunk.
 pub fn chunks(n: usize, per: usize) -> usize {
     n.div_ceil(per)

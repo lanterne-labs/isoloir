@@ -39,7 +39,7 @@ enum Cmd {
     Keygen(Keygen),
     /// Builds circuit variants and installs them into a mirror's circuits/.
     Circuits {
-        /// Variant names (circuits/gen.py), e.g. choice4_elgamal_linked_d20.
+        /// Variant names (circuits/gen.py), e.g. choice4_single_linked_d20.
         names: Vec<String>,
         #[arg(long, default_value = "circuits")]
         circuits: PathBuf,

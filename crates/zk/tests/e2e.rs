@@ -131,7 +131,7 @@ fn member(state: &State, registry: u32, s: &Fr) -> Member {
 fn a_yes_no_poll_end_to_end() {
     let tools = Tools::find().expect("nargo and bb");
     let circuits = Circuits::repo();
-    let name = "choice4_elgamal_linked_d20";
+    let name = "choice4_single_linked_d20";
     let built = circuits.build(&tools, name).unwrap();
     let vkdir = tempfile::tempdir().unwrap();
     isoloir_zk::install(&built, vkdir.path()).unwrap();
@@ -177,7 +177,7 @@ fn a_yes_no_poll_end_to_end() {
         registry: 1,
         title: "Oui ou non ?".into(),
         kind: KindSpec::Choice { options: vec!["Oui".into(), "Non".into()], blank: true },
-        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) }, per_chunk: 2 },
+        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) } },
         publish: Publish::Open { k_real: 1, min_gap: 0, coin: false },
         revote: Revote::Linked,
         opens: l.now,
@@ -213,7 +213,9 @@ fn a_yes_no_poll_end_to_end() {
     let d = client::draft(&poll, setup_seq, &variant, &m, &voters[1], &Choice::Pick(Some(0)), &Revoting::Linked { seq: 1 }, None, &mut rng).unwrap();
     let p = prover.prove(name, &d.inputs).unwrap();
     let mut tampered = d.clone();
-    tampered.body.ct.as_mut().unwrap().swap(0, 1);
+    // One chunk now (seven values per chunk): swap its two halves.
+    let c = &mut tampered.body.ct.as_mut().unwrap()[0];
+    c.swap(0, 1);
     assert_eq!(l.post(EntryKind::Ballot, tampered.finish(&p.proof), &checkers), Verdict::Reject(Reason::BadProof));
     let cp = l.checkpoint();
 
@@ -257,7 +259,7 @@ fn a_yes_no_poll_end_to_end() {
 fn delta_re_votes_end_to_end() {
     let tools = Tools::find().expect("nargo and bb");
     let circuits = Circuits::repo();
-    let name = "choice4_elgamal_delta_d20_b22";
+    let name = "choice4_single_delta_d20_b22";
     let built = circuits.build(&tools, name).unwrap();
     let vkdir = tempfile::tempdir().unwrap();
     isoloir_zk::install(&built, vkdir.path()).unwrap();
@@ -293,7 +295,7 @@ fn delta_re_votes_end_to_end() {
         registry: 1,
         title: "delta".into(),
         kind: KindSpec::Choice { options: vec!["Oui".into(), "Non".into()], blank: false },
-        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) }, per_chunk: 2 },
+        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) } },
         publish: Publish::Closed,
         revote: Revote::Delta,
         opens: l.now,
@@ -472,7 +474,7 @@ fn a_tlock_poll_end_to_end() {
 fn a_ranked_poll_with_margins() {
     let tools = Tools::find().expect("nargo and bb");
     let circuits = Circuits::repo();
-    let name = "rankedm12_elgamal_linked_d20_p7";
+    let name = "rankedm12_single_linked_d20";
     let built = circuits.build(&tools, name).unwrap();
     let vkdir = tempfile::tempdir().unwrap();
     isoloir_zk::install(&built, vkdir.path()).unwrap();
@@ -508,7 +510,7 @@ fn a_ranked_poll_with_margins() {
         registry: 1,
         title: "ranked".into(),
         kind: kind.clone(),
-        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) }, per_chunk: 7 },
+        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) } },
         publish: Publish::Closed,
         revote: Revote::Linked,
         opens: l.now,
@@ -559,7 +561,7 @@ fn review_rules() {
     use isoloir_proto::judge::{Proofs, SEQ_GAP};
     let tools = Tools::find().expect("nargo and bb");
     let circuits = Circuits::repo();
-    let name = "choice4_elgamal_linked_d20";
+    let name = "choice4_single_linked_d20";
     let built = circuits.build(&tools, name).unwrap();
     let vkdir = tempfile::tempdir().unwrap();
     isoloir_zk::install(&built, vkdir.path()).unwrap();
@@ -588,7 +590,7 @@ fn review_rules() {
     assert_eq!(verdicts, vec![Verdict::Accept, Verdict::Accept, Verdict::Reject(Reason::Full)]);
     l.checkpoint();
     // The poll's circuit variant must match the registry depth: d1.
-    let name1 = "choice4_elgamal_linked_d1";
+    let name1 = "choice4_single_linked_d1";
     let built1 = l_build(&prover, name1);
     isoloir_zk::install(&built1, vkdir.path()).unwrap();
     let sk = grumpkin::random_scalar(&mut rng);
@@ -601,7 +603,7 @@ fn review_rules() {
         registry: 1,
         title: "rules".into(),
         kind: KindSpec::Choice { options: vec!["Oui".into(), "Non".into()], blank: false },
-        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) }, per_chunk: 2 },
+        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) } },
         publish: Publish::Open { k_real: 5, min_gap: 60, coin: true },
         revote: Revote::Linked,
         opens: l.now,

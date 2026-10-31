@@ -31,23 +31,71 @@ pub enum Enc {
     Tlock,
 }
 
+/// How a poll's ballots are opened, which decides how the circuit packs
+/// them (SPEC §7.1): the one place that says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// ElGamal, one decrypter: it may open each ballot, so the densest
+    /// packing (seven values per chunk, the most 32-bit digits below r).
+    Single,
+    /// ElGamal, decrypted by aggregate only (a threshold committee, a
+    /// later version): two values per chunk, a two-digit discrete log.
+    Threshold,
+    /// drand time-lock: a commitment to the values, no packing.
+    Tlock,
+}
+
+impl Mode {
+    pub fn enc(&self) -> Enc {
+        match self {
+            Mode::Single | Mode::Threshold => Enc::Elgamal,
+            Mode::Tlock => Enc::Tlock,
+        }
+    }
+
+    /// Values per chunk.
+    pub fn per_chunk(&self) -> u32 {
+        match self {
+            Mode::Single => 7,
+            Mode::Threshold | Mode::Tlock => 2,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Mode::Single => "single",
+            Mode::Threshold => "threshold",
+            Mode::Tlock => "tlock",
+        }
+    }
+
+    /// The mode of a poll's encryption.
+    pub fn of(e: &Encryption) -> Mode {
+        match e {
+            Encryption::Elgamal { decrypter: crate::body::Decrypter::Single { .. }, .. } => Mode::Single,
+            Encryption::Tlock { .. } => Mode::Tlock,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Chain {
     Linked,
     Delta,
 }
 
-/// A circuit variant, parsed from its name: `choice4_elgamal_linked_d20`,
-/// `ranked12_elgamal_delta_d20_b22`.
+/// A circuit variant, parsed from its name: `choice4_single_linked_d20`,
+/// `ranked12_single_delta_d20_b22`, `choice4_tlock_linked_d20`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Variant {
     pub family: Family,
     pub slots: u32,
+    pub mode: Mode,
     pub enc: Enc,
     pub chain: Chain,
     pub depth: u32,
     pub ballot_depth: Option<u32>,
-    /// Values per chunk: 2, or 7 (`_p7`, elgamal only).
+    /// Values per chunk, from the mode.
     pub per: u32,
 }
 
@@ -67,9 +115,10 @@ impl Variant {
             return None;
         };
         let slots: u32 = slots.parse().ok().filter(|m| (2..=32).contains(m))?;
-        let enc = match parts[1] {
-            "elgamal" => Enc::Elgamal,
-            "tlock" => Enc::Tlock,
+        let mode = match parts[1] {
+            "single" => Mode::Single,
+            "threshold" => Mode::Threshold,
+            "tlock" => Mode::Tlock,
             _ => return None,
         };
         let chain = match parts[2] {
@@ -78,24 +127,16 @@ impl Variant {
             _ => return None,
         };
         let depth: u32 = parts[3].strip_prefix('d')?.parse().ok().filter(|d| (1..=30).contains(d))?;
-        let mut rest: Vec<&str> = parts[4..].to_vec();
-        let per = match rest.last().and_then(|x| x.strip_prefix('p')) {
-            Some("7") => {
-                rest.pop();
-                7
-            }
-            Some(_) => return None,
-            None => 2,
-        };
-        let ballot_depth = match (chain, rest.as_slice()) {
+        let ballot_depth = match (chain, &parts[4..]) {
             (Chain::Delta, [b]) => Some(b.strip_prefix('b')?.parse().ok().filter(|d| (1..=32).contains(d))?),
             (Chain::Linked, []) => None,
             _ => return None,
         };
-        if enc == Enc::Tlock && (family != Family::Choice || chain != Chain::Linked || per != 2) {
+        if mode == Mode::Tlock && (family != Family::Choice || chain != Chain::Linked) {
             return None;
         }
-        let v = Variant { family, slots, enc, chain, depth, ballot_depth, per };
+        let (enc, per) = (mode.enc(), mode.per_chunk());
+        let v = Variant { family, slots, mode, enc, chain, depth, ballot_depth, per };
         (v.name() == name).then_some(v)
     }
 
@@ -105,10 +146,7 @@ impl Variant {
             Family::Ranked => "ranked",
             Family::RankedMargins => "rankedm",
         };
-        let e = match self.enc {
-            Enc::Elgamal => "elgamal",
-            Enc::Tlock => "tlock",
-        };
+        let e = self.mode.name();
         let c = match self.chain {
             Chain::Linked => "linked",
             Chain::Delta => "delta",
@@ -116,9 +154,6 @@ impl Variant {
         let mut s = format!("{f}{}_{e}_{c}_d{}", self.slots, self.depth);
         if let Some(b) = self.ballot_depth {
             s.push_str(&format!("_b{b}"));
-        }
-        if self.per != 2 {
-            s.push_str(&format!("_p{}", self.per));
         }
         s
     }
@@ -199,15 +234,9 @@ pub fn variant_of(poll: &PollSetup, registry_depth: u32) -> Result<Variant, Stri
     if v.slots < slots(&poll.kind) {
         return Err(format!("the circuit has {} slots, the poll {}", v.slots, slots(&poll.kind)));
     }
-    let (enc, per) = match poll.encryption {
-        Encryption::Elgamal { per_chunk, .. } => (Enc::Elgamal, per_chunk),
-        Encryption::Tlock { .. } => (Enc::Tlock, 2),
-    };
-    if v.enc != enc {
-        return Err("the circuit encrypts otherwise".into());
-    }
-    if v.per != per {
-        return Err(format!("the circuit packs {} values per chunk, the poll {per}", v.per));
+    let mode = Mode::of(&poll.encryption);
+    if v.mode != mode {
+        return Err(format!("the circuit is for {} polls, the poll is {} (circuits/gen.py: {}…)", v.mode.name(), mode.name(), mode.name()));
     }
     let chain = if poll.revote == Revote::Delta { Chain::Delta } else { Chain::Linked };
     if v.chain != chain {
@@ -319,20 +348,22 @@ mod tests {
 
     #[test]
     fn variant_names() {
-        for n in ["choice4_elgamal_linked_d20", "ranked12_elgamal_delta_d20_b22", "rankedm12_elgamal_linked_d20", "choice4_tlock_linked_d20", "rankedm10_elgamal_linked_d20_p7", "choice4_elgamal_delta_d20_b22_p7"] {
+        for n in ["choice4_single_linked_d20", "ranked12_single_delta_d20_b22", "rankedm12_single_linked_d20", "choice4_tlock_linked_d20", "rankedm10_threshold_linked_d20"] {
             assert_eq!(Variant::parse(n).unwrap().name(), n);
         }
-        for n in ["ranked12_tlock_linked_d20", "choice4_tlock_delta_d20_b22", "choice4_tlock_linked_d20_p7", "choice4_elgamal_linked_d20_p2", "choice4_elgamal_linked_d20_p3", "choice4_elgamal_delta_d20", "choice4_elgamal_linked_d20_b22", "choice1_elgamal_linked_d20", "choice04_elgamal_linked_d20"] {
+        for n in ["ranked12_tlock_linked_d20", "choice4_tlock_delta_d20_b22", "choice4_elgamal_linked_d20", "choice4_single_linked_d20_p7", "choice4_single_delta_d20", "choice4_single_linked_d20_b22", "choice1_single_linked_d20", "choice04_single_linked_d20"] {
             assert!(Variant::parse(n).is_none(), "{n}");
         }
-        assert_eq!(Variant::parse("rankedm12_elgamal_linked_d20").unwrap().values(), 90);
+        assert_eq!(Variant::parse("rankedm12_single_linked_d20").unwrap().values(), 90);
+        assert_eq!(Variant::parse("rankedm12_single_linked_d20").unwrap().chunks(), 13);
+        assert_eq!(Variant::parse("rankedm12_threshold_linked_d20").unwrap().chunks(), 45);
     }
 
     #[test]
     fn ranked_values_match_the_circuit_test() {
         // The Noir test a_ranking_and_its_margins: 3 slots, blank = 2, 1 > 0.
         let kind = KindSpec::Ranked { options: vec!["a".into(), "b".into()], blank: true, depth: 3, margins: true };
-        let var = Variant { family: Family::RankedMargins, slots: 3, enc: Enc::Elgamal, chain: Chain::Linked, depth: 20, ballot_depth: None, per: 2 };
+        let var = Variant { family: Family::RankedMargins, slots: 3, mode: Mode::Single, enc: Enc::Elgamal, chain: Chain::Linked, depth: 20, ballot_depth: None, per: 7 };
         assert_eq!(values(&kind, &var, &Choice::Rank(vec![1, 0])).unwrap(), vec![0, 1, 0, 1, 1, 0, -1, 1, 1]);
         assert!(values(&kind, &var, &Choice::Rank(vec![2, 0])).is_err());
         assert!(values(&kind, &var, &Choice::Rank(vec![1, 1])).is_err());
@@ -341,7 +372,7 @@ mod tests {
     #[test]
     fn choices() {
         let kind = KindSpec::Choice { options: vec!["Oui".into(), "Non".into()], blank: true };
-        let var = Variant::parse("choice4_elgamal_linked_d20").unwrap();
+        let var = Variant::parse("choice4_single_linked_d20").unwrap();
         assert_eq!(mask(&kind), 0b111);
         assert_eq!(values(&kind, &var, &Choice::Pick(Some(2))).unwrap(), vec![0, 0, 1, 0]);
         assert_eq!(values(&kind, &var, &Choice::Pick(None)).unwrap(), vec![0, 0, 0, 0]);
