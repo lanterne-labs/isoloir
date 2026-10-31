@@ -239,15 +239,22 @@ impl Proofs for BbProofs {
             .args(["-t", TARGET])
             .output()
             .map_err(|e| format!("bb: {e}"))?;
-        // bb exits non-zero for a proof that does not verify; a crash
-        // (a signal, no exit code) is an infrastructure failure.
+        // bb exits 1 both for a proof that does not verify and for a
+        // failure of its own (a file it cannot open, memory): the message
+        // tells them apart. A refusal must never come from our failure.
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         match out.status.code() {
             Some(0) => Ok(true),
+            Some(_) if INFRA.iter().any(|m| text.contains(m)) => Err(format!("bb verify: {}", text.trim())),
             Some(_) => Ok(false),
-            None => Err(format!("bb verify: {}", String::from_utf8_lossy(&out.stderr))),
+            None => Err(format!("bb verify: {}", text.trim())),
         }
     }
 }
+
+/// What bb prints when it could not run, as opposed to a proof that does
+/// not verify.
+const INFRA: &[&str] = &["Unable to open file", "No such file", "bad_alloc", "Cannot allocate", "out of memory", "Permission denied", "Killed", "Aborted"];
 
 /// Installs a built circuit into a verification-key directory
 /// (`<dir>/<name>/vk` and the artifact browsers prove with).

@@ -61,21 +61,39 @@ pub fn values_of(digit_sums: &[u64], n_values: usize, n_ballots: u64) -> Vec<i64
 /// first digit, reused for each candidate second digit: about
 /// `2·bound + 1` table entries and as many additions.
 pub fn dlog_chunk(m: &Point, n: u64, bound: u64) -> Option<(u64, u64)> {
-    use ark_ec::CurveGroup;
-    let center = n * OFFSET as u64;
-    let lo = center.saturating_sub(bound);
-    let hi = center + bound;
-    let table = BabyTable::new(lo, hi);
-    let step = grumpkin::mul_g(&Fr::from(1u128 << DIGIT_BITS));
-    // target = M − d1·2^32·G, from d1 = lo up.
-    let mut target = grumpkin::Projective::from(*m) - grumpkin::mul_g(&Fr::from((lo as u128) << DIGIT_BITS));
-    for d1 in lo..=hi {
-        if let Some(d0) = table.find(&target.into_affine()) {
-            return Some((d0, d1));
-        }
-        target -= step;
+    DlogTable::new(n, bound).find(m)
+}
+
+/// The table of one tally's digit range, built once and used for every
+/// chunk (a ranked poll with margins has dozens).
+pub struct DlogTable {
+    lo: u64,
+    hi: u64,
+    table: BabyTable,
+    step: grumpkin::Projective,
+}
+
+impl DlogTable {
+    pub fn new(n: u64, bound: u64) -> Self {
+        let center = n * OFFSET as u64;
+        let lo = center.saturating_sub(bound);
+        let hi = center + bound;
+        DlogTable { lo, hi, table: BabyTable::new(lo, hi), step: grumpkin::mul_g(&Fr::from(1u128 << DIGIT_BITS)) }
     }
-    None
+
+    /// The two digits of a chunk point.
+    pub fn find(&self, m: &Point) -> Option<(u64, u64)> {
+        use ark_ec::CurveGroup;
+        // target = M − d1·2^32·G, from d1 = lo up.
+        let mut target = grumpkin::Projective::from(*m) - grumpkin::mul_g(&Fr::from((self.lo as u128) << DIGIT_BITS));
+        for d1 in self.lo..=self.hi {
+            if let Some(d0) = self.table.find(&target.into_affine()) {
+                return Some((d0, d1));
+            }
+            target -= self.step;
+        }
+        None
+    }
 }
 
 struct BabyTable {

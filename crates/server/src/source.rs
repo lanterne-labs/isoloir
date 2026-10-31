@@ -42,7 +42,8 @@ impl MirrorSource {
         }
     }
 
-    async fn get(&self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    /// One file of the mirror, or None when it is not there.
+    pub async fn get(&self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
         match self {
             MirrorSource::Dir(d) => match std::fs::read(d.join(path)) {
                 Ok(b) => Ok(Some(b)),

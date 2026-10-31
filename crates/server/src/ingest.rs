@@ -76,6 +76,9 @@ pub struct Ingest {
     last_upgrade: u64,
 }
 
+/// The longest time between two checkpoints, even on a quiet ledger.
+pub const HEARTBEAT: u64 = 600;
+
 /// How often incomplete stamps are upgraded.
 const UPGRADE_EVERY: u64 = 3_600;
 
@@ -112,7 +115,9 @@ impl Ingest {
             state.record(&cp).map_err(|e| anyhow::anyhow!("replay: {e}"))?;
             if let (Some(m), true) = (&mirror, (*idx as u64) > mirrored) {
                 m.write_data(&state, *idx as u64, from)?;
-                m.write_note(*idx as u64, signed)?;
+                if let Err(e) = m.write_note(*idx as u64, signed) {
+                    tracing::warn!(error = %e, index = idx, "mirror note during the replay (pushed with the next checkpoint)");
+                }
             }
         }
         if it.next().is_some() {
@@ -140,6 +145,9 @@ impl Ingest {
         if let Some(l) = ingest.state.ledger() {
             if l.log_key != ingest.signer.verifier() {
                 anyhow::bail!("the log key given is not the ledger's");
+            }
+            if l.ingest != hex::encode(isoloir_proto::sig::xonly(&ingest.nostr_sk)) {
+                anyhow::bail!("the Nostr key given is not the ledger's ingest key ({}): voters would ignore every ack", l.ingest);
             }
         }
         for r in ingest.store.pending().await? {
@@ -183,7 +191,9 @@ impl Ingest {
 
     fn ack_event(&self, of: &str, hash: &str, outcome: Outcome, reason: Option<isoloir_proto::Reason>, checkpoint: Option<u64>, now: u64) -> Event {
         let ack = Ack { v: V1, of: of.to_string(), hash: hash.to_string(), outcome, reason, checkpoint };
-        Event::sign(&self.nostr_sk, now, kinds::ACK, vec![vec!["t".into(), self.tag.clone()], vec!["e".into(), of.to_string()]], canonical::to_string(&ack).expect("ack"))
+        // To the minute: an ack is public, and its time would date the
+        // entry it names to the second (SPEC §11.2).
+        Event::sign(&self.nostr_sk, now / 60 * 60, kinds::ACK, vec![vec!["t".into(), self.tag.clone()], vec!["e".into(), of.to_string()]], canonical::to_string(&ack).expect("ack"))
     }
 
     async fn send_ack(&self, origin: &str, ev: &Event) {
@@ -229,7 +239,9 @@ impl Ingest {
                 Verdict::Accept => (Outcome::Accepted, None, Some(self.next_index())),
                 Verdict::Reject(r) => (Outcome::Rejected, Some(r), None),
                 Verdict::Defer(why) => {
-                    tracing::warn!(id = %ev.id, why, "message deferred");
+                    if !self.deferred.contains_key(&ev.id) {
+                        tracing::warn!(id = %ev.id, why, deferred = self.deferred.len() + 1, "message deferred");
+                    }
                     self.deferred.insert(ev.id.clone(), inc.clone());
                     return Ok(());
                 }
@@ -280,7 +292,10 @@ impl Ingest {
         let closes: Vec<u32> = self.state.polls.iter().filter(|(_, p)| p.close.is_none() && now >= p.current().closes).map(|(id, _)| *id).collect();
         let last = self.state.last_checkpoint().map(|c| c.time).unwrap_or(0);
         let due = now >= last + ledger.checkpoint_period;
-        if due && (!self.rows.is_empty() || !self.subs.is_empty() || !closes.is_empty()) {
+        // A heartbeat when nothing happened: readers refuse stale
+        // checkpoints, so a mirror cannot single one out with an old root.
+        let heartbeat = now >= last + HEARTBEAT;
+        if (due && (!self.rows.is_empty() || !self.subs.is_empty() || !closes.is_empty())) || heartbeat {
             return Ok(Some(self.checkpoint(now, &closes).await?));
         }
         Ok(None)
@@ -406,16 +421,21 @@ impl Ingest {
             entries.push((*k, b.clone()));
         }
         entries.sort_by_key(|(_, b)| encoding::body_hash(b));
-        let mut state = self.state.clone();
+        // Applied in place: cloning the state per checkpoint costs the
+        // whole log. An entry that does not apply leaves the state as it
+        // was (apply checks before it changes anything), and is left out.
         let mut logged = vec![];
+        let mut left_out: Vec<String> = vec![];
         for (k, b) in entries {
-            match state.apply(k, &b, now) {
+            match self.state.apply(k, &b, now) {
                 Ok(seq) => logged.push((seq, k, b.clone(), encoding::body_hash(&b))),
-                // A judged entry that no longer applies is a bug: keep it
-                // out of the log and say so.
-                Err(e) => tracing::error!(error = %e, kind = k.as_str(), "an accepted entry does not apply; left out"),
+                Err(e) => {
+                    tracing::error!(error = %e, kind = k.as_str(), "an accepted entry does not apply; left out");
+                    left_out.push(encoding::body_hash(&b));
+                }
             }
         }
+        let state = &mut self.state;
         for poll in closes {
             let last = state.polls[poll].ballots.last().map(|b| b.seq).unwrap_or(0);
             let c = Body::Close(Close { v: V1, poll: *poll, at: state.polls[poll].current().closes, last }).encode();
@@ -423,16 +443,27 @@ impl Ingest {
             logged.push((seq, EntryKind::Close, c.clone(), encoding::body_hash(&c)));
         }
         let token = match &self.mirror {
-            Some(m) => m.write_data(&state, index, from)?,
+            Some(m) => m.write_data(state, index, from)?,
             None => None,
         };
         let cp = state.checkpoint(index, now, token);
         let signed = self.signer.sign(&cp.text());
         state.record(&cp).map_err(|e| anyhow::anyhow!(e))?;
         let pending_ids: Vec<String> = self.rows.iter().map(|r| r.event_id.clone()).collect();
-        let sub_ids: Vec<i64> = self.subs.iter().map(|(id, _, _)| *id).collect();
-        self.store.checkpoint(&logged, index, &signed, now, cp.size, &pending_ids, &sub_ids).await?;
-        self.state = state;
+        // A setup left out is refused, not logged.
+        let mut sub_ids = vec![];
+        for (id, _, b) in &self.subs {
+            if left_out.contains(&encoding::body_hash(b)) {
+                self.store.submission_status(*id, "rejected", Some("it no longer applied at the checkpoint")).await?;
+            } else {
+                sub_ids.push(*id);
+            }
+        }
+        if let Err(e) = self.store.checkpoint(&logged, index, &signed, now, cp.size, &pending_ids, &sub_ids).await {
+            // The database did not take the checkpoint: the state in memory
+            // is ahead of it. Stop; a restart replays the database.
+            anyhow::bail!("checkpoint {index} not stored ({e}); restart to replay the log");
+        }
         self.rows.clear();
         self.subs.clear();
         self.pending.clear();

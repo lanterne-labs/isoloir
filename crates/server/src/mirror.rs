@@ -44,6 +44,34 @@ fn prefix(hex: &str) -> &str {
 }
 
 impl Mirror {
+    /// Makes the directory a git mirror of `remote`: cloned when empty (an
+    /// ephemeral disk: the circuits and the stamps come back with it),
+    /// initialised when new, left alone when it already is one.
+    pub fn prepare(&self) -> anyhow::Result<()> {
+        let Some(remote) = &self.git else {
+            std::fs::create_dir_all(&self.dir)?;
+            return Ok(());
+        };
+        std::fs::create_dir_all(&self.dir)?;
+        if self.dir.join(".git").is_dir() {
+            return Ok(());
+        }
+        let empty = std::fs::read_dir(&self.dir)?.next().is_none();
+        if empty {
+            let out = Command::new("git").arg("clone").arg("-q").arg(remote).arg(&self.dir).output()?;
+            if out.status.success() {
+                return Ok(());
+            }
+            let msg = String::from_utf8_lossy(&out.stderr);
+            if !msg.contains("empty repository") && !msg.contains("not found") && !msg.contains("does not exist") {
+                anyhow::bail!("git clone {remote}: {msg}");
+            }
+        }
+        self.git(&["init", "-q", "-b", "main"])?;
+        self.git(&["remote", "add", "origin", remote])?;
+        Ok(())
+    }
+
     fn git(&self, args: &[&str]) -> anyhow::Result<String> {
         let out = Command::new("git").arg("-C").arg(&self.dir).args(args).output()?;
         if !out.status.success() {
@@ -65,8 +93,8 @@ impl Mirror {
     }
 
     fn push(&self) -> anyhow::Result<()> {
-        if let Some(remote) = &self.git {
-            self.git(&["push", "-q", remote, "HEAD"])?;
+        if self.git.is_some() {
+            self.git(&["push", "-q", "origin", "HEAD:main"])?;
         }
         Ok(())
     }
@@ -88,9 +116,9 @@ impl Mirror {
         for seq in from..state.next_seq() {
             let (k, b) = &state.entries[seq as usize];
             match body::decode(*k, b) {
-                Ok(Body::Ledger(_)) => write_json(&self.dir.join("setup/ledger.json"), &json!({"seq": seq, "body": String::from_utf8_lossy(b)}))?,
-                Ok(Body::Registry(r)) => self.append_setup(&self.dir.join(format!("registries/{}.json", r.id)), seq, b)?,
-                Ok(Body::Poll(p)) => self.append_setup(&self.dir.join(format!("polls/{}.json", p.id)), seq, b)?,
+                Ok(Body::Ledger(_)) => self.append_setup(&self.dir.join("setup/ledger.json"), proven(state, seq, index))?,
+                Ok(Body::Registry(r)) => self.append_setup(&self.dir.join(format!("registries/{}.json", r.id)), proven(state, seq, index))?,
+                Ok(Body::Poll(p)) => self.append_setup(&self.dir.join(format!("polls/{}.json", p.id)), proven(state, seq, index))?,
                 Ok(Body::Register(r)) => {
                     let pos = state.registries[&r.registry].ids[&r.id] as usize;
                     leaves_touched.insert((r.registry, pos / SHARD));
@@ -109,7 +137,7 @@ impl Mirror {
                     }
                 }
                 Ok(Body::Tally(t)) => {
-                    let v = json!({"seq": seq, "body": String::from_utf8_lossy(b)});
+                    let v = proven(state, seq, index);
                     write_json(&self.dir.join(format!("polls/{}/tallies/{seq}.json", t.poll)), &v)?;
                     write_json(&self.dir.join(format!("polls/{}/tallies/latest.json", t.poll)), &v)?;
                 }
@@ -148,12 +176,12 @@ impl Mirror {
         self.commit(&format!("checkpoint {index}: data"))
     }
 
-    fn append_setup(&self, path: &Path, seq: u64, b: &[u8]) -> anyhow::Result<()> {
+    fn append_setup(&self, path: &Path, entry: Value) -> anyhow::Result<()> {
         let mut v = read_json(path);
         if !v.is_object() {
             v = json!({"setups": []});
         }
-        v["setups"].as_array_mut().expect("setups").push(json!({"seq": seq, "body": String::from_utf8_lossy(b)}));
+        v["setups"].as_array_mut().expect("setups").push(entry);
         write_json(path, &v)
     }
 
@@ -186,6 +214,16 @@ impl Mirror {
         std::fs::copy(vk, d.join("vk"))?;
         Ok(())
     }
+}
+
+/// An entry with its proof of inclusion in the log at checkpoint `index`
+/// (SPEC §15): a reader checks it against the signed note, so a mirror
+/// cannot serve a setup or a tally the log does not hold.
+fn proven(state: &State, seq: u64, index: u64) -> Value {
+    let (k, b) = &state.entries[seq as usize];
+    let size = state.next_seq();
+    let path: Vec<String> = state.log.inclusion(seq as usize, size as usize).iter().map(hex::encode).collect();
+    json!({"seq": seq, "kind": k.as_str(), "body": String::from_utf8_lossy(b), "checkpoint": index, "size": size, "path": path})
 }
 
 /// Reads a checkpoint's entries from a mirror's `entries/<index>.json`.

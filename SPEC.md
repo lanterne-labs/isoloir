@@ -102,8 +102,10 @@ name, e.g. `tartuffe.me/isoloir`). Entries are numbered from 0 (`seq`).
   The note's key name is the origin; its key id is the first 4 bytes of
   `SHA-256(origin ‖ "\n" ‖ 0x01 ‖ pubkey)`. Checkpoints are numbered
   from 1 (`index`) and taken at most every `checkpoint_period` seconds
-  when the log grew. A checkpoint's entries are the entries since the
-  previous one, ordered by body hash (so the order within a checkpoint
+  when the log grew, and at least every 10 minutes whatever happened (a
+  **heartbeat**, so that readers can refuse a stale checkpoint, §9.3). A
+  checkpoint's entries are the entries since the previous one, ordered by
+  body hash (so the order within a checkpoint
   reveals nothing about arrival order), except `close` entries, which end
   their checkpoint (in poll order) so that the ballots accepted before
   the close and logged with it come first; registrations take their tree
@@ -127,7 +129,10 @@ change what may change (§13).
 
 `channels`: at least one active (three relays for a ledger that wants
 voters never to reach the operator); `state` is `active` or `retired` (read, not
-written). `anchor_age`: how old a tree root a ballot may prove against.
+written). `anchor_age`: how old a tree root a ballot may prove against
+(at least `checkpoint_period`). Channel URLs are `wss://` (nostr) or
+`https://` (direct), `ws://` and `http://` on the local machine only, no
+trailing slash, no duplicate.
 
 ## 5. Registries
 
@@ -146,7 +151,7 @@ A registry is a set of eligible voters, reusable by any number of polls.
   leaves are 0; a node is `H(T_node, left, right)`.
 - **Registration** (§6) is the only way into the tree. Rules: one
   registration per passport (`uid`) per registry, ever (`uid_used`); one
-  per leaf (`id_used`).
+  per leaf (`id_used`); none once the tree is full (`full`).
 - `provider: "dev"` accepts any registration whose proof bundle names a
   `uid`; it exists for tests and is refused by the ingest unless started
   with `--dev`.
@@ -189,8 +194,15 @@ compute `uid`; participation is public to it. Votes are not.
 {"v":1,"id":7,"version":1,"registry":1,"title":"…",
  "kind":{…},"encryption":{…},"publish":{…},"revote":"linked",
  "opens":1761900000,"closes":1777000000,"blackouts":[{"from":…,"to":…}],
- "circuit":{"name":"choice4_elgamal_linked","vk_hash":"0x…"}}
+ "circuit":{"name":"choice4_elgamal_linked_d20","vk_hash":"0x…"}}
 ```
+
+`circuit.name` is a variant name (circuits/gen.py): the kind's family and
+slot count, the encryption, the re-vote chain, the registry depth
+(`d20`) and, for delta polls, the ballot tree depth (`_b22`), which the
+poll also gives as `ballot_depth`. Optional fields at their default
+(`blackouts: []`, `require_expiry: false`, `nationality: []`) are left
+out: a body has one spelling (§3).
 
 ### 7.1 Kinds
 
@@ -256,8 +268,10 @@ reused for each candidate of the other.
 - **`none`**: one ballot per voter; the pseudonym is
   `nullifier = H(T_null, poll, s)`; a second ballot is `revote_off`.
 - **`linked`**: the pseudonym `nullifier` and a sequence number `seq`;
-  a ballot counts if it has the highest `seq` of its nullifier. The log
-  shows when and how often a pseudonym changed its mind.
+  a ballot counts if it has the highest `seq` of its nullifier, and
+  `seq` may not exceed the last one by more than 16 (`seq_gap`: a huge
+  seq would make a ballot final, a receipt a coercer could demand). The
+  log shows when and how often a pseudonym changed its mind.
 - **`delta`**: every ballot has a fresh identifier
   `ident_i = H(T_bnull, poll, s, i)` (i = 0, 1, … private), carries the
   **correction** `new − old` (old = 0 for i = 0), and appends to the
@@ -266,8 +280,10 @@ reused for each candidate of the other.
   i > 0 the proof shows that the leaf of ballot i − 1 is in the ballot
   tree (a root from a checkpoint) and opens to `old`. The tally is the
   sum of every ballot. Nothing links a correction to the ballot it
-  corrects, and a first ballot looks like a correction. `ident` must be
-  unused (`duplicate`), so each voter has one chain.
+  corrects. `ident` must be unused (`duplicate`), so each voter has one
+  chain; the tree's capacity (`full`) is shared by every ballot, and a
+  voter may post corrections that change nothing, so a delta poll's tree
+  should be deep (`b22` holds four million ballots).
 
 ## 8. The matrix
 
@@ -343,7 +359,9 @@ canonical, version, poll known and its `setup` in force (§13: the
 current one, or the previous one for 24 h after its successor);
 `opens ≤ now < closes` (`not_open`, `closed`); `root` is a checkpoint
 root of the registry at most `anchor_age` old (`old_root`), same for
-`broot`; points decode and are not at infinity (`malformed`); the
+`broot` (and a browser drafts only against a checkpoint younger than 30
+minutes by its own clock: a mirror serving one voter an old root would
+single that voter's ballot out); points decode and are not at infinity (`malformed`); the
 re-vote rule (`revote_off`, `stale_seq` when `seq` is not above the
 pseudonym's last, `duplicate`); `blob` ≤ 4 KiB (tlock); the proof against
 the circuit of the setup with the public inputs rebuilt from the body,
@@ -367,6 +385,16 @@ Deterministic over the log, so any decrypter and any auditor agree:
   the low bit of `SHA-256("isoloir/1/coin" ‖ checkpoint root)` is 1.
   The tally covers the log up to that checkpoint (`upto`, its last seq).
 - `closed`: one tally, covering up to the `close` entry.
+
+What an open poll reveals: the difference between two tallies is the
+sum of the ballots counted in between. With `k_real` small, or at low
+traffic, that is one ballot, in clear, and the log says which entry it
+is. The ingest decides what each checkpoint holds, so it can make that
+happen; the coin, drawn from the log root, does not stop an ingest that
+chooses what to log. `k_real` and `min_gap` may only rise in a later
+setup (§13). An open poll is a choice to publish ballots as they come,
+with at most this much batching; a poll that must hide every ballot is
+closed.
 - At the close of an open poll, a final tally covering up to `close`,
   even during a blackout.
 
@@ -475,7 +503,11 @@ channel it came from, tag `["e", <event id>]`:
  "outcome":"accepted","checkpoint":234}
 ```
 
-or `"outcome":"rejected","reason":"…"`. An accepted message is first
+or `"outcome":"rejected","reason":"…"`. The ack's `created_at` is
+rounded down to the minute (an ack is public: to the second, it would
+date the entry it names). A message resent after a missed ack goes in a
+fresh envelope (relays filter old events by time); the ingest answers
+the same body with the same outcome whatever its envelope. An accepted message is first
 written to durable storage (pending), then acknowledged, then logged at
 the named checkpoint in the same transaction as the checkpoint itself.
 A message whose check failed for an infrastructure reason is neither
@@ -493,13 +525,17 @@ signature, which no one but the ingest can make.
 ### 11.4 Every refusal is logged
 
 Refusals are `reject` entries `{"v":1,"of":"<event id>","hash":"…",
-"reason":"…"}`, so the log accounts for every message the ingest judged.
+"reason":"…","kind":"ballot","raw":"<the body, base64>"}`, so the log
+accounts for every message the ingest judged and an auditor judges it
+again (§16). `raw` is absent only for a body over 256 KiB, refused as
+`malformed`.
 
 ## 12. Reasons
 
 `malformed`, `version`, `unknown`, `not_open`, `closed`, `bad_sig`,
-`stale_date`, `uid_used`, `id_used`, `bad_proof`, `old_root`,
-`revote_off`, `stale_seq`, `duplicate`, `not_due`, `bad_tally`.
+`stale_date`, `uid_used`, `id_used`, `full`, `bad_proof`, `old_root`,
+`revote_off`, `stale_seq`, `seq_gap`, `duplicate`, `not_due`,
+`bad_tally`.
 
 ## 13. Upgrades
 
@@ -508,18 +544,18 @@ Refusals are `reject` entries `{"v":1,"of":"<event id>","hash":"…",
 - **Setups** (`ledger`, `registry`, `poll`): a later entry with the same
   id and `version + 1` supersedes the previous. What may change:
   - `ledger`: `channels` (append, retire; a channel keeps its type),
-    `checkpoint_period`,
+    `ingest` (a new Nostr key), `checkpoint_period`,
     `anchor_age`; never `origin`, `log_key`.
   - `registry`: `name`, `validity`; never `id`, `eligibility`, `depth`.
   - `poll`: `title`, `closes` (later only, before the close), `blackouts`
     (future ones only), `publish.k_real` and `publish.min_gap` (open
-    polls), `circuit` (a fixed circuit with the same public inputs);
+    polls; they may only rise), `circuit` (another build of the same
+    variant);
     never `registry`, `kind`, `encryption`, `revote`, `publish.mode`,
     `opens`.
   A ballot names the setup it proves against (`setup`); the previous
   setup is accepted for 24 h after its successor is logged.
-- **Protocol**: the leaf prefix, the checkpoint origin line and the
-  Nostr tag carry `isoloir/1`. A ledger never changes protocol version;
+- **Protocol**: the leaf prefix and the relay tag carry `isoloir/1`. A ledger never changes protocol version;
   `isoloir/2` would be a new ledger.
 - **Storage**: numbered migrations; the server refuses to start on a
   schema newer than it knows.
@@ -547,15 +583,30 @@ checkpoints/<index>.txt              every note
 entries/<index>.json                 [{seq, kind, body}] of a checkpoint
 stamps/<index>.ots                   the OpenTimestamps proof
 setup/ledger.json, registries/<id>.json, polls/<id>.json
+                                     {"setups":[<proven entry>…]}, every version
+polls/<id>/close.json                <proven entry>
 circuits/<name>/{artifact.json,vk}
 registries/<id>/leaves/<k>.json      leaves 1024·k … 1024·k+1023
 registries/<id>/positions/<pp>.json  leaf → position, by leaf prefix
 polls/<id>/pseudonyms/<pp>.json      nullifier → last seq (linked)
 polls/<id>/ballots/<k>.json          ballot tree leaves (delta)
 polls/<id>/tallies/latest.json, polls/<id>/tallies/<seq>.json
+                                     <proven entry>
 ```
 
+A **proven entry** is `{"seq","kind","body","checkpoint","size","path"}`:
+the entry's log position, its body as a string, the checkpoint whose
+note a reader verifies it against, that checkpoint's log size, and the
+RFC 6962 inclusion proof (hex hashes) of leaf `seq` in the first `size`
+leaves. A reader accepts a setup or a tally only with its proof: the
+mirror cannot serve an ingest key, a channel, a decrypter key or a result
+the log does not hold.
+
 ## 16. The audit
+
+A check that cannot run (a missing verification key, a passport
+verifier that is not configured) is a problem, not a pass: an audit that
+could not verify something says so and fails.
 
 From the log alone: every checkpoint signature and the log's consistency
 between checkpoints; the stamps against Bitcoin block headers; every
@@ -572,7 +623,14 @@ checkpoint's commit are the log's.
 
 | | Passport ↔ leaf | Leaf ↔ ballot | Ballot content | Re-vote history |
 |---|---|---|---|---|
-| Public | yes (uid is public) | no | aggregates only (elgamal); every ballot at the round (tlock) | linked: per pseudonym; delta: nothing |
-| Ingest | yes | no (timing only, as a relay) | as public | as public |
-| Decrypter (elgamal) | yes | no | could decrypt any ballot | as public |
-| Relay | yes | address and time of the post | as public | as public |
+| Public | yes (uid is public) | no | closed elgamal: aggregates only; open: tally differences, down to one ballot at low traffic or `k_real` 1 (§10.1); tlock: every ballot at the round | linked: per pseudonym, with the minute of each post; delta: the count of corrections per tally window |
+| Ingest | yes | no, but it chooses what each checkpoint holds (§10.1) | as public | as public |
+| Decrypter (elgamal) | yes | no | could decrypt any ballot of any poll under its key | as public |
+| Relay | yes | address and time of the post; under tlock, the content at the round | as public | as public |
+| Mirror host | no | the address that asks for a checkpoint's entries or a shard (browsers fetch windows, not one checkpoint) | as public | as public |
+| Network observer | no | address ↔ relay ↔ time; defeated only by Tor or a VPN, which the app may recommend | as public | as public |
+| Passkey provider | learns a passkey for the site exists; a compelled account yields `s` | | | |
+| Whoever holds `s` or the words | | every ballot of the voter | delta: every choice (the chain is recoverable); tlock: the ballot | all |
+
+The device keeps `s`, the words until they are confirmed, and the last
+choice; a seized or compromised device reveals them.

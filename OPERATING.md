@@ -32,16 +32,28 @@ Each line printed is `name vk_hash`: the poll names both.
 ## 3. Genesis and setups
 
 ```sh
+isoloir check ledger ledger.json                       # offline: spelling, rules
+isoloir check poll poll.json --registry registry.json  # prints the circuit to build
 isoloir genesis ledger.json            # once per database
 isoloir submit registry registry.json  # waits until the ingest logs it
 isoloir submit poll poll.json
 ```
 
+A setup file is canonical JSON with optional fields at their default
+left out (`isoloir check` says what the one spelling is).
+
 The ingest judges every setup (SPEC §5, §7, §8, §13) and refuses a poll
 outside the matrix. Later versions of a setup (`version + 1`) change only
 what SPEC §13 allows.
 
-## 4. The ingest
+## 4. The mirror and the ingest
+
+The mirror is a git repository the ingest commits to and pushes, and
+browsers read through a CDN by commit. Create an empty repository, give
+the ingest a deploy key with write access, and point it there: an empty
+mirror directory is cloned at start (so an ephemeral disk is fine, the
+circuits and the stamps come back with the clone), a new one is
+initialised.
 
 ```sh
 isoloir ingest --mirror-dir /app/mirror --mirror-git git@github.com:org/ledger-data.git \
@@ -52,29 +64,41 @@ With a `direct` channel in the ledger, add `--listen 0.0.0.0:8080` and
 put the endpoint behind TLS at the URL the ledger names.
 
 Environment: `DATABASE_URL`, `ISOLOIR_LOG_SEED`, `ISOLOIR_NOSTR_KEY`,
-`ISOLOIR_BB`, `ISOLOIR_ETH_RPC` (optional, for passport certificate
-roots). One instance per database: a second one refuses to start. The
-container image (`Dockerfile`) runs it by default. At start it replays
-the log, brings the mirror up to date, and reads the relays from its
-saved cursors.
+`ISOLOIR_MIRROR_GIT` (or `--mirror-git`), `ISOLOIR_BB`, `ISOLOIR_ETH_RPC`
+(optional, for passport certificate roots), `PORT` (serves `/v1/health`
+and the direct channel when the ledger lists one). The ingest refuses to
+start when its keys are not the ledger's. One instance per database: a
+second one refuses to start. The container image (`Dockerfile`) runs it
+by default. At start it replays the log, brings the mirror up to date,
+and reads the relays from its saved cursors. It checkpoints when the
+log grew, and at least every 10 minutes.
 
 ## 5. The trustee
 
 ```sh
-isoloir trustee --mirror /path/to/mirror-clone --log-key "<log_key>" \
+isoloir trustee --mirror https://cdn.example/ledger --circuits ./circuits-vk \
+  --zkverifier ./zkverifier/verify.mjs --log-key "<log_key>" \
   --keys /secure/dec.json --nostr-key <a Nostr key>
 ```
 
-It verifies the whole log (every proof) before decrypting anything, then
-publishes each tally when the poll's rule says it is due. For tlock polls
-no key is needed: any trustee (or anyone) opens them at the round with
+It verifies the whole log (every proof, every passport) before
+decrypting anything, then publishes each tally when the poll's rule
+says it is due; it retries a transient failure and stops for good on a
+log that does not verify. `--circuits` points at verification keys you
+built yourself (`isoloir circuits … --mirror ./circuits-vk`), so that a
+mirror cannot hand you a different circuit. For tlock polls no key is
+needed: any trustee (or anyone) opens them at the round with
 `--drand https://api.drand.sh`.
 
 ## 6. Checks
 
 ```sh
-isoloir audit --mirror https://… --log-key "<log_key>" --relays
+isoloir audit --mirror https://… --circuits ./circuits-vk --zkverifier ./zkverifier/verify.mjs \
+  --log-key "<log_key>" --relays --bitcoin
 ```
 
 Exit 0 and no `PROBLEM` line. Run it from machines the operator does not
-control.
+control, with circuits you built. A proof the audit could not check is a
+problem, never a pass; `--skip-passports` reports every registration as
+unchecked. `--bitcoin` checks the checkpoints' stamps against block
+headers (stamps take hours to be attested).

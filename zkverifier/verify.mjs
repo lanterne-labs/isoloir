@@ -77,6 +77,11 @@ try {
 	});
 	reply({ verified: Boolean(verified && uniqueIdentifier), uniqueIdentifier: uniqueIdentifier ?? '', errors: queryResultErrors ?? null });
 } catch (err) {
-	// A malformed request is not verified; the API logs the message.
-	reply({ verified: false, uniqueIdentifier: '', errors: { message: String(err?.message ?? err) } });
+	// A failure of ours (the certificate registry on Ethereum unreachable, a
+	// network error, the SDK's own loading) is not a refusal: the ingest
+	// judges the message again later. A malformed request or a proof that
+	// does not verify is.
+	const msg = String(err?.message ?? err);
+	const infrastructure = /ECONN|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|fetch failed|network|timeout|rpc|rate limit|429|50\d|socket|ENOENT/i.test(msg) && !/missing |must be a non-empty|not show the document/i.test(msg);
+	reply({ verified: false, uniqueIdentifier: '', infrastructure, errors: { message: msg } });
 }

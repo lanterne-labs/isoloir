@@ -27,7 +27,11 @@ pub enum Reason {
     Duplicate,
     NotDue,
     BadTally,
-    BadSetup,
+    /// The registry's or the poll's tree is full.
+    Full,
+    /// A linked seq more than `SEQ_GAP` above the pseudonym's last (or
+    /// above it for a first ballot): a seq is a counter, not a lock.
+    SeqGap,
 }
 
 impl Reason {
@@ -49,7 +53,8 @@ impl Reason {
             Reason::Duplicate => "duplicate",
             Reason::NotDue => "not_due",
             Reason::BadTally => "bad_tally",
-            Reason::BadSetup => "bad_setup",
+            Reason::Full => "full",
+            Reason::SeqGap => "seq_gap",
         }
     }
 
@@ -344,8 +349,9 @@ pub struct Reject {
     pub raw: Option<String>,
 }
 
-/// The largest raw body a reject keeps.
-pub const REJECT_RAW_MAX: usize = 16 * 1024;
+/// The largest body a message may have; a refusal keeps it whole (up to
+/// this size) so that an auditor can judge it again.
+pub const REJECT_RAW_MAX: usize = 256 * 1024;
 
 /// A result (SPEC §10.3, §10.4).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -481,6 +487,34 @@ pub fn decode(kind: EntryKind, bytes: &[u8]) -> Result<Body, Reason> {
         // One spelling: a default written out, a null, all refused.
         if canonical::to_vec(&t).map_err(|_| Reason::Malformed)? != bytes {
             return Err(Reason::Malformed);
+        }
+        Ok(t)
+    }
+    Ok(match kind {
+        EntryKind::Ledger => Body::Ledger(one(value, bytes)?),
+        EntryKind::Registry => Body::Registry(one(value, bytes)?),
+        EntryKind::Register => Body::Register(one(value, bytes)?),
+        EntryKind::Poll => Body::Poll(one(value, bytes)?),
+        EntryKind::Ballot => Body::Ballot(one(value, bytes)?),
+        EntryKind::Reject => Body::Reject(one(value, bytes)?),
+        EntryKind::Tally => Body::Tally(one(value, bytes)?),
+        EntryKind::Close => Body::Close(one(value, bytes)?),
+    })
+}
+
+/// Decodes a body with serde's own message on failure (operators' tools;
+/// the ingest answers a reason, never a message).
+pub fn decode_verbose(kind: EntryKind, bytes: &[u8]) -> Result<Body, String> {
+    let value = canonical::parse(bytes).map_err(|e| format!("not canonical JSON: {e} (sorted keys, no spaces, integers, defaults left out)"))?;
+    let v = value.get("v").and_then(Value::as_u64).ok_or("no \"v\"")?;
+    if v != V1 as u64 {
+        return Err(format!("v {v}: this code knows v 1"));
+    }
+    fn one<T: serde::de::DeserializeOwned + Serialize>(value: Value, bytes: &[u8]) -> Result<T, String> {
+        let t: T = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        let again = canonical::to_vec(&t).map_err(|e| e.to_string())?;
+        if again != bytes {
+            return Err(format!("not in its one spelling: a field at its default is left out; the spelling is {}", String::from_utf8_lossy(&again)));
         }
         Ok(t)
     }
