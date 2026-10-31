@@ -21,5 +21,5 @@ fn main(
     assert(nullifier == isoloir::nullifier(poll, s));
     let _ = (setup, seq);
     let v: [Field; 4] = isoloir::choice_values::<4>(pick, mask);
-    isoloir::encrypt::<2, 8>(isoloir::pack::<4, 2>(v), rho, pk_x, pk_y)
+    isoloir::encrypt::<2, 8>(isoloir::pack::<4, 2, 2>(v), rho, pk_x, pk_y)
 }

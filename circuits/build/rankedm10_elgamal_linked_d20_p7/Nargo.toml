@@ -1,0 +1,8 @@
+[package]
+name = "rankedm10_elgamal_linked_d20_p7"
+type = "bin"
+authors = ["isoloir"]
+compiler_version = ">=1.0.0"
+
+[dependencies]
+isoloir = { path = "../../lib" }

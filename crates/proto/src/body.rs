@@ -211,6 +211,14 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+fn two() -> u32 {
+    2
+}
+
+fn is_two(x: &u32) -> bool {
+    *x == 2
+}
+
 /// The `poll` entry (SPEC §7).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -245,7 +253,13 @@ pub enum KindSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Encryption {
-    Elgamal { pk: String, decrypter: Decrypter },
+    Elgamal {
+        pk: String,
+        decrypter: Decrypter,
+        /// Values per chunk (SPEC §7.1): 2 (the default) or 7.
+        #[serde(default = "two", skip_serializing_if = "is_two")]
+        per_chunk: u32,
+    },
     Tlock { chain: String, public_key: String, period: u64, genesis: u64, round: u64 },
 }
 

@@ -23,5 +23,5 @@ fn main(
     assert(nullifier == isoloir::nullifier(poll, s));
     let _ = (setup, seq);
     let v: [Field; 24] = isoloir::ranked_values::<12, 3, 24>(len, slots, isoloir::ranks::<12, 3>(len, slots, mask, blank));
-    isoloir::encrypt::<12, 48>(isoloir::pack::<24, 12>(v), rho, pk_x, pk_y)
+    isoloir::encrypt::<12, 48>(isoloir::pack::<24, 12, 2>(v), rho, pk_x, pk_y)
 }

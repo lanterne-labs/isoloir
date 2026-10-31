@@ -3,10 +3,13 @@
 
 A variant is a kind and its slot count (choiceM, rankedM, rankedmM), an
 encryption (elgamal, tlock), a re-vote mode (linked, which also serves
-"none", or delta), the registry depth and, for delta, the ballot tree
-depth. Each variant is a small Noir binary in build/<name>/ calling the
-library in lib/. The name says everything: choice4_elgamal_linked_d20,
-ranked12_elgamal_delta_d20_b22.
+"none", or delta), the registry depth, for delta the ballot tree depth,
+and for elgamal the values per chunk (p2, the default, which threshold
+decryption needs; p7 for a single decrypter, which opens each ballot:
+three times fewer ciphertexts). Each variant is a small Noir binary in
+build/<name>/ calling the library in lib/. The name says everything:
+choice4_elgamal_linked_d20, ranked12_elgamal_delta_d20_b22,
+rankedm10_elgamal_linked_d20_p7.
 
     gen.py NAME...          writes those variants
     gen.py --defaults       writes the default set
@@ -27,24 +30,30 @@ DEFAULTS = [
     "ranked12_elgamal_linked_d20",
     "ranked12_elgamal_delta_d20_b22",
     "rankedm12_elgamal_linked_d20",
+    "rankedm10_elgamal_linked_d20_p7",
+    "rankedm12_elgamal_linked_d20_p7",
 ]
 
-NAME = re.compile(r"^(choice|ranked|rankedm)(\d+)_(elgamal|tlock)_(linked|delta)_d(\d+)(?:_b(\d+))?$")
+NAME = re.compile(r"^(choice|ranked|rankedm)(\d+)_(elgamal|tlock)_(linked|delta)_d(\d+)(?:_b(\d+))?(?:_p(2|7))?$")
 
 
 def parse(name):
     m = NAME.match(name)
     if not m:
         raise SystemExit(f"{name}: not a variant name")
-    kind, slots, enc, revote, d, bd = m.groups()
+    kind, slots, enc, revote, d, bd, per = m.groups()
     slots, d = int(slots), int(d)
+    if per and enc != "elgamal":
+        raise SystemExit(f"{name}: the values per chunk are an elgamal setting")
+    if per == "2":
+        raise SystemExit(f"{name}: p2 is the default, left out of the name")
     if not 2 <= slots <= 32:
         raise SystemExit(f"{name}: 2 to 32 slots")
     if enc == "tlock" and (kind != "choice" or revote != "linked"):
         raise SystemExit(f"{name}: tlock is for single-choice kinds with one ballot per voter only (SPEC §8)")
     if (revote == "delta") != (bd is not None):
         raise SystemExit(f"{name}: a ballot tree depth with delta, and only then")
-    return dict(kind=kind, m=slots, enc=enc, revote=revote, d=d, bd=int(bd) if bd else None)
+    return dict(kind=kind, m=slots, enc=enc, revote=revote, d=d, bd=int(bd) if bd else None, per=int(per) if per else 2)
 
 
 def values(kind, m):
@@ -56,9 +65,9 @@ def values(kind, m):
 
 
 def main_nr(v):
-    kind, m, enc, revote, d, bd = v["kind"], v["m"], v["enc"], v["revote"], v["d"], v["bd"]
+    kind, m, enc, revote, d, bd, per = v["kind"], v["m"], v["enc"], v["revote"], v["d"], v["bd"], v["per"]
     nv = values(kind, m)
-    nc = (nv + 1) // 2
+    nc = (nv + per - 1) // per
     ranked = kind != "choice"
     pub = ["registry: pub Field", "poll: pub Field", "setup: pub Field", "mask: pub u32"]
     if ranked:
@@ -106,7 +115,7 @@ def main_nr(v):
                  f"    let old: [Field; {nv}] = {vals('old_')};",
                  "    let v = isoloir::correction(new, old, has_old);"]
     if enc == "elgamal":
-        body.append(f"    isoloir::encrypt::<{nc}, {4 * nc}>(isoloir::pack::<{nv}, {nc}>(v), rho, pk_x, pk_y)")
+        body.append(f"    isoloir::encrypt::<{nc}, {4 * nc}>(isoloir::pack::<{nv}, {nc}, {per}>(v), rho, pk_x, pk_y)")
     else:
         body.append("    let _ = bhash;")
         body.append("    assert(vcmt == isoloir::commit(salt, v));")

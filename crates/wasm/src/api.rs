@@ -666,7 +666,7 @@ fn check_elgamal(p: &PollSetup, v: &Variant, t: &Tally, text: &str) -> R<()> {
         .iter()
         .map(|[a, b]| Ok((grumpkin::from_hex(a).map_err(err)?, grumpkin::from_hex(b).map_err(err)?)))
         .collect::<R<_>>()?;
-    isoloir_proto::tally::verify_shares(&p.encryption, t, text.as_bytes(), v.values(), v.chunks(), &agg)
+    isoloir_proto::tally::verify_shares(&p.encryption, t, text.as_bytes(), v.values(), v.chunks(), v.per as usize, &agg)
 }
 
 /// The results of a vector of values, mapped to the poll's kind.
