@@ -1,0 +1,30 @@
+[package]
+name = "isoloir-server"
+description = "The isoloir services: the ingest, the trustee, the mirror, the storage, the passport verifier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+isoloir-core.workspace = true
+isoloir-proto.workspace = true
+isoloir-zk.workspace = true
+isoloir-decrypt.workspace = true
+isoloir-relay.workspace = true
+isoloir-stamps.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "fs"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros", "json"] }
+async-trait = "0.1"
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+rand.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+[dev-dependencies]
+tempfile = "3"
+k256.workspace = true

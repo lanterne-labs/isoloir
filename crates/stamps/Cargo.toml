@@ -1,0 +1,20 @@
+[package]
+name = "isoloir-stamps"
+description = "OpenTimestamps for isoloir: the .ots format, calendar submission and upgrade, verification against Bitcoin block headers"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tartuffeme/isoloir"
+rust-version = "1.90"
+
+
+[dependencies]
+sha2 = "0.10"
+sha1 = "0.10"
+sha3 = "0.10"
+ripemd = "0.1"
+hex = "0.4"
+thiserror = "2"
+tracing = "0.1"
+serde_json = "1"
+ureq = "3"

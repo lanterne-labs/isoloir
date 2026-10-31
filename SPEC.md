@@ -101,7 +101,9 @@ name, e.g. `tartuffe.me/isoloir`). Entries are numbered from 0 (`seq`).
   from 1 (`index`) and taken at most every `checkpoint_period` seconds
   when the log grew. A checkpoint's entries are the entries since the
   previous one, ordered by body hash (so the order within a checkpoint
-  reveals nothing about arrival order); registrations take their tree
+  reveals nothing about arrival order), except `close` entries, which end
+  their checkpoint (in poll order) so that the ballots accepted before
+  the close and logged with it come first; registrations take their tree
   positions in that order.
 - **Stamps**: every checkpoint note's SHA-256 is timestamped with
   OpenTimestamps; the stamps are upgraded until they carry a Bitcoin
@@ -410,7 +412,8 @@ checks it in full before logging it.
 ### 10.5 The `close` entry
 
 At the first checkpoint whose time is ≥ `closes`, the ingest appends
-`{"v":1,"poll":7,"at":<closes>,"last":<seq of the last ballot>}`.
+`{"v":1,"poll":7,"at":<closes>,"last":<seq of the last ballot>}` at the
+end of that checkpoint (`last` counts the ballots logged in it).
 Ballots after are `closed`. Relays may still deliver ballots posted
 before `closes` (§11): they are logged before `close` if they arrive
 before it, else refused, and the complaint process (§11.3) covers a

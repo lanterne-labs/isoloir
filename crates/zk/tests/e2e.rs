@@ -100,7 +100,7 @@ impl Ledger {
     fn checkpoint(&mut self) -> note::Checkpoint {
         self.now += 20;
         let mut q = std::mem::take(&mut self.queue);
-        q.sort_by_key(|(_, b)| isoloir_core::encoding::body_hash(b));
+        q.sort_by_key(|(k, b)| (*k == EntryKind::Close, isoloir_core::encoding::body_hash(b)));
         for (k, b) in &q {
             self.state.apply(*k, b, self.now).unwrap();
         }
@@ -332,7 +332,7 @@ fn delta_re_votes_end_to_end() {
 
     // Close, then the final tally: two "no", nothing else.
     l.now = poll.closes;
-    l.queue.push((EntryKind::Close, Body::Close(Close { v: 1, poll: 9, at: poll.closes, last: l.state.polls[&9].ballots.last().unwrap().seq }).encode()));
+    l.queue.push((EntryKind::Close, Body::Close(Close { v: 1, poll: 9, at: poll.closes, last: l.state.polls[&9].ballots.last().map(|b| b.seq).unwrap_or(0) }).encode()));
     let cp = l.checkpoint();
     let due = policy::due_at(&l.state, 9, cp.index).expect("the final tally is due");
     assert!(due.is_final);

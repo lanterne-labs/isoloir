@@ -66,8 +66,12 @@ impl<'a> Auditor<'a> {
         if cp.size != start + entries.len() as u64 {
             return Err(format!("checkpoint {index}: size {} but {} entries before and {} given", cp.size, start, entries.len()));
         }
-        // Body-hash order within a checkpoint (SPEC §4).
-        let hashes: Vec<String> = entries.iter().map(|(_, b)| encoding::body_hash(b)).collect();
+        // Body-hash order within a checkpoint, closes last (SPEC §4).
+        let closes_from = entries.iter().rposition(|(k, _)| *k != EntryKind::Close).map(|i| i + 1).unwrap_or(0);
+        if entries[..closes_from].iter().any(|(k, _)| *k == EntryKind::Close) {
+            self.report.problem(format!("checkpoint {index}: a close entry before other entries"));
+        }
+        let hashes: Vec<String> = entries[..closes_from].iter().map(|(_, b)| encoding::body_hash(b)).collect();
         if hashes.windows(2).any(|w| w[0] > w[1]) {
             self.report.problem(format!("checkpoint {index}: entries not in body-hash order"));
         }
@@ -107,28 +111,28 @@ impl<'a> Auditor<'a> {
                         self.report.problem(format!("entry {seq}: setup: {e}"));
                     }
                 }
-                EntryKind::Close => {
-                    if let Ok(Body::Close(c)) = body::decode(EntryKind::Close, b) {
-                        match before.polls.get(&c.poll) {
-                            None => self.report.problem(format!("entry {seq}: close of an unknown poll")),
-                            Some(p) => {
-                                let closes = p.current().closes;
-                                if c.at != closes || cp.time < closes || prev_time.is_some_and(|t| t >= closes) {
-                                    self.report.problem(format!("entry {seq}: the close is not at the first checkpoint after {closes}"));
-                                }
-                                let last = p.ballots.last().map(|b| b.seq);
-                                if last.is_some_and(|l| l != c.last) {
-                                    self.report.problem(format!("entry {seq}: close names ballot {} as the last, the log {:?}", c.last, last));
-                                }
-                            }
-                        }
-                    }
-                }
-                EntryKind::Reject => {}
+                // Checked as they are applied, after the ballots before them.
+                EntryKind::Close | EntryKind::Reject => {}
             }
         }
         // Apply: conflicts between entries of the same checkpoint show here.
-        for (kind, b) in entries {
+        for (i, (kind, b)) in entries.iter().enumerate() {
+            if let (EntryKind::Close, Ok(Body::Close(c))) = (kind, body::decode(EntryKind::Close, b)) {
+                let seq = start + i as u64;
+                match self.state.polls.get(&c.poll) {
+                    None => self.report.problem(format!("entry {seq}: close of an unknown poll")),
+                    Some(p) => {
+                        let closes = p.current().closes;
+                        if c.at != closes || cp.time < closes || prev_time.is_some_and(|t| t >= closes) {
+                            self.report.problem(format!("entry {seq}: the close is not at the first checkpoint after {closes}"));
+                        }
+                        let last = p.ballots.last().map(|b| b.seq).unwrap_or(0);
+                        if last != c.last {
+                            self.report.problem(format!("entry {seq}: close names ballot {} as the last, the log {last}", c.last));
+                        }
+                    }
+                }
+            }
             if let Err(e) = self.state.apply(*kind, b, cp.time) {
                 self.report.problem(e);
             }
