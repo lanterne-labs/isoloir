@@ -310,3 +310,38 @@ which stays on the Go implementation; M0 is the only step that touches
 2. The presidential kind never runs under tlock (its ballots are
    multiple choices: §5.1).
 3. The name: isoloir.
+
+## 10. Status (2026-10-31)
+
+Built and tested (`cargo test --workspace`, 65 tests; the circuits'
+`nargo test`; a trial through the `isoloir` command on a local relay and
+Postgres):
+
+- M0, M1: the core, the circuits (choice, ranked, ranked with margins;
+  ElGamal and tlock; linked and delta), the protocol crate, real proofs
+  end to end for every family and mode.
+- M2: Postgres storage with migrations, the ingest, the trustee (single
+  decrypter, tlock opener), the mirror (directory or git), the relay
+  pool, OpenTimestamps, the audit (log, proofs, tallies, refusals, the
+  relays' withholding), the command.
+- M4: tlock for closed single-choice polls with one ballot per voter.
+  Delta re-votes under tlock turned out unsound (a voter could void a
+  first ballot and count a correction against others' votes): refused by
+  the matrix (SPEC §8).
+
+Decisions made while building (in SPEC.md): one ledger per database;
+registries reusable across polls; plaintexts are non-negative digits
+(signed values would not survive Grumpkin's group order); close entries
+end their checkpoint; tallies name their aggregates so browsers check
+them alone; refusals keep their raw body so auditors judge them again;
+the tlock blob's hash is a public input of the proof.
+
+Open:
+- M3: the browser package (crates/wasm, js/) is being finished.
+- M5: the presidential instance (a ranked poll of tartuffe's candidates)
+  and its UI live in tartuffe's repository, on top of `@isoloir/web`.
+- M6: threshold decryption (the share format and the combination are in
+  place; the DKG and n > 1 trustees are not).
+- The Dockerfile is untested (no Docker on the build machine); the
+  trustee reads verification keys from a local mirror copy; the ingest
+  reads the ledger's relays at start only.
