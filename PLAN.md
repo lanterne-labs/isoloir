@@ -79,7 +79,23 @@ over the body). None of these know what a ballot says.
    aggregate itself from the poll's logged ballots at a checkpoint; it is
    never handed a ciphertext. The committee key is reusable because of
    this rule and of the domain-separated DLEQ.
-6. **Deterministic policy.** When to decrypt is a function of the log, so
+6. **Delta ballots (to decide in M1).** Instead of one pseudonym per
+   voter and a sequence rule, the i-th ballot of a voter carries the
+   identifier `H(T_NULL, event, s, i)` and, for `i > 0`, encrypts the
+   correction `new − old`; the circuit proves privately that `old` is the
+   plaintext of the ballot with identifier `H(…, s, i−1)` already in the
+   log (a second Merkle proof, over the log tree) and recomputes its
+   ciphertext from the randomness derived from `(s, i−1)`. The tally is
+   the sum of every ballot; nothing in the log links a correction to the
+   ballot it corrects; a repeated counter is a repeated identifier,
+   refused. The old choice travels sealed under `s` in the ballot body so
+   a restore or a device link has what a correction needs. Gains: the log
+   no longer shows when or how often a voter changed their mind, the
+   sequence rule and the "latest ballot" logic disappear. Limit: in tlock
+   mode the corrections open in clear and are patterns of their own, so
+   the disclosure rule of §5 is unchanged. Cost: a second depth-20 Merkle
+   proof and the old ciphertext's recomputation in the circuit.
+7. **Deterministic policy.** When to decrypt is a function of the log, so
    several trustees agree without talking: at the first checkpoint after
    the close (closed polls); for open polls, the K_REAL rule with the
    delay drawn from the checkpoint hash instead of a private coin.
