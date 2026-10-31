@@ -1,0 +1,54 @@
+{
+  "name": "@isoloir/web",
+  "version": "0.1.0",
+  "description": "isoloir in the browser: keys, registration, ballots, receipts and results over Nostr relays and a static mirror, on the protocol's own Rust compiled to WebAssembly",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./prove.worker": {
+      "types": "./dist/prove.worker.d.ts",
+      "default": "./dist/prove.worker.js"
+    },
+    "./wasm": {
+      "types": "./wasm/web/isoloir_wasm.d.ts",
+      "default": "./wasm/web/isoloir_wasm.js"
+    }
+  },
+  "files": [
+    "dist",
+    "wasm/web"
+  ],
+  "scripts": {
+    "wasm:web": "wasm-pack build ../crates/wasm --target web --out-dir ../../js/wasm/web --out-name isoloir_wasm --release",
+    "wasm:node": "wasm-pack build ../crates/wasm --target nodejs --out-dir ../../js/wasm/node --out-name isoloir_wasm --release -- --features dev",
+    "wasm": "npm run wasm:web && npm run wasm:node",
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@aztec/bb.js": "5.0.0",
+    "@noir-lang/noir_js": "1.0.0-beta.22"
+  },
+  "peerDependenciesMeta": {
+    "@aztec/bb.js": {
+      "optional": true
+    },
+    "@noir-lang/noir_js": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@aztec/bb.js": "^5.0.0",
+    "@noir-lang/noir_js": "^1.0.0-beta.22",
+    "@types/node": "^24.19.2",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.3"
+  }
+}

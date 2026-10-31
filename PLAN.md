@@ -337,7 +337,11 @@ them alone; refusals keep their raw body so auditors judge them again;
 the tlock blob's hash is a public input of the proof.
 
 Open:
-- M3: the browser package (crates/wasm, js/) is being finished.
+- M3 done: `isoloir-wasm` (the protocol through WebAssembly) and `@isoloir/web`
+  (a framework-free session: keys, registration with the scan first, relays
+  and acks, receipts and complaints, linked and delta re-votes, device link,
+  verified tallies); a proof made with noir_js and bb.js verifies on the
+  server. Not yet run in a real browser against real relays.
 - M5: the presidential instance (a ranked poll of tartuffe's candidates)
   and its UI live in tartuffe's repository, on top of `@isoloir/web`.
 - M6: threshold decryption (the share format and the combination are in

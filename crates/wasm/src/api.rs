@@ -36,6 +36,11 @@ pub(crate) fn fr(s: &str) -> R<Fr> {
     field::from_hex(s).map_err(|e| format!("{s}: {e}"))
 }
 
+/// The voter secret: its value never appears in an error.
+pub(crate) fn secret(s: &str) -> R<Fr> {
+    field::from_hex(s).map_err(|_| "the secret is not a field element".to_string())
+}
+
 pub(crate) fn hexf(x: &Fr) -> String {
     field::to_hex(x)
 }
@@ -77,17 +82,17 @@ pub fn decode_body(kind: &str, text: &str) -> R<String> {
 
 /// `H(T_id, registry, s)`.
 pub fn leaf(registry: u32, s: &str) -> R<String> {
-    Ok(hexf(&client::leaf(registry, &fr(s)?)))
+    Ok(hexf(&client::leaf(registry, &secret(s)?)))
 }
 
 /// `H(T_null, poll, s)`.
 pub fn nullifier(poll: u32, s: &str) -> R<String> {
-    Ok(hexf(&client::nullifier(poll, &fr(s)?)))
+    Ok(hexf(&client::nullifier(poll, &secret(s)?)))
 }
 
 /// `H(T_bnull, poll, s, i)`.
 pub fn ident(poll: u32, s: &str, i: u32) -> R<String> {
-    Ok(hexf(&client::ident(poll, &fr(s)?, i)))
+    Ok(hexf(&client::ident(poll, &secret(s)?, i)))
 }
 
 /// The ballot tree leaf `H(T_bleaf, ident, cmt)`.
@@ -123,7 +128,7 @@ pub fn secret_from_entropy(entropy: &[u8]) -> R<String> {
 /// The order of the relays for a key (SPEC §11.1): by
 /// `H(T_relay, s, SHA-256(url) mod r)`, lowest first.
 pub fn relay_ranking(s: &str, urls_json: &str) -> R<String> {
-    let s = fr(s)?;
+    let s = secret(s)?;
     let urls: Vec<String> = parse(urls_json, "urls")?;
     let mut scored: Vec<([u8; 32], String)> = urls
         .into_iter()
@@ -173,7 +178,7 @@ struct RegisterReq {
 /// The signed `register` body (SPEC §6).
 pub fn register_body(req_json: &str) -> R<String> {
     let r: RegisterReq = parse(req_json, "register request")?;
-    let b = client::register_body(r.registry, &fr(&r.s)?, &r.uid, r.proof, r.proof_date, &reg_sk(&r.reg_secret)?);
+    let b = client::register_body(r.registry, &secret(&r.s)?, &r.uid, r.proof, r.proof_date, &reg_sk(&r.reg_secret)?);
     String::from_utf8(b).map_err(err)
 }
 
@@ -352,7 +357,7 @@ pub fn draft_ballot(req_json: &str) -> R<String> {
     if member.path.len() != variant.depth as usize {
         return Err(format!("the path has {} levels, the circuit {}", member.path.len(), variant.depth));
     }
-    let s = fr(&r.s)?;
+    let s = secret(&r.s)?;
     let choice = choice_from(&r.choice)?;
     let revoting = match r.revoting {
         RevotingJ::Linked { seq } => Revoting::Linked { seq },
@@ -408,7 +413,7 @@ pub fn delta_recover(poll_json: &str, s: &str, leaves_json: &str) -> R<String> {
     if v.chain != Chain::Delta {
         return Err("not a delta poll".into());
     }
-    let s = fr(s)?;
+    let s = secret(s)?;
     let leaves: Vec<String> = parse(leaves_json, "leaves")?;
     let index: std::collections::HashMap<&str, usize> = leaves.iter().enumerate().map(|(i, l)| (l.as_str(), i)).collect();
     let candidates = all_choices(&p, &v);
