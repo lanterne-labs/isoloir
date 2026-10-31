@@ -11,6 +11,7 @@ An isoloir is the voting booth: the curtain you vote behind, unseen.
 
 - The protocol: [SPEC.md](SPEC.md) (normative).
 - Running a ledger: [OPERATING.md](OPERATING.md).
+- What protects what, the limits, the extensions: [DESIGN.md](DESIGN.md).
 - The plan and its status: [PLAN.md](PLAN.md).
 
 ## What a deployment can be
