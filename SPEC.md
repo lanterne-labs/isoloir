@@ -90,6 +90,7 @@ name, e.g. `tartuffe.me/isoloir`). Entries are numbered from 0 (`seq`).
   <origin>
   <log size>
   <log root, base64>
+  index <checkpoint index>
   time <unix seconds>
   registry <id> <tree size> <tree root>      one line per registry
   ballots <poll> <tree size> <tree root>     one line per delta poll
@@ -435,8 +436,10 @@ Nostr events, tag `["t","isoloir/1/<origin>"]`, content the body:
 | 7105 | tally | a throwaway key (the body carries its own signature) |
 | 7106 | complaint | a throwaway key |
 
-A voter posts to one relay chosen by `H(T_relay, s, …)` among the active
-ones, and moves to the next when no ack comes within 60 s.
+A voter ranks the active relays by `H(T_relay, s, SHA-256(url) mod r)`,
+lowest first: registrations go to the first, ballots start with the
+second (so the two are not seen together by one relay); the voter moves
+to the next when no ack comes within 60 s.
 
 ### 11.2 Acknowledgements
 
@@ -458,7 +461,8 @@ acknowledged nor refused; it is retried.
 
 The browser keeps the ack and checks the entries of the named
 checkpoint on the mirror for its body hash. A missing body is a
-**complaint**: `{"v":1,"ack":<the ack event>,"body":<the body>}` posted
+**complaint**: `{"v":1,"ack":<the ack event>,"body":<the body, as JSON>}`
+(the body is canonical, so embedding it as JSON is lossless) posted
 to the relays; anyone can judge it from the log and the ack's
 signature.
 

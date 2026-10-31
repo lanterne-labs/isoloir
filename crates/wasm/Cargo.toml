@@ -7,9 +7,6 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/tartuffeme/isoloir"
 rust-version = "1.90"
 
-# Not a member of the repository's workspace: it builds on its own, for
-# wasm32-unknown-unknown and natively (its tests).
-[workspace]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -49,6 +46,3 @@ getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] 
 [dev-dependencies]
 isoloir-decrypt = { path = "../decrypt" }
 
-[profile.release]
-opt-level = 3
-lto = true
