@@ -1,0 +1,8 @@
+[package]
+name = "isoloir"
+type = "lib"
+authors = ["isoloir"]
+compiler_version = ">=1.0.0"
+
+[dependencies]
+poseidon = { tag = "v0.4.0", git = "https://github.com/noir-lang/poseidon" }

@@ -1,0 +1,16 @@
+[package]
+name = "isoloir-zk"
+description = "The isoloir circuits through nargo and bb: build, prove (tests and tools), verify (the ingest and the auditor)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+isoloir-core.workspace = true
+isoloir-proto.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tempfile = "3"
+rand.workspace = true

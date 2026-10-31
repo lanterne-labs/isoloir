@@ -230,9 +230,13 @@ reused for each candidate of the other.
 - **`tlock`**: `{"mode":"tlock","chain":"<drand chain hash>",
   "public_key":"<drand group public key hex>","period":3,"genesis":…,
   "round":<round at or after closes>}`. The ballot carries a commitment
-  `c = H(T_cmt, salt, v_0, …, v_{n−1})` and a blob: the tlock encryption
-  (drand IBE, `tlock` format) of `{"salt":"0x…","values":[…]}` to
-  `round`. Nobody can open a blob before the round; anyone can after.
+  `vcmt = H(T_cmt, salt, H(v_0, …, v_{n−1}))` and a blob: a 16-byte key
+  time-locked to `round` (drand IBE, the `tlock` format) followed by
+  `{"salt":"0x…","values":[…]}` sealed under that key
+  (ChaCha20-Poly1305, key `SHA-256("isoloir/1/tlock" ‖ key)`, zero nonce:
+  the key is used once). Nobody can open a blob before the round; anyone
+  can after. The circuit checks the values against the kind, so an
+  invalid choice is refused at once, not discovered at the close.
 
 ### 7.3 Publication
 
@@ -267,7 +271,7 @@ reused for each candidate of the other.
 | elgamal, closed | single choice | ✓ | ✓ | ✓ |
 | elgamal, closed | multiple choices | ✓ | ✓ | ✓ |
 | tlock, open | any | ✗ | ✗ | ✗ |
-| tlock, closed | single choice | ✓ | ✗ | ✓ |
+| tlock, closed | single choice | ✓ | ✗ | ✗ |
 | tlock, closed | multiple choices | ✗ | ✗ | ✗ |
 
 - tlock, open: nothing opens before the round.
@@ -275,8 +279,14 @@ reused for each candidate of the other.
   rare ranking is a receipt for a coercer or a buyer. A correction is a
   pattern too, so delta does not help.
 - tlock, single choice, linked: ballots are alike but histories are not
-  ("yes, no, yes, no") under one pseudonym; delta removes the link and
-  each opened correction is shared by many.
+  ("yes, no, yes, no") under one pseudonym.
+- tlock, delta: a correction is only sound if the ballot it corrects is
+  counted. Under tlock nobody can tell before the round whether a blob
+  opens, and a voter could post a first ballot whose blob is garbage
+  (void at the round) and then a valid correction "no − yes": unlinkable
+  to the void ballot, it would remove someone else's "yes". The circuit
+  cannot check a drand ciphertext at phone cost, so tlock polls take one
+  ballot per voter.
 
 A `poll` entry outside the matrix is refused by the ingest and reported
 by the auditor. With a single decrypter, "closed" means the public cannot
@@ -291,12 +301,16 @@ One UltraHonk proof (Noir, `bb`, verifier target `noir-recursive`,
 zero-knowledge). Public inputs, in this order:
 
 1. `registry`, `poll`, `setup` (the seq of the `poll` entry proven
-   against), `mask`, `root` (a registry tree root);
+   against), `mask`, for ranked kinds `blank` (the blank's slot, or the
+   circuit's slot count when there is none), `root` (a registry tree
+   root);
 2. none/linked: `nullifier`, `seq`; delta: `ident`, `broot` (a ballot tree
    root), `cmt` (the new leaf's commitment);
 3. elgamal: `pk.x`, `pk.y`, then the ciphertexts as return values
    (`c0.x, c0.y, c1.x, c1.y` per chunk); tlock: `vcmt`, the commitment
-   to the values the blob holds.
+   to the values the blob holds, and `bhash`, SHA-256 of the blob read
+   as a big-endian integer modulo r: the proof binds the blob, so a relay
+   cannot swap it, and only the voter can make their own ballot void.
 
 The circuit proves: the leaf `H(T_id, registry, s)` is in the tree of
 `root`; the pseudonym is computed from `s` as §7.4 says; the choice is
