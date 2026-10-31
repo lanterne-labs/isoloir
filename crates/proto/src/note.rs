@@ -36,8 +36,9 @@ impl Signer {
     /// `golang.org/x/mod/sumdb/note` writes), checked against its key id.
     pub fn from_private(s: &str) -> Result<Self, String> {
         let rest = s.strip_prefix("PRIVATE+KEY+").ok_or("not a PRIVATE+KEY string")?;
-        let mut parts = rest.rsplitn(3, '+');
-        let (kd, id, name) = (parts.next().ok_or("no key data")?, parts.next().ok_or("no key id")?, parts.next().ok_or("no name")?);
+        // A name has no '+' (C2SP signed-note); the base64 key data may.
+        let mut parts = rest.splitn(3, '+');
+        let (name, id, kd) = (parts.next().ok_or("no name")?, parts.next().ok_or("no key id")?, parts.next().ok_or("no key data")?);
         let kd = STANDARD.decode(kd).map_err(|e| e.to_string())?;
         if kd.len() != 33 || kd[0] != ALG_ED25519 {
             return Err("not an Ed25519 key".into());
@@ -228,6 +229,19 @@ mod tests {
         kd.extend_from_slice(&s.key.to_bytes());
         let private = format!("PRIVATE+KEY+example.org/isoloir+{}+{}", hex::encode(key_id("example.org/isoloir", &pk)), STANDARD.encode(kd));
         assert_eq!(Signer::from_private(&private).unwrap().verifier(), s.verifier());
+        // Key data with '+' in its base64.
+        let t = (0u8..=255).map(|b| Signer::new("example.org/isoloir", &[b; 32])).find(|t| {
+            let mut kd = vec![ALG_ED25519];
+            kd.extend_from_slice(&t.seed());
+            STANDARD.encode(kd).contains('+')
+        });
+        if let Some(t) = t {
+            let pk = t.key.verifying_key().to_bytes();
+            let mut kd = vec![ALG_ED25519];
+            kd.extend_from_slice(&t.seed());
+            let p = format!("PRIVATE+KEY+example.org/isoloir+{}+{}", hex::encode(key_id("example.org/isoloir", &pk)), STANDARD.encode(kd));
+            assert_eq!(Signer::from_private(&p).unwrap().verifier(), t.verifier());
+        }
         assert!(Signer::from_private(&private.replacen("example.org", "example.com", 1)).is_err());
         let other = Signer::new("example.org/isoloir", &[8u8; 32]);
         assert!(Verifier::parse(&other.verifier()).unwrap().open(&note).is_err());
