@@ -4,7 +4,7 @@
 
 use anyhow::{bail, Context, Result};
 use isoloir_core::{field, Fr};
-use isoloir_proto::body::{self, decode_ack, Body, EntryKind, LedgerSetup, PollSetup, RelayState};
+use isoloir_proto::body::{self, decode_ack, Body, EntryKind, LedgerSetup, PollSetup};
 use isoloir_proto::client::{self, Member, Revoting};
 use isoloir_proto::kinds::{Choice, Variant};
 use isoloir_proto::sig::Event;
@@ -58,28 +58,38 @@ fn registry_depth(dir: &Path, id: u32) -> Result<usize> {
     }
 }
 
-/// Posts a body and waits for its ack; prints it.
+/// Posts a body by the ledger's first active channel and waits for its
+/// ack; prints it.
 async fn post(dir: &Path, kind: u32, body: Vec<u8>) -> Result<()> {
     let l = ledger(dir)?;
-    let relays: Vec<String> = l.relays.iter().filter(|r| r.state == RelayState::Active).map(|r| r.url.clone()).collect();
-    let pool = Pool::connect(relays.clone());
     let sk: [u8; 32] = rand::random();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
     let tag = format!("{}/{}", isoloir_proto::PROTOCOL, l.origin);
     let ev = Event::sign(&sk, now, kind, vec![vec!["t".into(), tag.clone()]], String::from_utf8(body)?);
-    let waiter = {
-        let pool = pool.clone();
-        let id = ev.id.clone();
-        tokio::spawn(async move { pool.wait_for(Filter { kinds: vec![7102], e: vec![id], ..Default::default() }, Duration::from_secs(90)).await })
+    let channel = l.channels.iter().find(|c| c.is_active()).context("no active channel")?;
+    let ack = match channel {
+        isoloir_proto::body::Channel::Direct { url, .. } => {
+            println!("posting {} to {url}", ev.id);
+            isoloir_server::direct::post_direct(url, &ev, Duration::from_secs(90)).await?
+        }
+        isoloir_proto::body::Channel::Nostr { .. } => {
+            let relays = l.nostr(true);
+            let pool = Pool::connect(relays.clone());
+            let waiter = {
+                let pool = pool.clone();
+                let id = ev.id.clone();
+                tokio::spawn(async move { pool.wait_for(Filter { kinds: vec![7102], e: vec![id], ..Default::default() }, Duration::from_secs(90)).await })
+            };
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let relay = pool.publish_any(&relays, &ev, Duration::from_secs(10)).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("posted {} to {relay}", ev.id);
+            waiter.await?.context("no acknowledgement within 90 s")?.event
+        }
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let relay = pool.publish_any(&relays, &ev, Duration::from_secs(10)).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!("posted {} to {relay}", ev.id);
-    let Some(d) = waiter.await? else { bail!("no acknowledgement within 90 s") };
-    if d.event.pubkey != l.ingest {
-        bail!("an ack signed by someone else than the ingest");
+    if ack.pubkey != l.ingest || !ack.verify() || ack.tag("e") != Some(ev.id.as_str()) {
+        bail!("an acknowledgement not signed by the ingest, or for another message");
     }
-    let ack = decode_ack(d.event.content.as_bytes()).map_err(|r| anyhow::anyhow!("ack: {}", r.as_str()))?;
+    let ack = decode_ack(ack.content.as_bytes()).map_err(|r| anyhow::anyhow!("ack: {}", r.as_str()))?;
     println!("{}", serde_json::to_string(&ack)?);
     Ok(())
 }

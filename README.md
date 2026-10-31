@@ -2,9 +2,10 @@
 
 Anonymous polls with passport eligibility: prove once, with a passport,
 that you may vote; vote anonymously and encrypted; let anyone recount
-from a public log. No blockchain, no network of the operator's: messages
-travel through public Nostr relays, results are files on a static mirror,
-checkpoints are timestamped in Bitcoin.
+from a public log. No blockchain needed: messages travel by the channels
+the ledger declares (public Nostr relays, the ingest's own HTTP endpoint,
+or both), results are files on a static mirror, checkpoints are
+timestamped in Bitcoin.
 
 An isoloir is the voting booth: the curtain you vote behind, unseen.
 

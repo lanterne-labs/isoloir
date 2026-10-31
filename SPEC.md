@@ -15,8 +15,10 @@ results — is appended to one public **log** per deployment (a
 **ledger**), signed and timestamped, mirrored as static files; anyone can
 recount.
 
-Nothing runs on a blockchain. Messages travel through public Nostr
-relays; the browser never talks to the operator's server. Bitcoin is used
+Nothing runs on a blockchain. Messages travel by the **channels** the
+ledger declares (§11.1): public Nostr relays, so that the browser never
+talks to the operator's server, or the ingest's own HTTP endpoint, or
+both; the library picks them from the ledger. Bitcoin is used
 only to timestamp checkpoints (OpenTimestamps), Ethereum only to read the
 passport certificate registry, drand only as a time-lock beacon.
 
@@ -27,7 +29,7 @@ passport certificate registry, drand only as a time-lock beacon.
 | Voter (browser) | the voter secret `s` | registers, votes, checks receipts |
 | Ingest (server) | the ledger's log key, its Nostr key | verifies and logs, acknowledges, checkpoints, mirrors |
 | Decrypter (`trustee`) | a poll's decryption key, or nothing (tlock) | publishes decryptions when the poll's rule says so |
-| Relays | nothing | carry messages; see who posts what, from which address |
+| Channels | nothing | carry messages; a relay sees who posts what, from which address (a direct channel: the operator does) |
 | Auditor | nothing | recomputes everything from the log, the relays, the mirror |
 
 The ingest cannot vote for anyone, cannot change a ballot, cannot read a
@@ -118,11 +120,13 @@ change what may change (§13).
 ```json
 {"v":1,"version":1,"origin":"tartuffe.me/isoloir",
  "log_key":"<C2SP verifier key>","ingest":"<Nostr pubkey, x-only hex>",
- "relays":[{"url":"wss://…","state":"active"}],
+ "channels":[{"type":"nostr","url":"wss://…","state":"active"},
+             {"type":"direct","url":"https://vote.example/ingest","state":"active"}],
  "checkpoint_period":20,"anchor_age":86400}
 ```
 
-`relays`: at least three; `state` is `active` or `retired` (read, not
+`channels`: at least one active (three relays for a ledger that wants
+voters never to reach the operator); `state` is `active` or `retired` (read, not
 written). `anchor_age`: how old a tree root a ballot may prove against.
 
 ## 5. Registries
@@ -157,7 +161,7 @@ A registry is a set of eligible voters, reusable by any number of polls.
    `validity`.
 2. **Then the key.** The browser obtains `s` (§14) and computes `ID`. The
    proof waits with `R` in the browser's storage until then.
-3. **Post** `register` to the ledger's relays:
+3. **Post** `register` by the ledger's channels (§11.1):
 
    ```json
    {"v":1,"registry":1,"id":"<ID>","uid":"<passport identifier>",
@@ -422,9 +426,28 @@ ballot acknowledged and never logged.
 
 ## 11. Transport
 
-### 11.1 Relays
+### 11.1 Channels
 
-Nostr events, tag `["t","isoloir/1/<origin>"]`, content the body:
+Every message is a signed **envelope** in the format of a Nostr event
+(NIP-01: id, pubkey, created_at, kind, tags, content, sig; BIP340 on
+secp256k1), tag `["t","isoloir/1/<origin>"]`, content the body. The
+envelope and its acknowledgement are the same whatever carries them; a
+channel type only says how they travel:
+
+- **`nostr`**: public relays (`wss://`). The voter publishes the envelope;
+  the ingest reads the relays and publishes the ack on the relay the
+  envelope came from. The relays keep copies, so an auditor can prove
+  withholding (§16); the operator never sees a voter's address.
+- **`direct`**: the ingest's HTTP endpoint (`https://`).
+  `POST <url>/v1/messages` with the envelope as JSON answers 200 with the
+  ack, or 202 `{"pending":"<id>"}` when judgment waits (§11.2);
+  `GET <url>/v1/acks/<id>` answers the ack, or 404. Simpler to run, but
+  the operator sees each voter's address and timing, and no third party
+  keeps a copy: withholding shows only through receipts (§11.3).
+- Later types (a chain, for instance) add a variant: the envelope, the
+  ack, the log and the mirror do not change.
+
+Kinds:
 
 | Kind | Content | Signed by |
 |---|---|---|
@@ -436,15 +459,16 @@ Nostr events, tag `["t","isoloir/1/<origin>"]`, content the body:
 | 7105 | tally | a throwaway key (the body carries its own signature) |
 | 7106 | complaint | a throwaway key |
 
-A voter ranks the active relays by `H(T_relay, s, SHA-256(url) mod r)`,
+A voter ranks the active channels by `H(T_relay, s, SHA-256(url) mod r)`,
 lowest first: registrations go to the first, ballots start with the
-second (so the two are not seen together by one relay); the voter moves
-to the next when no ack comes within 60 s.
+second when there is more than one (so the two are not seen together by
+one relay); the voter moves to the next when no ack comes within 60 s.
+The device link (§14) needs a relay.
 
 ### 11.2 Acknowledgements
 
-The ingest answers every message it has judged with an ack on the relay
-it came from, tag `["e", <event id>]`:
+The ingest answers every message it has judged with an ack by the
+channel it came from, tag `["e", <event id>]`:
 
 ```json
 {"v":1,"of":"<event id>","hash":"<SHA-256 of the body>",
@@ -463,8 +487,8 @@ The browser keeps the ack and checks the entries of the named
 checkpoint on the mirror for its body hash. A missing body is a
 **complaint**: `{"v":1,"ack":<the ack event>,"body":<the body, as JSON>}`
 (the body is canonical, so embedding it as JSON is lossless) posted
-to the relays; anyone can judge it from the log and the ack's
-signature.
+by the ledger's channels; anyone can judge it from the log and the ack's
+signature, which no one but the ingest can make.
 
 ### 11.4 Every refusal is logged
 
@@ -483,7 +507,8 @@ Refusals are `reject` entries `{"v":1,"of":"<event id>","hash":"…",
   versions. A new body version is added alongside the old one.
 - **Setups** (`ledger`, `registry`, `poll`): a later entry with the same
   id and `version + 1` supersedes the previous. What may change:
-  - `ledger`: `relays` (append, retire), `checkpoint_period`,
+  - `ledger`: `channels` (append, retire; a channel keeps its type),
+    `checkpoint_period`,
     `anchor_age`; never `origin`, `log_key`.
   - `registry`: `name`, `validity`; never `id`, `eligibility`, `depth`.
   - `poll`: `title`, `closes` (later only, before the close), `blackouts`
