@@ -1,14 +1,15 @@
 // The voter's session for one ledger, one registry and (optionally) one
 // poll: everything a page shows comes from here. It reads the mirror and
-// posts to relays, never to the operator's server; every protocol rule
-// is the wasm core's. TypeScript only orchestrates:
+// posts through the ledger's channels (Nostr relays, the ingest's direct
+// endpoint: channel.ts), as the ledger setup on the mirror lists them;
+// every protocol rule is the wasm core's. TypeScript only orchestrates:
 //
 //   key        a passkey's PRF, 12 words, or a device link (SPEC §14)
 //   register   the registration key is drawn before the passport scan,
 //              the proof waits for the key, then the body is signed and
 //              posted (SPEC §6)
-//   post       a signed event to the key's relay, the ingest's signed ack
-//              awaited 60 s, then the next relay (SPEC §11.1); the event
+//   post       a signed event to the key's channel, the ingest's signed
+//              ack awaited 60 s, then the next channel (SPEC §11.1); the event
 //              and the ack are kept, so a missed ack is a resend of the
 //              same event, never a lost message
 //   receipt    the acked body's hash among the entries of the checkpoint
@@ -25,9 +26,10 @@ import { IsoloirError, toIsoloirError } from './errors.js';
 import { Mirror, dirSource, type Fetcher, type MirrorSource } from './mirror.js';
 import { createPrf, assertPrf, prfInput, type PasskeyOptions } from './passkey.js';
 import type { Prover } from './prover.js';
-import { postWithAck, WebSocketTransport, type PostProgress, type RelayTransport } from './relay.js';
+import { defaultChannelFactory, findAck, postWithAck, type Acked, type ChannelFactory, type IngestChannel, type PostProgress } from './channel.js';
 import { defaultStore, readJSON, writeJSON, type KeyValueStore } from './storage.js';
 import type {
+	Channel,
 	Checkpoint,
 	Choice,
 	KindInfo,
@@ -57,17 +59,25 @@ export interface SessionConfig {
 	mirror: MirrorSource[] | string;
 	fetch?: Fetcher;
 	store?: KeyValueStore;
-	transport?: RelayTransport;
+	/**
+	 * How a channel of the ledger is reached. The session builds its
+	 * channels from the ledger setup on the mirror; the default factory
+	 * (WebSockets for relays, fetch for the direct endpoint) is what an app
+	 * wants: this is for tests and fakes.
+	 */
+	channels?: ChannelFactory;
 	prover?: Prover;
 	passkey?: PasskeyOptions;
 	/** The word list of the 12 words: 'en' (default) or 'fr'. */
 	wordsLang?: string;
-	/** How long an ack is awaited on a relay before the next one (SPEC §11.1: 60 s). */
+	/** How long an ack is awaited on a channel before the next one (SPEC §11.1: 60 s). */
 	ackTimeoutMs?: number;
 	publishTimeoutMs?: number;
+	/** How often the direct endpoint is asked for a pending ack (default 2 s). */
+	directPollMs?: number;
 	/** How often the mirror is read while something waits (0: never; the app calls refresh()). */
 	refreshMs?: number;
-	/** Follow the ingest's checkpoint events on a relay (default true). */
+	/** Follow the ingest's checkpoint events on a relay, when the ledger has one (default true). */
 	watchRelays?: boolean;
 	/** The local clock, ms (tests). */
 	now?: () => number;
@@ -84,7 +94,8 @@ export interface PostRecord {
 	event: NostrEvent;
 	hash: string;
 	state: PostState;
-	relay?: string;
+	/** The channel (its URL) that took it, then the one that acked it. */
+	channel?: string;
 	sentAt?: number;
 	ack?: { event: NostrEvent; checkpoint: number | null };
 	reason?: string;
@@ -208,6 +219,10 @@ export interface SessionState {
 	revote: { seq: number | null; next: number | null; previousChoice: Choice | null };
 	tally: TallyVerdict | null;
 	prover: 'idle' | 'loading' | 'ready' | 'failed';
+	/** The ledger's active channels. */
+	channels: Channel[];
+	/** Whether a device link can be made (it needs a Nostr relay among the channels). */
+	linkAvailable: boolean;
 }
 
 export interface SessionEvents {
@@ -239,7 +254,8 @@ export class Session {
 	readonly mirror: Mirror;
 	private readonly events = new Emitter<SessionEvents>();
 	private readonly store: KeyValueStore;
-	private readonly transport: RelayTransport;
+	private readonly channelFactory: ChannelFactory;
+	private channels: IngestChannel[] = [];
 	private readonly clock: ServerClock;
 	private readonly keyName: string;
 	private readonly scanName: string;
@@ -268,7 +284,7 @@ export class Session {
 		const sources = typeof config.mirror === 'string' ? [dirSource(config.mirror)] : config.mirror;
 		this.mirror = new Mirror(this.core, sources, config.verifierKey, config.fetch);
 		this.store = config.store ?? defaultStore();
-		this.transport = config.transport ?? new WebSocketTransport();
+		this.channelFactory = config.channels ?? defaultChannelFactory({ publishTimeoutMs: config.publishTimeoutMs, directPollMs: config.directPollMs });
 		this.clock = new ServerClock(config.now ?? (() => Date.now()));
 		this.keyName = `isoloir/${config.origin}/${config.registry}/key`;
 		this.scanName = `isoloir/${config.origin}/${config.registry}/scan`;
@@ -310,7 +326,9 @@ export class Session {
 				previousChoice: rec?.delta?.previous?.choice ?? null
 			},
 			tally: this.tally,
-			prover: this.proverState
+			prover: this.proverState,
+			channels: (this.ledger?.body.channels ?? []).filter((c) => c.state === 'active'),
+			linkAvailable: this.relays().length > 0
 		};
 	}
 
@@ -329,6 +347,8 @@ export class Session {
 			if (!ledger) throw new IsoloirError('no_setup', 'setup/ledger.json');
 			if (ledger.body.origin !== this.config.origin) throw new IsoloirError('no_setup', `the mirror is of ${ledger.body.origin}`);
 			this.ledger = ledger;
+			this.channels = ledger.body.channels.filter((c) => c.state === 'active').map((c) => this.channelFactory(c));
+			if (this.channels.length === 0) throw new IsoloirError('no_setup', 'the ledger has no active channel');
 			const registry = await this.mirror.setup<RegistrySetup>(`registries/${this.config.registry}.json`, 'registry');
 			if (!registry) throw new IsoloirError('no_setup', `registries/${this.config.registry}.json`);
 			this.registry = registry;
@@ -344,6 +364,7 @@ export class Session {
 			this.phaseOverride = null;
 			this.resume();
 			this.emit();
+			await this.recoverAcks();
 			await this.refresh();
 			this.start();
 		} catch (e) {
@@ -556,6 +577,8 @@ export class Session {
 	 * the key. Ends after 15 minutes.
 	 */
 	receiveLink(): LinkReceiver {
+		const relays = this.relays();
+		if (relays.length === 0) throw new IsoloirError('link_unavailable', 'the ledger has no Nostr relay');
 		this.requireNoKey();
 		const r = this.core.linkReceiver();
 		const tag = linkTag(r.public);
@@ -570,9 +593,9 @@ export class Session {
 			settle.reject(new IsoloirError('link_expired'));
 		}, LINK_TIMEOUT);
 		const since = Math.floor(this.clock.now() / 1000) - 600;
-		for (const relay of this.activeRelays()) {
+		for (const relay of relays) {
 			stops.push(
-				this.transport.subscribe(relay, { kinds: [this.core.kinds.link], '#t': [tag], since }, (e) => {
+				relay.subscribe!({ kinds: [this.core.kinds.link], '#t': [tag], since }, (e) => {
 					if (taken || pending) return;
 					try {
 						const got = this.core.linkOpen(r.secret, e.content);
@@ -613,15 +636,17 @@ export class Session {
 	 */
 	async sendKeyTo(receiverPublic: string): Promise<string> {
 		const k = this.requireKey();
+		const relays = this.ranking(k).filter((c) => c.type === 'nostr');
+		if (relays.length === 0) throw new IsoloirError('link_unavailable', 'the ledger has no Nostr relay');
 		const polls: LinkPayload['polls'] = {};
 		for (const [id, p] of Object.entries(k.polls)) polls[id] = { seq: p.seq, delta: p.delta };
 		const payload: LinkPayload = { v: 1, origin: this.config.origin, registry: this.config.registry, secret: k.secret, source: k.source, words: k.words, position: k.position, polls };
 		const sealed = this.core.linkSeal(receiverPublic, JSON.stringify(payload));
 		const event = this.signEvent(this.core.kinds.link, sealed.sealed, [['t', linkTag(receiverPublic)]]);
 		let lastErr = 'no relay';
-		for (const relay of this.ranking(k)) {
+		for (const relay of relays) {
 			try {
-				await this.transport.publish(relay, event, this.config.publishTimeoutMs ?? 10_000);
+				await relay.publish(event);
 				k.backups.linked++;
 				this.saveKey(k);
 				this.emit();
@@ -718,7 +743,7 @@ export class Session {
 		if (verdict === 'retry') await this.cast(b.choice);
 	}
 
-	/** Drops a kept ballot no relay acknowledged (to cast another choice). */
+	/** Drops a kept ballot no channel acknowledged (to cast another choice). */
 	discardKeptBallot(): void {
 		const k = this.key();
 		const rec = k ? this.pollRecord(k) : null;
@@ -894,17 +919,19 @@ export class Session {
 		};
 	}
 
-	private activeRelays(): string[] {
-		return (this.ledger?.body.relays ?? []).filter((r) => r.state === 'active').map((r) => r.url);
+	/** The active Nostr relays (live reads, device links). */
+	private relays(): IngestChannel[] {
+		return this.channels.filter((c) => c.type === 'nostr' && c.subscribe);
 	}
 
-	/** The key's order of the active relays (SPEC §11.1). */
-	private ranking(k: StoredKey): string[] {
-		return this.core.relayRanking(k.secret, this.activeRelays());
+	/** The key's order of the active channels (SPEC §11.1): relay_ranking over their URLs. */
+	private ranking(k: StoredKey): IngestChannel[] {
+		const order = this.core.relayRanking(k.secret, this.channels.map((c) => c.url));
+		return order.map((u) => this.channels.find((c) => c.url === u)!);
 	}
 
-	/** Ballots go first to the key's second relay, so registration and ballots part ways. */
-	private ballotRelays(k: StoredKey): string[] {
+	/** Registrations go to the key's first channel; ballots start at the second, so the two part ways. */
+	private ballotChannels(k: StoredKey): IngestChannel[] {
 		const r = this.ranking(k);
 		return r.length > 1 ? [...r.slice(1), r[0]] : r;
 	}
@@ -964,22 +991,25 @@ export class Session {
 	}
 
 	private start() {
-		const ms = this.config.refreshMs ?? 30_000;
+		// Without a relay to watch, the timer is the only way checkpoints come.
+		const ms = this.config.refreshMs ?? (this.relays().length > 0 ? 30_000 : 15_000);
 		if (ms > 0 && !this.timer) this.timer = setInterval(() => void this.refresh(), ms);
 		if (this.config.watchRelays !== false) this.watchCheckpoints(0);
 	}
 
-	/** Follows the ingest's checkpoint events on a relay; a relay that fails gives way to the next. */
+	/**
+	 * Follows the ingest's checkpoint events on a relay; a relay that fails
+	 * gives way to the next. Without a relay among the channels, the
+	 * mirror is read on the timer instead.
+	 */
 	private watchCheckpoints(skip: number) {
-		const relays = this.activeRelays();
-		if (relays.length === 0) return;
 		const k = this.key();
-		const order = k ? this.ballotRelays(k) : relays;
-		const relay = order[skip % order.length];
+		const relays = (k ? this.ballotChannels(k) : this.channels).filter((c) => c.type === 'nostr' && c.subscribe);
+		if (relays.length === 0) return;
+		const relay = relays[skip % relays.length];
 		this.stopWatch?.();
 		const since = Math.floor(this.clock.now() / 1000) - 600;
-		this.stopWatch = this.transport.subscribe(
-			relay,
+		this.stopWatch = relay.subscribe!(
 			{ kinds: [this.core.kinds.checkpoint], authors: [this.ingest()], since },
 			(e) => {
 				if (!this.core.verifyEvent(e)) return;
@@ -1004,14 +1034,13 @@ export class Session {
 		this.registration = { state: 'posting' };
 		this.emit();
 		try {
-			const res = await postWithAck(this.core, this.transport, this.ranking(k), r.event, this.ingest(), {
+			const res = await postWithAck(this.core, this.ranking(k), r.event, this.ingest(), {
 				ackTimeoutMs: this.ackTimeoutMs,
-				publishTimeoutMs: this.config.publishTimeoutMs,
-				onPosted: (relay) => {
+				onPosted: (channel) => {
 					const kk = this.requireKey();
 					if (kk.registration) {
 						kk.registration.state = 'sent';
-						kk.registration.relay = relay;
+						kk.registration.channel = channel;
 						kk.registration.sentAt ??= this.clock.now();
 						this.saveKey(kk);
 					}
@@ -1021,9 +1050,24 @@ export class Session {
 					this.emit();
 				}
 			});
+			await this.applyRegistrationAck(res, resend);
+		} catch (e) {
+			const err = toIsoloirError(e);
+			if (!err.code.startsWith('reg:')) {
+				const kk = this.key();
+				this.registration = { state: 'failed', reason: err.code, detail: err.detail, stale: !!kk?.registration && !this.proofFresh(kk.registration.proofDate) };
+				this.emit();
+			}
+			throw err;
+		}
+	}
+
+	/** Keeps a registration's ack and acts on its outcome. */
+	private async applyRegistrationAck(res: Acked, resend: boolean): Promise<void> {
+		{
 			const kk = this.requireKey();
 			const rec = kk.registration!;
-			rec.relay = res.relay;
+			rec.channel = res.channel;
 			rec.ack = { event: res.ackEvent, checkpoint: res.ack.checkpoint ?? null };
 			if (res.ack.outcome === 'accepted') rec.state = 'acked';
 			else if (resend && (res.ack.reason === 'uid_used' || res.ack.reason === 'id_used' || res.ack.reason === 'duplicate')) {
@@ -1039,14 +1083,31 @@ export class Session {
 			this.emit();
 			if (rec.state === 'rejected') throw new IsoloirError(`reg:${rec.reason}`);
 			await this.refresh();
-		} catch (e) {
-			const err = toIsoloirError(e);
-			if (!err.code.startsWith('reg:')) {
-				const kk = this.key();
-				this.registration = { state: 'failed', reason: err.code, detail: err.detail, stale: !!kk?.registration && !this.proofFresh(kk.registration.proofDate) };
-				this.emit();
+		}
+	}
+
+	/**
+	 * Messages a previous visit posted and never saw acked: their acks are
+	 * asked for on every channel (a relay's stored events, the direct
+	 * endpoint's GET), so a closed tab does not leave them waiting.
+	 */
+	private async recoverAcks(): Promise<void> {
+		const k = this.key();
+		if (!k) return;
+		const wait = Math.min(this.ackTimeoutMs, 5000);
+		try {
+			const r = k.registration;
+			if (r && r.state === 'sent' && k.position < 0) {
+				const res = await findAck(this.core, this.ranking(k), r.event, this.ingest(), wait);
+				if (res) await this.applyRegistrationAck(res, true).catch(() => undefined);
 			}
-			throw err;
+			const b = this.pollRecord(k)?.ballot;
+			if (b && b.state === 'sent') {
+				const res = await findAck(this.core, this.ballotChannels(k), b.event, this.ingest(), wait);
+				if (res && (res.ack.outcome === 'accepted' || res.ack.reason === 'duplicate')) this.applyBallotAck(res);
+			}
+		} catch (e) {
+			this.log('warn', 'recovering acks', { detail: messageOf(e) });
 		}
 	}
 
@@ -1114,15 +1175,14 @@ export class Session {
 		this.emit();
 		let res;
 		try {
-			res = await postWithAck(this.core, this.transport, this.ballotRelays(k), b.event, this.ingest(), {
+			res = await postWithAck(this.core, this.ballotChannels(k), b.event, this.ingest(), {
 				ackTimeoutMs: this.ackTimeoutMs,
-				publishTimeoutMs: this.config.publishTimeoutMs,
-				onPosted: (relay) => {
+				onPosted: (channel) => {
 					const kk = this.requireKey();
 					const bb = this.pollRecord(kk).ballot;
 					if (bb) {
 						bb.state = 'sent';
-						bb.relay = relay;
+						bb.channel = channel;
 						bb.sentAt ??= this.clock.now();
 						this.saveKey(kk);
 					}
@@ -1145,14 +1205,7 @@ export class Session {
 		const bb = r.ballot!;
 		const reason = res.ack.reason;
 		if (res.ack.outcome === 'accepted' || ((resend || wasSent) && reason === 'duplicate')) {
-			bb.state = 'acked';
-			bb.relay = res.relay;
-			bb.ack = { event: res.ackEvent, checkpoint: res.ack.checkpoint ?? null };
-			if (bb.ballotSeq !== undefined) r.seq = Math.max(r.seq ?? -1, bb.ballotSeq);
-			if (bb.i !== undefined) r.delta = { next: bb.i + 1, previous: { choice: bb.choice, leaf: bb.leaf } };
-			this.saveKey(kk);
-			this.ballot = this.ballotView(bb);
-			this.emit();
+			this.applyBallotAck(res);
 			void this.refresh();
 			return 'done';
 		}
@@ -1171,6 +1224,22 @@ export class Session {
 		this.ballot = this.ballotView(bb);
 		this.emit();
 		throw new IsoloirError(bb.reason);
+	}
+
+	/** Keeps an accepted ballot's ack and moves the key's chain on. */
+	private applyBallotAck(res: Acked) {
+		const kk = this.requireKey();
+		const r = this.pollRecord(kk);
+		const bb = r.ballot;
+		if (!bb) return;
+		bb.state = 'acked';
+		bb.channel = res.channel;
+		bb.ack = { event: res.ackEvent, checkpoint: res.ack.checkpoint ?? null };
+		if (bb.ballotSeq !== undefined) r.seq = Math.max(r.seq ?? -1, bb.ballotSeq);
+		if (bb.i !== undefined) r.delta = { next: bb.i + 1, previous: { choice: bb.choice, leaf: bb.leaf } };
+		this.saveKey(kk);
+		this.ballot = this.ballotView(bb);
+		this.emit();
 	}
 
 	/** The key's place in the registry tree at a checkpoint, rebuilt from the mirror's leaves. */
@@ -1262,20 +1331,23 @@ export class Session {
 	/**
 	 * The ack named a checkpoint whose entries lack the body (SPEC §11.3):
 	 * the complaint, the signed ack and the body, goes to every active
-	 * relay, and the message itself is posted there again.
+	 * relay, where anyone can read it, and the message itself is posted
+	 * there again; on a ledger without relays, to the direct endpoints. It
+	 * stays with the device too (the record's complaints and ack).
 	 */
 	private async complain(what: 'registration' | 'ballot', k: StoredKey, r: PostRecord) {
 		if (!r.ack) return;
 		const content = this.core.complaintBody(r.ack.event, r.event.content);
 		const event = this.signEvent(this.core.kinds.complaint, content);
 		const ids: string[] = [];
-		for (const relay of this.activeRelays()) {
+		const relays = this.relays();
+		for (const ch of relays.length > 0 ? relays : this.channels) {
 			try {
-				await this.transport.publish(relay, event, this.config.publishTimeoutMs ?? 10_000);
-				ids.push(`${relay} ${event.id}`);
-				await this.transport.publish(relay, r.event, this.config.publishTimeoutMs ?? 10_000).catch(() => undefined);
+				await ch.publish(event);
+				ids.push(`${ch.url} ${event.id}`);
+				if (ch.type === 'nostr') await ch.publish(r.event).catch(() => undefined);
 			} catch (e) {
-				this.log('warn', 'complaint not posted', { relay, detail: messageOf(e) });
+				this.log('warn', 'complaint not posted', { channel: ch.url, detail: messageOf(e) });
 			}
 		}
 		r.state = 'missing';
@@ -1283,7 +1355,7 @@ export class Session {
 		this.saveKey(k);
 		if (what === 'ballot') this.ballot = this.ballotView(r as BallotRecord);
 		else this.registration = { state: 'missing', checkpoint: r.ack.checkpoint };
-		this.log('warn', 'acked and missing from its checkpoint: complaint posted', { what, checkpoint: r.ack.checkpoint, relays: ids.length });
+		this.log('warn', 'acked and missing from its checkpoint: complaint posted', { what, checkpoint: r.ack.checkpoint, channels: ids.length });
 		this.events.emit('complaint', { what, checkpoint: r.ack.checkpoint, events: [event.id] });
 		this.emit();
 	}

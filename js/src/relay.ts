@@ -1,14 +1,7 @@
-// The relays (SPEC §11): Nostr over plain WebSockets, no library. The
-// session depends on RelayTransport only; tests give an in-memory one.
-//
-// postWithAck is the one way a message leaves the device: the signed
-// event is posted to a relay, the ingest's signed ack is awaited there
-// for 60 s, then the next relay of the key's ranking gets the same event
-// (same id: the ingest judges a message once).
+// Nostr relays (SPEC §11.1) over plain WebSockets, no library. The nostr
+// channel (channel.ts) wraps a RelayTransport; tests give an in-memory one.
 
-import { IsoloirError } from './errors.js';
-import type { Ack, NostrEvent } from './types.js';
-import type { Core } from './wasm.js';
+import type { NostrEvent } from './types.js';
 
 export interface Filter {
 	ids?: string[];
@@ -157,71 +150,4 @@ export class WebSocketTransport implements RelayTransport {
 			}
 		};
 	}
-}
-
-/** Where a post stands, for the page. */
-export interface PostProgress {
-	relay: string;
-	n: number;
-	of: number;
-	stage: 'posting' | 'waiting';
-}
-
-export interface PostOptions {
-	ackTimeoutMs: number;
-	publishTimeoutMs?: number;
-	onPosted?: (relay: string) => void;
-	onProgress?: (p: PostProgress) => void;
-}
-
-export interface Acked {
-	relay: string;
-	ack: Ack;
-	ackEvent: NostrEvent;
-}
-
-/**
- * Posts a signed event to the relays in turn and waits for the ingest's
- * ack on each (SPEC §11.1, §11.2): an ack counts only when the ingest's
- * key signed it, it names the event and the body's hash. Throws no_relay
- * when no relay took the event, no_ack when some did and none answered.
- */
-export async function postWithAck(core: Core, transport: RelayTransport, relays: string[], event: NostrEvent, ingest: string, opts: PostOptions): Promise<Acked> {
-	const hash = core.bodyHash(event.content);
-	let posted = 0;
-	let lastErr = 'no relay';
-	let n = 0;
-	for (const relay of relays) {
-		n++;
-		opts.onProgress?.({ relay, n, of: relays.length, stage: 'posting' });
-		let resolveAck: (a: Acked | null) => void = () => {};
-		const got = new Promise<Acked | null>((r) => (resolveAck = r));
-		// Listen first: an ack may come before the relay's OK.
-		const stop = transport.subscribe(relay, { kinds: [core.kinds.ack], authors: [ingest], '#e': [event.id] }, (e) => {
-			try {
-				const ack = core.readAck(e, ingest);
-				if (ack.of !== event.id || ack.hash !== hash) return;
-				resolveAck({ relay, ack, ackEvent: e });
-			} catch {
-				// not an ack of the ingest's: a relay may serve anything
-			}
-		});
-		try {
-			await transport.publish(relay, event, opts.publishTimeoutMs ?? 10_000);
-		} catch (e) {
-			stop();
-			lastErr = e instanceof Error ? e.message : String(e);
-			continue;
-		}
-		posted++;
-		opts.onPosted?.(relay);
-		opts.onProgress?.({ relay, n, of: relays.length, stage: 'waiting' });
-		const timer = setTimeout(() => resolveAck(null), opts.ackTimeoutMs);
-		const acked = await got;
-		clearTimeout(timer);
-		stop();
-		if (acked) return acked;
-		lastErr = `${relay}: no acknowledgement`;
-	}
-	throw new IsoloirError(posted > 0 ? 'no_ack' : 'no_relay', lastErr);
 }

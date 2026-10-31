@@ -20,7 +20,7 @@ function session(w: World, opts: Partial<SessionConfig> = {}) {
 		poll: 7,
 		mirror: MIRROR,
 		fetch: w.mirror.fetch,
-		transport: w.relays,
+		channels: w.channels,
 		store: new MemoryStore(),
 		prover: new StubProver(),
 		ackTimeoutMs: 100,
@@ -162,7 +162,7 @@ describe('ballots', () => {
 		const w = world();
 		const { s } = await voter(w);
 		const posted: string[] = [];
-		s.subscribe((st) => st.ballot.progress && posted.push(`${st.ballot.progress.stage}:${st.ballot.progress.relay}`));
+		s.subscribe((st) => st.ballot.progress && posted.push(`${st.ballot.progress.stage}:${st.ballot.progress.channel}`));
 		// Drop the acks on the relay the ballot goes to first.
 		const first = firstBallotRelay(s);
 		w.relays.relay(first).dropAcks = true;
