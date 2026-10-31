@@ -227,4 +227,19 @@ async fn the_ingest_on_postgres() {
     let agg: Vec<_> = body.aggregate.as_ref().unwrap().iter().map(|[a, b]| (grumpkin::from_hex(a).unwrap(), grumpkin::from_hex(b).unwrap())).collect();
     isoloir_proto::tally::verify_shares(&poll.encryption, &body, latest["body"].as_str().unwrap().as_bytes(), variant.values(), variant.chunks(), &agg).unwrap();
     let _ = Projective::default();
+
+    // Withholding: what the relays hold against the log.
+    let mut events: Vec<Event> = mem.posted.lock().unwrap().iter().map(|(_, e)| e.clone()).collect();
+    events.extend(reg_events.iter().cloned());
+    events.push(dup_ev.clone());
+    let ingest_pk = hex::encode(isoloir_proto::sig::xonly(&[12u8; 32]));
+    assert!(isoloir_proto::audit::check_relays(&state, &events, &ingest_pk, 0).is_empty());
+    // An accepted message the ingest never logged.
+    let lost = event(kinds::BALLOT, &tag, b"{\"v\":1}", now - 200);
+    let ack = Ack { v: 1, of: lost.id.clone(), hash: isoloir_core::encoding::body_hash(lost.content.as_bytes()), outcome: Outcome::Accepted, reason: None, checkpoint: Some(3) };
+    let ack_ev = Event::sign(&[12u8; 32], now - 200, kinds::ACK, vec![vec!["t".into(), tag.clone()], vec!["e".into(), lost.id.clone()]], canonical::to_string(&ack).unwrap());
+    events.push(lost);
+    events.push(ack_ev);
+    let problems = isoloir_proto::audit::check_relays(&state, &events, &ingest_pk, 0);
+    assert_eq!(problems.len(), 2, "{problems:?}");
 }

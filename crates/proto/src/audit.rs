@@ -185,3 +185,38 @@ impl<'a> Auditor<'a> {
         (self.state, self.report)
     }
 }
+
+/// Withholding (SPEC §11.3, §16): with what the relays hold for this
+/// ledger, every message was judged (logged, or refused in the log), and
+/// every message acknowledged as accepted is logged by the checkpoint its
+/// acknowledgement named. Messages younger than `grace` seconds before
+/// the last checkpoint may still be pending.
+pub fn check_relays(state: &State, events: &[crate::sig::Event], ingest: &str, grace: u64) -> Vec<String> {
+    use crate::body::{decode_ack, Outcome};
+    let mut problems = vec![];
+    let Some(last) = state.last_checkpoint() else { return problems };
+    let judged = |e: &crate::sig::Event| state.hashes.contains_key(&encoding::body_hash(e.content.as_bytes())) || state.rejected.contains(&e.id);
+    for e in events {
+        if !matches!(e.kind, 7100 | 7101 | 7105) || !e.verify() || e.created_at + grace > last.time {
+            continue;
+        }
+        if !judged(e) {
+            problems.push(format!("event {} (kind {}) is on a relay and was never judged", e.id, e.kind));
+        }
+    }
+    for a in events.iter().filter(|e| e.kind == 7102 && e.pubkey == ingest && e.verify()) {
+        let Ok(ack) = decode_ack(a.content.as_bytes()) else { continue };
+        if ack.outcome != Outcome::Accepted {
+            continue;
+        }
+        let Some(c) = ack.checkpoint else { continue };
+        if c > last.index {
+            continue;
+        }
+        match state.hashes.get(&ack.hash) {
+            Some(seq) if state.checkpoint_of(*seq).is_some_and(|cp| cp.index <= c) => {}
+            _ => problems.push(format!("the ingest acknowledged {} for checkpoint {c} and did not log it there", ack.of)),
+        }
+    }
+    problems
+}

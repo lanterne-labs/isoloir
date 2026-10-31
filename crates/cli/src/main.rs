@@ -137,6 +137,9 @@ enum Cmd {
         node: PathBuf,
         #[arg(long, env = "ISOLOIR_ETH_RPC")]
         rpc_url: Option<String>,
+        /// Also read the ledger's relays: withholding.
+        #[arg(long)]
+        relays: bool,
     },
 }
 
@@ -371,7 +374,7 @@ async fn main() -> Result<()> {
             println!("relay on ws://{addr}");
             task.await?;
         }
-        Cmd::Audit { mirror, log_key, circuits, zkverifier, node, rpc_url } => {
+        Cmd::Audit { mirror, log_key, circuits, zkverifier, node, rpc_url, relays } => {
             let bb = Tools::find_bb()?;
             let vk_dir = circuits.unwrap_or_else(|| PathBuf::from(&mirror).join("circuits"));
             let proofs = BbProofs::new(bb, vk_dir);
@@ -382,7 +385,23 @@ async fn main() -> Result<()> {
             for (n, es) in MirrorSource::parse(&mirror).from(1).await? {
                 a.checkpoint(&n, &es).map_err(|e| anyhow::anyhow!(e))?;
             }
-            let (_, r) = a.finish();
+            let (state, mut r) = a.finish();
+            if relays {
+                let l = state.ledger().context("no ledger")?.clone();
+                let urls: Vec<String> = l.relays.iter().map(|r| r.url.clone()).collect();
+                let pool = Pool::connect(urls.clone());
+                let tag = format!("{}/{}", isoloir_proto::PROTOCOL, l.origin);
+                let mut events = vec![];
+                for u in &urls {
+                    let f = isoloir_relay::Filter { kinds: vec![7100, 7101, 7102, 7105], t: Some(tag.clone()), ..Default::default() };
+                    match pool.fetch(u, f, Duration::from_secs(30)).await {
+                        Ok(es) => events.extend(es),
+                        Err(e) => r.warnings.push(format!("relay {u}: {e}")),
+                    }
+                }
+                println!("{} events read from {} relays", events.len(), urls.len());
+                r.problems.extend(isoloir_proto::audit::check_relays(&state, &events, &l.ingest, 2 * l.checkpoint_period + 60));
+            }
             println!("{} checkpoints, {} entries: {} registrations, {} ballots, {} refusals, {} tallies", r.checkpoints, r.entries, r.registrations, r.ballots, r.rejects, r.tallies);
             for w in &r.warnings {
                 println!("warning: {w}");
