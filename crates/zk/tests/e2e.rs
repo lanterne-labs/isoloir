@@ -1,6 +1,6 @@
 //! End to end with real proofs (nargo and bb): a ledger, a registry, two
 //! voters, a yes/no poll, ballots and a re-vote, a tally decrypted by a
-//! single decrypter, each step through the judge and the state machine
+//! single authority, each step through the judge and the state machine
 //! that the ingest and the auditor share. Needs nargo and bb (Tools::find).
 
 use isoloir_core::grumpkin::{self, Projective, Scalar};
@@ -177,7 +177,7 @@ fn a_yes_no_poll_end_to_end() {
         registry: 1,
         title: "Oui ou non ?".into(),
         kind: KindSpec::Choice { options: vec!["Oui".into(), "Non".into()], blank: true },
-        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) } },
+        encryption: Encryption::Elgamal { pk, authority: Authority::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) } },
         publish: Publish::Open { k_real: 1, min_gap: 0, coin: false },
         revote: Revote::Linked,
         opens: l.now,
@@ -295,7 +295,7 @@ fn delta_re_votes_end_to_end() {
         registry: 1,
         title: "delta".into(),
         kind: KindSpec::Choice { options: vec!["Oui".into(), "Non".into()], blank: false },
-        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) } },
+        encryption: Encryption::Elgamal { pk, authority: Authority::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) } },
         publish: Publish::Closed,
         revote: Revote::Delta,
         opens: l.now,
@@ -510,7 +510,7 @@ fn a_ranked_poll_with_margins() {
         registry: 1,
         title: "ranked".into(),
         kind: kind.clone(),
-        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) } },
+        encryption: Encryption::Elgamal { pk, authority: Authority::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) } },
         publish: Publish::Closed,
         revote: Revote::Linked,
         opens: l.now,
@@ -603,7 +603,7 @@ fn review_rules() {
         registry: 1,
         title: "rules".into(),
         kind: KindSpec::Choice { options: vec!["Oui".into(), "Non".into()], blank: false },
-        encryption: Encryption::Elgamal { pk, decrypter: Decrypter::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) } },
+        encryption: Encryption::Elgamal { pk, authority: Authority::Single { sign_key: isoloir_proto::sig::ed25519_public(&seed) } },
         publish: Publish::Open { k_real: 5, min_gap: 60, coin: true },
         revote: Revote::Linked,
         opens: l.now,

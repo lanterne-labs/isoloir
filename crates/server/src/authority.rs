@@ -1,4 +1,4 @@
-//! The trustee (SPEC §10): replays the log through the auditor, then
+//! The authority (SPEC §10): replays the log through the auditor, then
 //! publishes the tallies that are due for the polls it can decrypt: those
 //! encrypted under its key, and tlock polls once their round's beacon is
 //! out. It decrypts nothing from a log it could not verify.
@@ -17,21 +17,21 @@ use isoloir_proto::tally;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Where the trustee's keys are.
+/// Where the authority's keys are.
 pub struct Keys {
     pub pk: String,
     pub sk: Scalar,
     pub sign_seed: [u8; 32],
 }
 
-/// Where tallies go: the relays, or the ingest's submissions (a trustee
+/// Where tallies go: the relays, or the ingest's submissions (an authority
 /// beside the ingest).
 pub enum Output {
     Relays { transport: Arc<dyn Transport>, nostr_sk: [u8; 32] },
     Store(crate::store::Store),
 }
 
-pub struct Trustee {
+pub struct Service {
     source: Box<dyn LogSource>,
     auditor: Auditor<'static>,
     keys: Option<Keys>,
@@ -42,7 +42,7 @@ pub struct Trustee {
     rng: rand::rngs::StdRng,
 }
 
-impl Trustee {
+impl Service {
     /// `drand`: the base URL of a drand HTTP API (tlock polls), e.g.
     /// https://api.drand.sh.
     pub fn new(
@@ -53,14 +53,14 @@ impl Trustee {
         keys: Option<Keys>,
         drand: Option<String>,
         output: Output,
-    ) -> anyhow::Result<Trustee> {
-        // The trustee lives as long as the process: its verifiers too.
+    ) -> anyhow::Result<Service> {
+        // The authority lives as long as the process: its verifiers too.
         let proofs: &'static dyn Proofs = Box::leak(proofs);
         let passports: &'static dyn Passports = Box::leak(passports);
         let tlock: &'static DrandTlock = Box::leak(Box::new(DrandTlock));
         let auditor = Auditor::new(log_key, Checkers { proofs, passports, tlock: Some(tlock) }).map_err(|e| anyhow::anyhow!(e))?;
         use rand::SeedableRng;
-        Ok(Trustee { source, auditor, keys, drand, output, published: HashSet::new(), tag: None, rng: rand::rngs::StdRng::from_entropy() })
+        Ok(Service { source, auditor, keys, drand, output, published: HashSet::new(), tag: None, rng: rand::rngs::StdRng::from_entropy() })
     }
 
     /// One round: new checkpoints, then the tallies due. Returns how many
@@ -135,7 +135,7 @@ impl Trustee {
     }
 }
 
-/// The log does not verify: the trustee must not go on.
+/// The log does not verify: the authority must not go on.
 #[derive(Debug)]
 pub struct LogFault(pub String);
 

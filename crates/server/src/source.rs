@@ -1,4 +1,4 @@
-//! Where the trustee and the auditor read the log: the ingest's database,
+//! Where the authority and the auditor read the log: the ingest's database,
 //! or a mirror (a directory or a base URL), checkpoint by checkpoint.
 
 use crate::mirror;

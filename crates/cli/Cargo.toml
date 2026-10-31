@@ -1,6 +1,6 @@
 [package]
 name = "isoloir"
-description = "The isoloir command: keys, circuits, the ledger's genesis, setups, the ingest, the trustee, the audit"
+description = "The isoloir command: keys, circuits, the ledger's genesis, setups, the ingest, the authority, the audit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -14,7 +14,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = []
 # Helpers for tests and fakes (an ingest that signs notes and acks, a
-# decrypter that builds tallies). Never in a production bundle.
+# authority that builds tallies). Never in a production bundle.
 dev = []
 
 [dependencies]

@@ -134,8 +134,8 @@ describe('the mirror', () => {
 		// Another poll key.
 		const w2 = world();
 		const pf = JSON.parse(w2.mirror.files.get('polls/7.json')!) as { setups: { body: string }[] };
-		const other = (JSON.parse(wasm.dev_decrypter('55'.repeat(32))) as { pk: string }).pk;
-		w2.mirror.put('polls/7.json', { setups: [{ ...pf.setups[0], body: pf.setups[0].body.replace(w2.ingest.decrypter.pk, other) }] });
+		const other = (JSON.parse(wasm.dev_authority('55'.repeat(32))) as { pk: string }).pk;
+		w2.mirror.put('polls/7.json', { setups: [{ ...pf.setups[0], body: pf.setups[0].body.replace(w2.ingest.authority.pk, other) }] });
 		await expect(session(w2).init()).rejects.toMatchObject({ code: 'unproven' });
 		// No proof at all.
 		const w3 = world();

@@ -1,5 +1,5 @@
 //! When a tally is due (SPEC §10.1): a function of the log alone, so that
-//! any decrypter and any auditor agree without talking.
+//! any authority and any auditor agree without talking.
 
 use crate::body::Publish;
 use crate::log::Hash;
@@ -56,7 +56,7 @@ pub fn due_at(state: &State, poll: u32, cp_index: u64) -> Option<Due> {
     Some(Due { poll, checkpoint: cp_index, upto, is_final: false })
 }
 
-/// The newest tally due for a poll: what a decrypter publishes next.
+/// The newest tally due for a poll: what an authority publishes next.
 pub fn next_due(state: &State, poll: u32) -> Option<Due> {
     let p = state.polls.get(&poll)?;
     let after = p.tallies.iter().filter_map(|(_, t)| t.checkpoint).max().unwrap_or(0);

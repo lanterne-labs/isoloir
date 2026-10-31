@@ -1,5 +1,5 @@
 //! Helpers for tests and fakes only (feature `dev`): a checkpoint signer
-//! and a single decrypter, so that a fake ingest in JavaScript writes the
+//! and a single authority, so that a fake ingest in JavaScript writes the
 //! same notes and tallies the real one does.
 
 use crate::api::{self, err, fr, R};
@@ -8,7 +8,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use isoloir_core::grumpkin::{self, Dleq};
 use isoloir_core::{canonical, pack, Fr};
-use isoloir_decrypt::keys::DecrypterKeys;
+use isoloir_decrypt::keys::AuthorityKeys;
 use isoloir_proto::body::{self, EntryKind, Share, Tally, V1};
 use isoloir_proto::note::{Checkpoint, Signer};
 use isoloir_proto::{sig, statement, tally};
@@ -66,9 +66,9 @@ pub fn sign_checkpoint(seed: &str, checkpoint_json: &str) -> R<String> {
     Ok(Signer::new(&c.origin, &seed32(seed)?).sign(&cp.text()))
 }
 
-/// A single decrypter's keys from a seed.
-pub fn decrypter(seed: &str) -> R<String> {
-    let k = DecrypterKeys::generate(&mut ChaCha20Rng::from_seed(seed32(seed)?));
+/// A single authority's keys from a seed.
+pub fn authority(seed: &str) -> R<String> {
+    let k = AuthorityKeys::generate(&mut ChaCha20Rng::from_seed(seed32(seed)?));
     serde_json::to_string(&k).map_err(err)
 }
 
@@ -91,7 +91,7 @@ struct TallyReq {
     seed: String,
 }
 
-/// The tally a single decrypter publishes over the ballots given (the
+/// The tally a single authority publishes over the ballots given (the
 /// counted ones), as `isoloir_proto::tally::build_elgamal` builds it.
 pub fn build_tally(req_json: &str) -> R<String> {
     let r: TallyReq = serde_json::from_str(req_json).map_err(err)?;
@@ -105,7 +105,7 @@ pub fn build_tally(req_json: &str) -> R<String> {
     }
     let n = cts.len() as u64;
     let mut values = vec![0i64; v.values()];
-    let mut share = Share { trustee: 1, d: vec![], proofs: vec![] };
+    let mut share = Share { authority: 1, d: vec![], proofs: vec![] };
     let mut agg = vec![];
     if n > 0 {
         let points: Vec<_> = (0..v.chunks())

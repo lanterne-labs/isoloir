@@ -38,7 +38,7 @@ CREATE TABLE isoloir_seen (
     posted BOOLEAN NOT NULL DEFAULT false
 );
 
--- Entries from the operator (setups) and from local trustees.
+-- Entries from the operator (setups) and from local authorities.
 CREATE TABLE isoloir_submissions (
     id BIGSERIAL PRIMARY KEY,
     kind TEXT NOT NULL,

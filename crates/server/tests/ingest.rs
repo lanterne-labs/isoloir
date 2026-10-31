@@ -4,7 +4,7 @@
 
 use isoloir_core::grumpkin::{self, Projective};
 use isoloir_core::{canonical, field, Fr};
-use isoloir_decrypt::keys::DecrypterKeys;
+use isoloir_decrypt::keys::AuthorityKeys;
 use isoloir_decrypt::tlock::DrandTlock;
 use isoloir_proto::audit::Auditor;
 use isoloir_proto::body::*;
@@ -18,7 +18,7 @@ use isoloir_server::ingest::{kinds, Config, Incoming, Ingest, Transport};
 use isoloir_server::mirror::Mirror;
 use isoloir_server::source::{LogSource, MirrorSource};
 use isoloir_server::store::Store;
-use isoloir_server::trustee::{Keys, Output, Trustee};
+use isoloir_server::authority::{Keys, Output, Service};
 use isoloir_zk::{BbProofs, Circuits, Prover, Tools};
 use rand::SeedableRng;
 use serde_json::json;
@@ -147,8 +147,8 @@ async fn the_ingest_on_postgres() {
     assert_eq!(ingest.tick(now).await.unwrap(), Some(3));
     assert_eq!(ingest.state.registries[&1].tree.len(), 2);
 
-    // The poll, with a single decrypter.
-    let keys = DecrypterKeys::generate(&mut rng);
+    // The poll, with a single authority.
+    let keys = AuthorityKeys::generate(&mut rng);
     let poll = PollSetup {
         v: 1,
         id: 5,
@@ -156,7 +156,7 @@ async fn the_ingest_on_postgres() {
         registry: 1,
         title: "Oui ou non ?".into(),
         kind: KindSpec::Choice { options: vec!["Oui".into(), "Non".into()], blank: true },
-        encryption: Encryption::Elgamal { pk: keys.pk.clone(), decrypter: Decrypter::Single { sign_key: keys.sign_key.clone() } },
+        encryption: Encryption::Elgamal { pk: keys.pk.clone(), authority: Authority::Single { sign_key: keys.sign_key.clone() } },
         publish: Publish::Open { k_real: 1, min_gap: 0, coin: false },
         revote: Revote::Linked,
         opens: now,
@@ -185,9 +185,9 @@ async fn the_ingest_on_postgres() {
     now += 30;
     let cp = ingest.tick(now).await.unwrap().unwrap();
 
-    // The trustee: reads the database, verifies, decrypts, submits.
+    // The authority: reads the database, verifies, decrypts, submits.
     let (sk, seed) = keys.secrets().unwrap();
-    let mut trustee = Trustee::new(
+    let mut authority = Service::new(
         Box::new(store.clone()),
         Some(&signer.verifier()),
         Box::new(BbProofs::new(tools.bb.clone(), vk_dir.clone())),
@@ -197,8 +197,8 @@ async fn the_ingest_on_postgres() {
         Output::Store(store.clone()),
     )
     .unwrap();
-    assert_eq!(trustee.step(now).await.unwrap(), 1);
-    assert_eq!(trustee.step(now).await.unwrap(), 0, "published once");
+    assert_eq!(authority.step(now).await.unwrap(), 1);
+    assert_eq!(authority.step(now).await.unwrap(), 0, "published once");
     now += 30;
     ingest.tick(now).await.unwrap().unwrap();
     let (_, t) = ingest.state.polls[&5].tallies.last().unwrap();

@@ -22,7 +22,7 @@ registry. A poll chooses:
 | | Options |
 |---|---|
 | Ballot | single choice (yes/no, one of n) or a ranking of up to 3 (with or without pairwise margins), a blank slot or not |
-| Encryption | ElGamal under a decrypter's key (one key may serve many polls), or drand time-lock |
+| Encryption | ElGamal under an authority's key (one key may serve many polls), or drand time-lock |
 | Results | open (published while the poll runs, every `k_real` changed ballots) or closed (one result after the close) |
 | Re-votes | none, linked (one pseudonym per voter), delta (unlinkable corrections) |
 
@@ -36,10 +36,10 @@ refuses the others.
 | `isoloir-core` | Poseidon2 (Barretenberg's), trees, Grumpkin ElGamal, Chaum–Pedersen, packing, canonical JSON |
 | `isoloir-proto` | bodies and versions, kinds, the matrix, the log and signed checkpoints, the state machine, the judge, the policy, tallies, the audit, the voter's ballot drafting |
 | `isoloir-zk` | the circuits through nargo and bb: build, prove, verify |
-| `isoloir-decrypt` | drand time-lock (seal, open, beacon checks), the decrypter's keys |
+| `isoloir-decrypt` | drand time-lock (seal, open, beacon checks), the authority's keys |
 | `isoloir-relay` | a Nostr relay pool, and a local relay for trials |
 | `isoloir-stamps` | OpenTimestamps: submit, upgrade, verify against Bitcoin |
-| `isoloir-server` | Postgres storage, the ingest, the trustee, the mirror, the passport verifier |
+| `isoloir-server` | Postgres storage, the ingest, the authority, the mirror, the passport verifier |
 | `isoloir` | the command |
 | `isoloir-wasm`, `js/` | the browser: the same Rust through WebAssembly, and a framework-free session |
 
@@ -56,7 +56,7 @@ cargo build --release -p isoloir && alias isoloir=target/release/isoloir
 isoloir relay &                                   # ws://127.0.0.1:7777, in memory
 isoloir keygen log --origin trial.local/isoloir   # ISOLOIR_LOG_SEED, log_key
 isoloir keygen nostr                              # ISOLOIR_NOSTR_KEY, ingest
-isoloir keygen decrypter --out dec.json           # pk, sign_key
+isoloir keygen authority --out dec.json           # pk, sign_key
 isoloir circuits choice4_single_linked_d20 --mirror mirror   # prints the vk hash
 export DATABASE_URL=postgresql://localhost/isoloir_trial ISOLOIR_LOG_SEED=… ISOLOIR_NOSTR_KEY=…
 isoloir check registry registry.json && isoloir check poll poll.json --registry registry.json
@@ -64,7 +64,7 @@ isoloir genesis ledger.json && isoloir ingest --mirror-dir mirror --dev --no-sta
 isoloir submit registry registry.json && isoloir submit poll poll.json
 S=$(isoloir voter secret); isoloir voter register --mirror mirror --registry 1 --secret $S --uid alice
 isoloir voter vote --mirror mirror --poll 5 --secret $S --choice 0
-isoloir trustee --mirror mirror --log-key "…" --keys dec.json --db $DATABASE_URL --once
+isoloir authority --mirror mirror --log-key "…" --keys dec.json --db $DATABASE_URL --once
 isoloir audit --mirror mirror --log-key "…" --relays --skip-passports
 ```
 

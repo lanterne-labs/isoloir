@@ -5,7 +5,7 @@ A variant is a kind and its slot count (choiceM, rankedM, rankedmM), a
 decryption mode, a re-vote mode (linked, which also serves "none", or
 delta), the registry depth and, for delta, the ballot tree depth. The
 decryption mode decides how ballots are packed (SPEC §7.1): `single`
-(ElGamal, one decrypter, who may open each ballot: seven values per
+(ElGamal, one authority, who may open each ballot: seven values per
 chunk), `threshold` (ElGamal decrypted by aggregate only: two values per
 chunk), `tlock` (a commitment to the values). Each variant is a small
 Noir binary in build/<name>/ calling the library in lib/. The name says
