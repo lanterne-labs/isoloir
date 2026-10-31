@@ -100,24 +100,31 @@ multiplication in G1, likely millions of constraints: not for a phone
 today). So the tlock mode does not encrypt the ElGamal chunks to drand.
 It works like this:
 
-- In the circuit, the ballot is proven valid as today, and the circuit
-  outputs a binding commitment `c = H(T_CT, plaintext, salt)` as a public
-  input instead of ElGamal ciphertexts.
-- Outside the circuit, the browser time-locks `(plaintext, salt)` to the
-  poll's close round with `tlock` (the drand team's Rust crate, via wasm)
-  and posts the proof, `c` and the time-locked blob together.
-- The ingest checks the proof and logs the three; it cannot read the
-  ballot. At the close round, anyone decrypts every blob, checks it opens
-  to the committed `c`, drops the ballots that do not (their voter's own
-  fault, nobody else's) and counts the plaintexts in clear.
+- Outside the circuit, the browser time-locks the plaintext to the poll's
+  close round with `tlock` (the drand team's Rust crate, via wasm).
+- In the circuit, the ballot proves membership and its pseudonym as
+  today, and binds the blob: `H(blob)` is a public input, as
+  `custom_data` binds the passport proof. The circuit does not see the
+  plaintext and does not check the ballot's rules: when plaintexts are
+  public at the close, validity is checked in the clear at opening, and
+  an invalid ballot is discarded then.
+- The ingest checks the proof and the hash and logs the ballot; it cannot
+  read it. At the close round, anyone decrypts every blob, drops the
+  invalid ballots (their voter's own doing, nobody else's) and counts the
+  plaintexts in clear. A relay that swaps a blob in transit can only
+  cancel that ballot (the hash no longer matches), which the receipt
+  check already catches, as for a dropped message.
 
 What this gives: nobody, including us, can read any ballot before the
 close, and nobody is needed to finish the tally. What it changes: after
 the close, the plaintext of every ballot is public **per pseudonym**, and
 so is a pseudonym's voting history (every re-vote opens). The pseudonym is
 still unlinkable to the person. For a yes/no question this is usually
-acceptable; for a ranked ballot it exposes the ranking pattern, which the
-v2 design chose to hide. The setup says which it is, and the library
+acceptable: every "yes" looks like every other. For a ranked ballot it
+exposes the ranking pattern, 720 of them for three among ten, more with
+the history: a buyer or a coercer names a pattern and checks at the close
+that it was cast (the "Italian attack"), which the v2 design chose to
+make impossible by publishing aggregates only. The setup says which it is, and the library
 refuses `tlock` for a ballot type whose `PollKind` declares that
 individual plaintexts must stay hidden. In-circuit tlock stays a research
 item (a spike in M4 measures the constraint count with bb's bignum
@@ -229,7 +236,8 @@ which stays on the Go implementation; M0 is the only step that touches
 - v3 is not byte-compatible with v2; the presidential pre-poll migrates at
   a new event, or never.
 - One committee key, per-chunk randomness, key as a public input.
-- tlock = commitment in circuit + time-locked plaintext outside; per
+- tlock = time-locked plaintext outside the circuit, bound by its hash as
+  a public input; validity checked in the clear at the close; per
   pseudonym plaintexts public at the close; refused for kinds that
   declare hidden plaintexts.
 - Policy deterministic over the log; no private coin.
