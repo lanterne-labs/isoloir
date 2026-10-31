@@ -304,10 +304,9 @@ which stays on the Go implementation; M0 is the only step that touches
 - The ZKPassport verifier stays a Node sidecar.
 - Threshold designed in, built later.
 
-## 9. Open questions for the owner
+## 9. Decisions of the owner (2026-10-31)
 
-1. The repo's name and where it lives (private under `tartuffeme`?).
-2. Licence of the library (the Go code is private; this one is meant to be
-   reused, so a licence is needed from the first commit).
-3. For closed ranked polls: accept per-pseudonym plaintexts at the close
-   (tlock mode allowed), or keep them hidden (single or threshold only)?
+1. Licence: MIT OR Apache-2.0, from the first commit.
+2. The presidential kind never runs under tlock (its ballots are
+   multiple choices: §5.1).
+3. The name: to be chosen; it should say anonymity and voting.
