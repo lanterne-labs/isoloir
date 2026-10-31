@@ -1,0 +1,27 @@
+[package]
+name = "isoloir"
+description = "The isoloir command: keys, circuits, the ledger's genesis, setups, the ingest, the trustee, the audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "isoloir"
+path = "src/main.rs"
+
+[dependencies]
+isoloir-core.workspace = true
+isoloir-proto.workspace = true
+isoloir-zk.workspace = true
+isoloir-decrypt.workspace = true
+isoloir-relay.workspace = true
+isoloir-server.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+serde_json.workspace = true
+hex.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand.workspace = true

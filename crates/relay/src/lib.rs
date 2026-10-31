@@ -14,6 +14,8 @@
 //! - [`Pool::wait_for`] waits for the first matching event on any relay
 //!   (a voter waiting for its ack).
 
+pub mod local;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
