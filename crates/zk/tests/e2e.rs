@@ -25,6 +25,10 @@ impl Passports for DevPassports {
     }
 }
 
+mod isoloir_server_free {
+    pub type Read = (String, Vec<(isoloir_proto::body::EntryKind, Vec<u8>)>);
+}
+
 struct Ledger {
     state: State,
     pending: Pending,
@@ -32,7 +36,7 @@ struct Ledger {
     now: u64,
     signer: note::Signer,
     /// Each checkpoint's signed note and entries, for the auditor.
-    notes: Vec<(String, Vec<(EntryKind, Vec<u8>)>)>,
+    notes: Vec<isoloir_server_free::Read>,
     posted: u64,
 }
 

@@ -1,0 +1,54 @@
+[package]
+name = "isoloir-wasm"
+description = "isoloir for the browser: the voter's side of the protocol (keys, registration, ballots, checkpoints, receipts, tallies) compiled to WebAssembly, JSON in and JSON out"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tartuffeme/isoloir"
+rust-version = "1.90"
+
+# Not a member of the repository's workspace: it builds on its own, for
+# wasm32-unknown-unknown and natively (its tests).
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Helpers for tests and fakes (an ingest that signs notes and acks, a
+# decrypter that builds tallies). Never in a production bundle.
+dev = []
+
+[dependencies]
+isoloir-core = { path = "../core" }
+isoloir-proto = { path = "../proto" }
+isoloir-decrypt = { path = "../decrypt" }
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+ark-ec = { version = "0.6", default-features = false }
+ark-ff = { version = "0.6", default-features = false }
+rand_core = { version = "0.6", features = ["getrandom"] }
+rand_chacha = "0.3"
+k256 = { version = "0.13", features = ["schnorr", "ecdh"] }
+chacha20poly1305 = "0.10"
+ed25519-dalek = "2"
+bip39 = { version = "2", default-features = false, features = ["std", "french"] }
+
+# Randomness in the browser: crypto.getRandomValues through each getrandom
+# version in the tree (0.2 for rand_core 0.6 / ark / k256, 0.4 for tlock's
+# rand 0.10).
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+isoloir-decrypt = { path = "../decrypt" }
+
+[profile.release]
+opt-level = 3
+lto = true

@@ -81,6 +81,7 @@ const UPGRADE_EVERY: u64 = 3_600;
 impl Ingest {
     /// Loads the ledger from the store: the log is replayed into the state,
     /// the pending messages are claimed again.
+    #[allow(clippy::too_many_arguments)]
     pub async fn load(
         store: Store,
         config: Config,

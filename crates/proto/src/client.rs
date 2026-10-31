@@ -128,6 +128,9 @@ pub fn no_choice(kind: &KindSpec) -> Choice {
     }
 }
 
+/// A sealer of tlock payloads (isoloir-decrypt).
+pub type Seal<'a> = &'a dyn Fn(&[u8]) -> Result<Vec<u8>, String>;
+
 /// Drafts a ballot. `seal` time-locks a tlock payload (isoloir-decrypt).
 #[allow(clippy::too_many_arguments)]
 pub fn draft<R: RngCore + CryptoRng>(
@@ -138,7 +141,7 @@ pub fn draft<R: RngCore + CryptoRng>(
     s: &Fr,
     choice: &Choice,
     revoting: &Revoting,
-    seal: Option<&dyn Fn(&[u8]) -> Result<Vec<u8>, String>>,
+    seal: Option<Seal>,
     rng: &mut R,
 ) -> Result<Draft, String> {
     let new_values = kinds::values(&poll.kind, variant, choice)?;

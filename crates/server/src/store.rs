@@ -148,6 +148,7 @@ impl Store {
 
     /// Writes a checkpoint: its entries, its note, the removal of the
     /// pending rows and submissions it logs, in one transaction.
+    #[allow(clippy::too_many_arguments)]
     pub async fn checkpoint(&self, entries: &[(u64, EntryKind, Vec<u8>, String)], idx: u64, note: &str, time: u64, size: u64, pending: &[String], submissions: &[i64]) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
         for (seq, k, body, hash) in entries {

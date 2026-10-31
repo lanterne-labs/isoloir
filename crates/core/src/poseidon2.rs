@@ -51,6 +51,7 @@ fn external(s: &mut [Fr; WIDTH]) {
 }
 
 /// x_i ← (D_i − 1)·x_i + Σ x.
+#[allow(clippy::needless_range_loop)]
 fn internal(s: &mut [Fr; WIDTH], diag: &[Fr; WIDTH]) {
     let sum: Fr = s.iter().sum();
     for i in 0..WIDTH {
@@ -59,6 +60,7 @@ fn internal(s: &mut [Fr; WIDTH], diag: &[Fr; WIDTH]) {
 }
 
 /// The Poseidon2 permutation on a state of four elements.
+#[allow(clippy::needless_range_loop)]
 pub fn permutation(mut s: [Fr; WIDTH]) -> [Fr; WIDTH] {
     let p = params();
     external(&mut s);
@@ -98,7 +100,7 @@ pub fn hash(inputs: &[Fr]) -> Fr {
     for (i, x) in inputs[full * RATE..].iter().enumerate() {
         s[i] += x;
     }
-    if inputs.is_empty() || inputs.len() % RATE != 0 {
+    if inputs.is_empty() || !inputs.len().is_multiple_of(RATE) {
         s = permutation(s);
     }
     s[0]
