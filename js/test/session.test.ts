@@ -43,6 +43,21 @@ describe('registration', () => {
 		expect(w.mirror.reads).toContain('entries/2.json');
 	});
 
+	it('a backup declined in so many words lets the registration go, and the words stay readable', async () => {
+		const w = world();
+		const s = session(w);
+		await s.init();
+		await s.scanPassport(passport());
+		const words = s.createKeyFromWords();
+		await expect(s.submitRegistration()).rejects.toMatchObject({ code: 'backup_required' });
+		s.declineBackup();
+		expect(s.state().key?.backedUp).toBe(true);
+		await s.submitRegistration();
+		expect(s.state().registration.state).toBe('acked');
+		expect(w.relays.all(core.kinds.register)).toHaveLength(1);
+		expect(s.words()).toBe(words);
+	});
+
 	it('register() asks for the words back and refuses a wrong answer', async () => {
 		const w = world();
 		const s = session(w);

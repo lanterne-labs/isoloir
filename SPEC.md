@@ -579,7 +579,9 @@ PRF extension, `s = H(T_prf, prf_lo, prf_hi)` from a passkey's PRF output
 on input `isoloir/1/<origin>/<registry>`; otherwise `s` comes from 12
 words (BIP39, 128 bits) or is carried by a device link (ECDH secp256k1 +
 XChaCha20-Poly1305 over a relay, confirmed by a six-digit code). No
-ballot is cast before a backup is confirmed.
+ballot is cast before a backup is confirmed, unless the voter declined
+one in so many words (the choice is recorded with the key; the app
+carries the warning).
 
 ## 15. The mirror
 

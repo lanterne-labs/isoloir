@@ -51,7 +51,7 @@ await session.init();
    - When the platform says it has no PRF support, no passkey is created (`passkey_noprf`).
    - The names the platform shows default to the registry's name.
 
-3. **Confirm.** There is no registration and no ballot before a backup exists (`backup_required`).
+3. **Confirm.** There is no registration and no ballot before a backup exists (`backup_required`), or before the voter has declined one in so many words: `session.declineBackup()` records that choice with the key, and the app owns the warning (a lost device means the last ballot stays counted and cannot be changed). The words of a words key stay readable (`session.words()`) for a backup made later.
    - Ask the voter for the words at `session.wordChallenge()` (three 1-based positions).
    - Call `session.confirmWords(positions, answers)`, which returns `{ ok, wrong }`; `wrong` lists the 1-based positions that do not match.
    - Case and French accents do not matter.
