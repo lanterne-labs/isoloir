@@ -163,8 +163,13 @@ export interface StoredKey {
 	source: KeySource;
 	words?: string;
 	credentialId?: string;
-	/** What copies of the key exist: confirmed words, a synced passkey, devices that confirmed a link. */
-	backups: { words: boolean; passkey: boolean; linked: number };
+	/**
+	 * What copies of the key exist: confirmed words, a synced passkey,
+	 * devices that confirmed a link; or the voter's explicit choice to
+	 * keep the key on this device alone (declined), which stands for a
+	 * backup where one is required.
+	 */
+	backups: { words: boolean; passkey: boolean; linked: number; declined?: boolean };
 	leaf: string;
 	position: number;
 	regSecret?: string;
@@ -559,6 +564,21 @@ export class Session {
 			this.emit();
 		}
 		return { ok, wrong };
+	}
+
+	/**
+	 * The voter declines a backup, in so many words: the key stays on this
+	 * device alone, and the registration may go. The app owns the warning
+	 * (a lost device means the last ballot stays counted and cannot be
+	 * changed); the choice is recorded with the key, and the words of a
+	 * words key remain readable (words()) for a backup made later.
+	 */
+	declineBackup(): void {
+		const k = this.requireKey();
+		if (this.backedUp(k)) return;
+		k.backups.declined = true;
+		this.saveKey(k);
+		this.emit();
 	}
 
 	/**
@@ -1073,7 +1093,7 @@ export class Session {
 	}
 
 	private backedUp(k: StoredKey): boolean {
-		return k.backups.passkey || k.backups.words || k.backups.linked > 0 || k.source === 'link';
+		return k.backups.passkey || k.backups.words || k.backups.linked > 0 || k.source === 'link' || k.backups.declined === true;
 	}
 
 	private pollRecord(k: StoredKey): PollRecord;
