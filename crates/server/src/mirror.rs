@@ -210,7 +210,8 @@ impl Mirror {
     pub fn install_circuit(&self, name: &str, artifact: &Path, vk: &Path) -> anyhow::Result<()> {
         let d = self.dir.join("circuits").join(name);
         std::fs::create_dir_all(&d)?;
-        std::fs::copy(artifact, d.join("artifact.json"))?;
+        let bytes = isoloir_proto::artifact::published(&std::fs::read(artifact)?).map_err(anyhow::Error::msg)?;
+        std::fs::write(d.join("artifact.json"), bytes)?;
         std::fs::copy(vk, d.join("vk"))?;
         Ok(())
     }

@@ -268,6 +268,7 @@ pub fn install(built: &Built, dir: &Path) -> Result<()> {
     let d = dir.join(&built.name);
     std::fs::create_dir_all(&d)?;
     std::fs::copy(&built.vk, d.join("vk"))?;
-    std::fs::copy(&built.artifact, d.join("artifact.json"))?;
+    let bytes = isoloir_proto::artifact::published(&std::fs::read(&built.artifact)?).map_err(|e| Error::Tool("artifact".into(), e))?;
+    std::fs::write(d.join("artifact.json"), bytes)?;
     Ok(())
 }
