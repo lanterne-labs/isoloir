@@ -90,13 +90,15 @@ Every error is an `IsoloirError` whose `code` belongs to the `IsoloirErrorCode` 
 The ingest's verifier (`../zkverifier/verify.mjs`) rebuilds the query from the registry's eligibility and the binding, so the browser must ask for exactly the same query:
 
 ```ts
-import { ZKPassport } from '@zkpassport/sdk';
+import { NullifierType, ZKPassport } from '@zkpassport/sdk';
 
 async function zkpassportScan(req: RegistrationRequest, session: Session): Promise<PassportProof> {
 	const e = req.eligibility;
 	const day = new Date(session.serverNow());              // the proof's day, on the server's clock
 	const zk = new ZKPassport(e.domain);
-	let q = await zk.request({ name: '…', logo: '…', purpose: '…', scope: e.scope, mode: 'compressed', validity: req.validity /* , devMode */ });
+	// The registry's identifier type: salted by its OPRF key, or the document's own.
+	const id = e.oprf_key ? { uniqueIdentifierType: NullifierType.SALTED, oprfKeyId: e.oprf_key.id } : { uniqueIdentifierType: NullifierType.NON_SALTED };
+	let q = await zk.request({ name: '…', logo: '…', purpose: '…', scope: e.scope, mode: 'compressed', validity: req.validity, ...id });
 	if (e.min_age) q = q.gte('age', e.min_age);
 	if (e.nationality?.length) q = q.in('nationality', e.nationality);
 	if (e.document_type) q = q.eq('document_type', e.document_type);
@@ -110,7 +112,7 @@ async function zkpassportScan(req: RegistrationRequest, session: Session): Promi
 		r.onResult(({ uniqueIdentifier, verified, result }) => {
 			if (!verified || !uniqueIdentifier) return reject(new Error('not verified'));
 			resolve({
-				uid: uniqueIdentifier,                           // the non-salted unique identifier
+				uid: uniqueIdentifier,                           // the registry's identifier (salted or not)
 				proof: { proofs, result },                       // the bundle verify.mjs takes
 				proofDate: Math.floor(session.serverNow() / 1000)
 			});
@@ -122,7 +124,8 @@ async function zkpassportScan(req: RegistrationRequest, session: Session): Promi
 ```
 
 Notes:
-- The identifier must be the document's own, not salted (`NullifierType.NON_SALTED`; the mock type in dev mode). A salted identifier would let one passport register twice.
+- The identifier must be of the registry's type: salted (`NullifierType.SALTED` with `oprfKeyId`) when its eligibility has `oprf_key`, else the document's own (`NullifierType.NON_SALTED`). A salted identifier is still one per document (the OPRF is deterministic under the key), and the state that issued the passport cannot compute it alone; the verifier checks the proof's OPRF key against the registry's pinned one (SPEC §5). A proof of the other type is refused.
+- A salted identifier may need a face match in the ZKPassport app (its OPRF nodes authenticate the query with one): not yet confirmed with a real passport.
 - The callback names follow the SDK version the reference app used; check them against yours.
 - With the `dev` provider (tests, `--dev` ingests), the bundle only needs `{ uid }`.
 
