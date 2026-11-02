@@ -50,6 +50,11 @@ export interface IsoloirWasm {
 	link_receiver(): string;
 	link_seal(receiver_public: string, payload: string): string;
 	link_open(receiver_secret: string, sealed: string): string;
+	audit_start(log_key: string, verdicts_json: string): number;
+	audit_checkpoint(id: number, note: string, entries_json: string): string;
+	audit_finish(id: number): string;
+	audit_relays(id: number, events_json: string): string;
+	audit_drop(id: number): void;
 }
 
 /** The Nostr kinds of SPEC §11.1. */

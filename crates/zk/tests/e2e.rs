@@ -100,6 +100,37 @@ impl Ledger {
         assert!(report.problems.is_empty(), "audit problems: {:#?}", report.problems);
     }
 
+    /// The browser's audit (isoloir-wasm audit.rs, two passes): the first
+    /// asks for the proofs, `verdict` answers each, the second replays
+    /// with the answers. Returns the second pass's report.
+    fn browser_audit(&self, verdict: &dyn Fn(&Value) -> Value) -> Value {
+        let notes: Vec<(String, String)> = self
+            .notes
+            .iter()
+            .enumerate()
+            .map(|(i, (n, es))| {
+                let start: usize = self.notes[..i].iter().map(|(_, e)| e.len()).sum();
+                let entries: Vec<Value> = es.iter().enumerate().map(|(j, (k, b))| json!({"seq": start + j, "kind": k.as_str(), "body": String::from_utf8(b.clone()).unwrap()})).collect();
+                (n.clone(), Value::Array(entries).to_string())
+            })
+            .collect();
+        let key = self.signer.verifier();
+        let mut first = isoloir_wasm::audit::Run::new(Some(&key), "{}").unwrap();
+        let mut verdicts = serde_json::Map::new();
+        for (n, es) in &notes {
+            let out: Value = serde_json::from_str(&first.checkpoint(n, es).unwrap()).unwrap();
+            for r in out["requests"].as_array().unwrap() {
+                verdicts.insert(r["key"].as_str().unwrap().to_string(), verdict(r));
+            }
+        }
+        let mut second = isoloir_wasm::audit::Run::new(Some(&key), &Value::Object(verdicts).to_string()).unwrap();
+        for (n, es) in &notes {
+            let out: Value = serde_json::from_str(&second.checkpoint(n, es).unwrap()).unwrap();
+            assert!(out["requests"].as_array().unwrap().is_empty(), "the second pass asked again");
+        }
+        serde_json::from_str(&second.finish().unwrap()).unwrap()
+    }
+
     /// Logs the queue, ordered by body hash, and checkpoints.
     fn checkpoint(&mut self) -> note::Checkpoint {
         self.now += 20;
@@ -238,6 +269,25 @@ fn a_yes_no_poll_end_to_end() {
     l.checkpoint();
     assert_eq!(l.state.polls[&7].tallies.len(), 1);
     l.audit(Checkers { proofs: &proofs, passports: &DevPassports, tlock: None });
+
+    // The browser's audit: the proofs it asks for, verified with bb as the
+    // page would with bb.js, give the CLI's verdict; one refused proof is
+    // a problem, and so is a proof that could not be checked.
+    let bb = |r: &Value| -> Value {
+        use base64::Engine as _;
+        let c = isoloir_proto::body::CircuitRef { name: r["circuit"].as_str().unwrap().into(), vk_hash: r["vk_hash"].as_str().unwrap().into() };
+        let proof = base64::engine::general_purpose::STANDARD.decode(r["proof"].as_str().unwrap()).unwrap();
+        let inputs: Vec<[u8; 32]> = r["inputs"].as_array().unwrap().iter().map(|h| hex::decode(&h.as_str().unwrap()[2..]).unwrap().try_into().unwrap()).collect();
+        json!({"type": "proof", "ok": isoloir_proto::judge::Proofs::verify(&proofs, &c, &proof, &inputs).unwrap()})
+    };
+    let report = l.browser_audit(&bb);
+    assert_eq!(report["problems"], json!([]), "browser audit: {report}");
+    assert_eq!(report["ballots"], json!(l.state.polls[&7].ballots.len()));
+    let refused = std::cell::Cell::new(false);
+    let report = l.browser_audit(&|r| if refused.replace(true) { bb(r) } else { json!({"type": "proof", "ok": false}) });
+    assert!(report["problems"].as_array().unwrap().iter().any(|p| p.as_str().unwrap().contains("(ballot): logged, but")), "{report}");
+    let report = l.browser_audit(&|_| json!({"type": "proof", "error": "bb unavailable"}));
+    assert!(report["problems"].as_array().unwrap().iter().any(|p| p.as_str().unwrap().contains("not checked")), "{report}");
 
     // A log changed after the fact: one refusal turned into the valid
     // ballot of another voter, under the same signed notes. The replay
