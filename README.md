@@ -72,6 +72,9 @@ isoloir audit --mirror mirror --log-key "…" --relays --skip-passports
 Run it from the repository root (`circuits/` is where variants are
 built from); create the database first.
 
+How a vote works, in French, for a technical reader:
+[docs/comment-ca-marche.md](docs/comment-ca-marche.md).
+
 Anyone can also audit from a web page: `audit()` of `@isoloir/web` runs
 the same replay in the browser, with `bbVerifier` for the ballot proofs
 and `zkPassportVerifier` for the passports (DESIGN §1.7).
