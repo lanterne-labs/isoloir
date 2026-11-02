@@ -118,7 +118,18 @@ pub async fn vote(dir: &Path, circuits: &Path, poll_id: u32, secret: &str, choic
     if p.revote == isoloir_proto::body::Revote::Delta {
         bail!("delta polls need the previous ballot's place in the ballot tree: use @isoloir/web");
     }
-    let d = client::draft(&p, setup_seq, &variant, &m, &s, &choice, &Revoting::Linked { seq }, None, &mut rand::rngs::OsRng).map_err(|e| anyhow::anyhow!(e))?;
+    // A tlock poll: the payload is time-locked to the poll's round (SPEC §7.2).
+    let tl = match &p.encryption {
+        isoloir_proto::body::Encryption::Tlock { public_key, round, .. } => Some((hex::decode(public_key).context("drand public key")?, *round)),
+        _ => None,
+    };
+    let seal_rng = std::cell::RefCell::new(rand::rngs::OsRng);
+    let sealer = |payload: &[u8]| -> Result<Vec<u8>, String> {
+        let (pk, round) = tl.as_ref().ok_or("not a tlock poll")?;
+        isoloir_decrypt::tlock::seal(pk, *round, payload, &mut *seal_rng.borrow_mut())
+    };
+    let seal: Option<client::Seal> = if tl.is_some() { Some(&sealer) } else { None };
+    let d = client::draft(&p, setup_seq, &variant, &m, &s, &choice, &Revoting::Linked { seq }, seal, &mut rand::rngs::OsRng).map_err(|e| anyhow::anyhow!(e))?;
     let prover = Prover::new(Tools::find()?, Circuits::new(circuits));
     let t0 = std::time::Instant::now();
     let proof = prover.prove(&p.circuit.name, &d.inputs)?;
