@@ -25,8 +25,8 @@
     "wasm/web"
   ],
   "scripts": {
-    "wasm:web": "wasm-pack build ../crates/wasm --target web --out-dir ../../js/wasm/web --out-name isoloir_wasm --release && rm -f wasm/web/.gitignore",
-    "wasm:node": "wasm-pack build ../crates/wasm --target nodejs --out-dir ../../js/wasm/node --out-name isoloir_wasm --release -- --features dev && rm -f wasm/node/.gitignore",
+    "wasm:web": "RUSTFLAGS=\"--remap-path-prefix=$HOME=~\" wasm-pack build ../crates/wasm --target web --out-dir ../../js/wasm/web --out-name isoloir_wasm --release && rm -f wasm/web/.gitignore",
+    "wasm:node": "RUSTFLAGS=\"--remap-path-prefix=$HOME=~\" wasm-pack build ../crates/wasm --target nodejs --out-dir ../../js/wasm/node --out-name isoloir_wasm --release -- --features dev && rm -f wasm/node/.gitignore",
     "wasm": "npm run wasm:web && npm run wasm:node",
     "build": "tsc -p tsconfig.build.json",
     "check": "tsc --noEmit -p tsconfig.json",
