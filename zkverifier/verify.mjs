@@ -2,10 +2,11 @@
 // The ingest (crates/server/src/eligibility.rs) runs it once per registration:
 // the request is one JSON object on stdin, the answer one JSON object on stdout.
 //
-// stdin:  { proofs, result, challenge (the custom data the proof binds), domain, scope, minAge, nationality, devMode, rpcUrl,
-//           documentType, requireExpiry, proofDate }: with requireExpiry the proof must show a document not expired at
+// stdin:  { proofs, result, challenge (the custom data the proof binds), domain, scope, minAge, nationality, rpcUrl,
+//           documentType, requireExpiry, proofDate, oprfKey }: with requireExpiry the proof must show a document not expired at
 //           proofDate (the base proof does not check the expiry; the query expiry_date >= <date> does, and the date the
-//           browser chose, kept in the result, must be the proof's day)
+//           browser chose, kept in the result, must be the proof's day); with oprfKey ({ id, x, y }, the registry's)
+//           the identifier must be salted by that key, else it must be the document's own
 // stdout: { verified, uniqueIdentifier, errors }
 //
 // The query is rebuilt here from the server's own settings and the one-time
@@ -13,7 +14,9 @@
 // Verification is local (verifierMode "local"): the open-source verifier
 // bundled in @zkpassport/sdk checks the proofs; only the registry roots of
 // the certificates are read on-chain (Ethereum, through rpcUrl or the SDK's
-// public endpoint). No ZKPassport account, key or API is used.
+// public endpoint). No ZKPassport account, key or API is used, and the
+// OPRF key of a salted identifier is the registry's, not asked of the
+// OPRF nodes.
 
 import { createRequire } from 'node:module';
 
@@ -26,6 +29,20 @@ async function readStdin() {
 	const chunks = [];
 	for await (const chunk of process.stdin) chunks.push(chunk);
 	return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
+// pinOprfKey answers the SDK's request for the OPRF public key
+// (`<node>/oprf_pub/<id>`, which it hashes and compares with the key the
+// proof used) with the registry's pinned key: the check holds when the
+// nodes are down, months later, or if they served another key.
+function pinOprfKey(key) {
+	const real = globalThis.fetch;
+	globalThis.fetch = async (input, init) => {
+		const m = /\/oprf_pub\/([^/?#]+)$/.exec(String(input?.url ?? input));
+		if (!m) return real(input, init);
+		if (decodeURIComponent(m[1]) !== key.id) return new Response('not the registry key', { status: 404 });
+		return new Response(JSON.stringify({ key: [key.x, key.y] }), { status: 200, headers: { 'content-type': 'application/json' } });
+	};
 }
 
 function reply(obj) {
@@ -60,17 +77,21 @@ try {
 	builder = builder.bind('custom_data', req.challenge);
 	const { query } = builder.done();
 
-	// The identifier must be the document's own (non-salted): a salted one
-	// would be another identifier for the same passport. The validity is
-	// the caller's (the ingest bounds proof_date itself; the audit runs
-	// months later): without it the SDK refuses a proof older than 7 days.
+	// The identifier is of the one type the registry names: salted by its
+	// OPRF key, or the document's own. Taking both would give a passport
+	// two identifiers. The validity is the caller's (the ingest bounds
+	// proof_date itself; the audit runs months later): without it the SDK
+	// refuses a proof older than 7 days.
+	const key = req.oprfKey;
+	if (key) pinOprfKey(key);
 	const { verified, uniqueIdentifier, queryResultErrors } = await zk.verify({
 		proofs: req.proofs,
 		originalQuery: query,
 		queryResult: req.result,
 		scope: req.scope,
-		devMode: Boolean(req.devMode),
-		uniqueIdentifierType: req.devMode ? NullifierType.NON_SALTED_MOCK : NullifierType.NON_SALTED,
+		devMode: false,
+		uniqueIdentifierType: key ? NullifierType.SALTED : NullifierType.NON_SALTED,
+		oprfKeyId: key ? key.id : undefined,
 		validity: req.validity || 10 * 365 * 86_400,
 		verifierMode: 'local',
 		config: req.rpcUrl ? { rpcUrl: req.rpcUrl } : undefined

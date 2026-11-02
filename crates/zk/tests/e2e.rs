@@ -177,7 +177,7 @@ fn a_yes_no_poll_end_to_end() {
         id: 1,
         version: 1,
         name: "test".into(),
-        eligibility: Eligibility { provider: "dev".into(), domain: "test.example".into(), scope: "t".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false },
+        eligibility: Eligibility { provider: "dev".into(), domain: "test.example".into(), scope: "t".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false, oprf_key: None },
         validity: 3600,
         depth: 20,
     }));
@@ -324,7 +324,7 @@ fn delta_re_votes_end_to_end() {
         id: 1,
         version: 1,
         name: "test".into(),
-        eligibility: Eligibility { provider: "dev".into(), domain: "test.example".into(), scope: "t".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false },
+        eligibility: Eligibility { provider: "dev".into(), domain: "test.example".into(), scope: "t".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false, oprf_key: None },
         validity: 3600,
         depth: 20,
     }));
@@ -422,7 +422,7 @@ fn a_tlock_poll_end_to_end() {
         id: 1,
         version: 1,
         name: "test".into(),
-        eligibility: Eligibility { provider: "dev".into(), domain: "test.example".into(), scope: "t".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false },
+        eligibility: Eligibility { provider: "dev".into(), domain: "test.example".into(), scope: "t".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false, oprf_key: None },
         validity: 3600,
         depth: 20,
     }));
@@ -538,7 +538,7 @@ fn a_ranked_poll_with_margins() {
         id: 1,
         version: 1,
         name: "test".into(),
-        eligibility: Eligibility { provider: "dev".into(), domain: "test.example".into(), scope: "t".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false },
+        eligibility: Eligibility { provider: "dev".into(), domain: "test.example".into(), scope: "t".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false, oprf_key: None },
         validity: 3600,
         depth: 20,
     }));
@@ -626,7 +626,7 @@ fn review_rules() {
         id: 1,
         version: 1,
         name: "tiny".into(),
-        eligibility: Eligibility { provider: "dev".into(), domain: "d".into(), scope: "s".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false },
+        eligibility: Eligibility { provider: "dev".into(), domain: "d".into(), scope: "s".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false, oprf_key: None },
         validity: 3600,
         depth: 1,
     }));

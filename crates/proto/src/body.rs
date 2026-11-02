@@ -205,6 +205,21 @@ pub struct Eligibility {
     pub document_type: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub require_expiry: bool,
+    /// zkpassport: the OPRF key of a salted identifier, pinned. Without
+    /// it the identifier is the document's own, which the issuing state
+    /// can compute (SPEC §5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oprf_key: Option<OprfKey>,
+}
+
+/// The public key of ZKPassport's OPRF network that salts the identifier:
+/// its id and point, decimal, as its nodes serve it (`/oprf_pub/<id>`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OprfKey {
+    pub id: String,
+    pub x: String,
+    pub y: String,
 }
 
 fn is_false(b: &bool) -> bool {

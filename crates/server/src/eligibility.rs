@@ -36,6 +36,7 @@ impl Passports for Verifiers {
                     "nationality": e.nationality,
                     "documentType": e.document_type,
                     "requireExpiry": e.require_expiry,
+                    "oprfKey": e.oprf_key,
                     "proofDate": proof_date * 1000,
                     "rpcUrl": self.rpc_url,
                 });

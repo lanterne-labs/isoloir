@@ -13,7 +13,9 @@ the spec.
 - A voter proves with the ZKPassport app that their passport satisfies
   the registry's rule (age, nationality, document type, expiry) and
   gets a `uid`, unique per passport for the registry's domain and
-  scope (§5, §6). The ingest verifies the proof itself (the open
+  scope (§5, §6), salted by ZKPassport's threshold OPRF under a key the
+  registry pins, so the state that issued the passport cannot compute it
+  alone. The ingest verifies the proof itself (the open
   verifier of the ZKPassport SDK in a Node sidecar) and refuses a `uid`
   already registered (`uid_used`): one registration per passport, ever.
 - The registration binds a leaf `ID = H(T_id, registry, s)` of the

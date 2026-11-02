@@ -29,15 +29,18 @@ Les rôles :
   authentique (signé par l’État émetteur), titulaire majeur et de la
   nationalité demandée, document valide. La preuve est liée à
   l’inscription et ne révèle ni nom, ni photo, ni numéro : seulement un
-  identifiant propre au passeport et au site (`uid`).
+  identifiant propre au passeport et au site (`uid`), salé par un
+  secret partagé entre trois opérateurs indépendants (OPRF à seuil de
+  ZKPassport, deux sur trois).
 - L’inscription part sur un relais public. Le serveur la lit, vérifie la
   preuve avec le vérificateur ouvert du SDK ZKPassport (les racines du
   registre des certificats sont lues sur Ethereum), refuse un `uid` déjà
   inscrit, puis l’inscrit dans le registre public, preuve comprise.
 - Chacun peut donc vérifier que chaque votant vient d’un vrai passeport,
-  et qu’aucun passeport n’a deux inscriptions. L’`uid` étant public,
-  l’État qui a signé la puce pourrait savoir qu’un passeport s’est
-  inscrit ; jamais pour qui il vote.
+  et qu’aucun passeport n’a deux inscriptions. L’`uid` est public, mais
+  salé : l’État qui a signé la puce ne peut pas le recalculer seul pour
+  savoir qu’un passeport s’est inscrit ; il lui faudrait deux des trois
+  opérateurs de l’OPRF. Et jamais pour qui il vote.
 
 ## 2. Voter : un bulletin chiffré, sans nom
 

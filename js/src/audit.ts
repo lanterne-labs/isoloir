@@ -8,7 +8,7 @@
 // run is a problem, never a pass.
 
 import type { IsoloirWasm } from './wasm.js';
-import type { NostrEvent } from './types.js';
+import type { Eligibility, NostrEvent, OprfKey } from './types.js';
 import type { RelayTransport } from './relay.js';
 
 /** A proof the judge asked for. */
@@ -17,15 +17,7 @@ export type AuditRequest =
 	| {
 			key: string;
 			type: 'passport';
-			eligibility: {
-				provider: string;
-				domain: string;
-				scope: string;
-				min_age?: number;
-				nationality?: string[];
-				document_type?: string;
-				require_expiry?: boolean;
-			};
+			eligibility: Eligibility;
 			proof: { proofs?: unknown[]; result?: Record<string, unknown> } & Record<string, unknown>;
 			custom_data: string;
 			proof_date: number;
@@ -303,13 +295,37 @@ export interface ZkPassportSdk {
 		createQuery(): unknown;
 		verify(o: Record<string, unknown>): Promise<{ verified: boolean; uniqueIdentifier?: string; queryResultErrors?: unknown }>;
 	};
-	NullifierType: { NON_SALTED: unknown; NON_SALTED_MOCK: unknown };
+	NullifierType: { NON_SALTED: unknown; SALTED: unknown };
+}
+
+// The OPRF keys the registries pin, by id: the SDK asks the OPRF nodes for
+// the key a salted proof used (`<node>/oprf_pub/<id>`) and gets the
+// registry's, so the audit holds when the nodes are down or serve another
+// key. Every other request goes through.
+const pinnedOprf = new Map<string, OprfKey>();
+let oprfFetchPinned = false;
+function pinOprfKey(key: OprfKey): void {
+	const known = pinnedOprf.get(key.id);
+	if (known && (known.x !== key.x || known.y !== key.y)) throw new Error(`two registries pin OPRF key ${key.id} differently`);
+	pinnedOprf.set(key.id, key);
+	if (oprfFetchPinned) return;
+	oprfFetchPinned = true;
+	const real = globalThis.fetch.bind(globalThis);
+	globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+		const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+		const m = /\/oprf_pub\/([^/?#]+)$/.exec(url);
+		if (!m) return real(input, init);
+		const k = pinnedOprf.get(decodeURIComponent(m[1]));
+		if (!k) return new Response('not a registry key', { status: 404 });
+		return new Response(JSON.stringify({ key: [k.x, k.y] }), { status: 200, headers: { 'content-type': 'application/json' } });
+	};
 }
 
 /**
  * Verifies passport proofs with the ZKPassport SDK, locally (its open
  * verifier; the certificate registry roots read on Ethereum through
- * `rpcUrl`). The query is rebuilt from the registry's rules and the
+ * `rpcUrl`; a salted identifier against the registry's pinned OPRF key).
+ * The query is rebuilt from the registry's rules and the
  * registration's binding, as the ingest's verifier does (zkverifier/
  * verify.mjs).
  */
@@ -343,13 +359,16 @@ export function zkPassportVerifier(sdk: ZkPassportSdk, rpcUrl: string): (req: Ex
 		}
 		b = b.bind('custom_data', req.custom_data);
 		const { query } = b.done();
+		// The one identifier type the registry names (verify.mjs).
+		if (e.oprf_key) pinOprfKey(e.oprf_key);
 		const r = await zk.verify({
 			proofs,
 			originalQuery: query,
 			queryResult: req.proof.result,
 			scope: e.scope,
 			devMode: false,
-			uniqueIdentifierType: sdk.NullifierType.NON_SALTED,
+			uniqueIdentifierType: e.oprf_key ? sdk.NullifierType.SALTED : sdk.NullifierType.NON_SALTED,
+			oprfKeyId: e.oprf_key?.id,
 			validity: 10 * 365 * 86_400,
 			verifierMode: 'local',
 			config: { rpcUrl }
