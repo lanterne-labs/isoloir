@@ -80,6 +80,12 @@ export interface AuditOptions {
 	onProgress?(p: AuditProgress): void;
 	/** Stops the audit (it then throws). */
 	signal?: AbortSignal;
+	/**
+	 * Accepts a registry of the dev passport provider (a local trial, where
+	 * anyone may register). Absent, such a registry and its registrations
+	 * are problems, as for the ingest and the authority.
+	 */
+	allowDev?: boolean;
 }
 
 type Verdict = { type: 'proof'; ok?: boolean; error?: string } | { type: 'passport'; uid?: string | null; error?: string };
@@ -133,7 +139,7 @@ export async function audit(wasm: IsoloirWasm & AuditWasm, opts: AuditOptions): 
 	};
 
 	const pass = async (onCheckpoint: (out: CheckpointOut) => void): Promise<number> => {
-		const id = wasm.audit_start(opts.logKey, JSON.stringify(verdicts));
+		const id = wasm.audit_start(opts.logKey, JSON.stringify(verdicts), opts.allowDev === true);
 		try {
 			for (let i = 1; i <= last; i++) {
 				opts.signal?.throwIfAborted();
@@ -218,7 +224,7 @@ interface CheckpointOut {
 
 /** The audit functions of the wasm core. */
 export interface AuditWasm {
-	audit_start(log_key: string, verdicts_json: string): number;
+	audit_start(log_key: string, verdicts_json: string, allow_dev: boolean): number;
 	audit_checkpoint(id: number, note: string, entries_json: string): string;
 	audit_finish(id: number): string;
 	audit_relays(id: number, events_json: string): string;

@@ -115,7 +115,7 @@ impl Ledger {
             })
             .collect();
         let key = self.signer.verifier();
-        let mut first = isoloir_wasm::audit::Run::new(Some(&key), "{}").unwrap();
+        let mut first = isoloir_wasm::audit::Run::new(Some(&key), "{}", true).unwrap();
         let mut verdicts = serde_json::Map::new();
         for (n, es) in &notes {
             let out: Value = serde_json::from_str(&first.checkpoint(n, es).unwrap()).unwrap();
@@ -123,7 +123,7 @@ impl Ledger {
                 verdicts.insert(r["key"].as_str().unwrap().to_string(), verdict(r));
             }
         }
-        let mut second = isoloir_wasm::audit::Run::new(Some(&key), &Value::Object(verdicts).to_string()).unwrap();
+        let mut second = isoloir_wasm::audit::Run::new(Some(&key), &Value::Object(verdicts).to_string(), true).unwrap();
         for (n, es) in &notes {
             let out: Value = serde_json::from_str(&second.checkpoint(n, es).unwrap()).unwrap();
             assert!(out["requests"].as_array().unwrap().is_empty(), "the second pass asked again");

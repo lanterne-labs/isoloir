@@ -131,6 +131,10 @@ enum Cmd {
         every: u64,
         #[arg(long)]
         once: bool,
+        /// Accept registrations of the dev passport provider (local trials
+        /// only): without it, a dev registration in the log stops the authority.
+        #[arg(long)]
+        dev: bool,
     },
     /// A reference voter (dev provider registries; trials and tests).
     #[command(subcommand)]
@@ -165,6 +169,10 @@ enum Cmd {
         /// Check the checkpoints' stamps against Bitcoin block headers (blockstream.info, mempool.space).
         #[arg(long)]
         bitcoin: bool,
+        /// Accept a registry of the dev passport provider (local trials): a
+        /// warning, not a problem.
+        #[arg(long)]
+        dev: bool,
     },
     /// Checks a setup file offline: its spelling, its rules, the circuit it needs.
     Check {
@@ -406,7 +414,10 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Authority { mirror, log_key, log_key_env, keys, drand, circuits, zkverifier, node, rpc_url, db, nostr_key, every, once } => {
+        Cmd::Authority { mirror, log_key, log_key_env, keys, drand, circuits, zkverifier, node, rpc_url, db, nostr_key, every, once, dev } => {
+            if dev && std::env::var_os("ISOLOIR_PRODUCTION").is_some() {
+                bail!("--dev is for local trials");
+            }
             let log_key = log_key.or(log_key_env).context("--log-key or ISOLOIR_LOG_KEY: the ledger's log key, pinned")?;
             let bb = Tools::find_bb()?;
             let vk_dir = match (circuits, &mirror) {
@@ -458,7 +469,7 @@ async fn main() -> Result<()> {
                 source,
                 Some(&log_key),
                 Box::new(BbProofs::new(bb, vk_dir)),
-                Box::new(passports(zkverifier, node, rpc_url, true)),
+                Box::new(passports(zkverifier, node, rpc_url, dev)),
                 keys,
                 Some(drand),
                 output,
@@ -509,7 +520,7 @@ async fn main() -> Result<()> {
             }
             println!("ok: {}", String::from_utf8_lossy(&bytes));
         }
-        Cmd::Audit { mirror, log_key, circuits, zkverifier, node, rpc_url, relays, skip_passports, bitcoin } => {
+        Cmd::Audit { mirror, log_key, circuits, zkverifier, node, rpc_url, relays, skip_passports, bitcoin, dev } => {
             let bb = Tools::find_bb()?;
             let vk_dir = match circuits {
                 Some(c) => c,
@@ -520,9 +531,9 @@ async fn main() -> Result<()> {
             if zkverifier.is_none() && !skip_passports {
                 bail!("--zkverifier <verify.mjs> to check the passport proofs, or --skip-passports to report them as not checked");
             }
-            // The dev provider is accepted by an auditor: its registry says
-            // so in the log, for everyone to see (warned below).
-            let passports = passports(zkverifier, node, rpc_url, true);
+            // The dev provider takes anyone: a registry of it is a problem,
+            // and its registrations are refused, unless --dev (a trial).
+            let passports = passports(zkverifier, node, rpc_url, dev);
             let mut a = Auditor::new(log_key.as_deref(), Checkers { proofs: &proofs, passports: &passports, tlock: Some(&DrandTlock) }).map_err(|e| anyhow::anyhow!(e))?;
             for (n, es) in MirrorSource::parse(&mirror).from(1).await? {
                 a.checkpoint(&n, &es).map_err(|e| anyhow::anyhow!(e))?;
@@ -530,7 +541,8 @@ async fn main() -> Result<()> {
             let (state, mut r) = a.finish();
             for (id, reg) in &state.registries {
                 if reg.current().eligibility.provider == "dev" {
-                    r.warnings.push(format!("registry {id} takes the dev provider: anyone may register"));
+                    let w = format!("registry {id} takes the dev provider: anyone may register");
+                    if dev { r.warnings.push(w) } else { r.problems.push(w) }
                 }
             }
             if bitcoin {

@@ -44,10 +44,11 @@ mod bind {
         static RUNS: std::cell::RefCell<(u32, std::collections::HashMap<u32, crate::audit::Run>)> = Default::default();
     }
 
-    /// Starts an audit pass; `log_key` "" for the key the log names. Returns its id.
+    /// Starts an audit pass; `log_key` "" for the key the log names;
+    /// `allow_dev` accepts the dev passport provider (local trials). Returns its id.
     #[wasm_bindgen]
-    pub fn audit_start(log_key: &str, verdicts_json: &str) -> Result<u32, JsError> {
-        let run = crate::audit::Run::new((!log_key.is_empty()).then_some(log_key), verdicts_json).map_err(|e| JsError::new(&e))?;
+    pub fn audit_start(log_key: &str, verdicts_json: &str, allow_dev: bool) -> Result<u32, JsError> {
+        let run = crate::audit::Run::new((!log_key.is_empty()).then_some(log_key), verdicts_json, allow_dev).map_err(|e| JsError::new(&e))?;
         Ok(RUNS.with(|r| {
             let mut r = r.borrow_mut();
             r.0 += 1;
