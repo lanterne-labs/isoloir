@@ -73,7 +73,14 @@ pub fn check_registry(r: &RegistrySetup) -> Result<(), String> {
             if r.eligibility.domain.is_empty() || r.eligibility.scope.is_empty() {
                 return Err("zkpassport: a domain and a scope".into());
             }
+            if let Some(k) = &r.eligibility.oprf_key {
+                let dec = |v: &str| !v.is_empty() && v.len() <= 78 && v.bytes().all(|b| b.is_ascii_digit());
+                if k.id.is_empty() || !dec(&k.x) || !dec(&k.y) {
+                    return Err("oprf_key: an id and a point in decimal".into());
+                }
+            }
         }
+        "dev" if r.eligibility.oprf_key.is_some() => return Err("dev: no oprf_key".into()),
         "dev" => {}
         p => return Err(format!("provider {p}: unknown")),
     }
@@ -259,5 +266,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A salted identifier names its OPRF key, decimal, and only for zkpassport.
+    #[test]
+    fn oprf_key() {
+        let reg = |provider: &str, key: Option<crate::body::OprfKey>| RegistrySetup {
+            v: 1,
+            id: 1,
+            version: 1,
+            name: "r".into(),
+            eligibility: crate::body::Eligibility {
+                provider: provider.into(),
+                domain: "d".into(),
+                scope: "s".into(),
+                min_age: None,
+                nationality: vec![],
+                document_type: None,
+                require_expiry: false,
+                oprf_key: key,
+            },
+            validity: 60,
+            depth: 20,
+        };
+        let key = |x: &str| Some(crate::body::OprfKey { id: "1".into(), x: x.into(), y: "17".into() });
+        assert!(check_registry(&reg("zkpassport", None)).is_ok());
+        assert!(check_registry(&reg("zkpassport", key("1816"))).is_ok());
+        assert!(check_registry(&reg("zkpassport", key("0x18"))).is_err());
+        assert!(check_registry(&reg("zkpassport", key(""))).is_err());
+        assert!(check_registry(&reg("dev", key("1816"))).is_err());
     }
 }

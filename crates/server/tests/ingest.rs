@@ -112,7 +112,7 @@ async fn the_ingest_on_postgres() {
         id: 1,
         version: 1,
         name: "test".into(),
-        eligibility: Eligibility { provider: "dev".into(), domain: "test.example".into(), scope: "t".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false },
+        eligibility: Eligibility { provider: "dev".into(), domain: "test.example".into(), scope: "t".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false, oprf_key: None },
         validity: 3600,
         depth: 20,
     };
@@ -287,7 +287,7 @@ async fn the_direct_channel() {
         id: 1,
         version: 1,
         name: "test".into(),
-        eligibility: Eligibility { provider: "dev".into(), domain: "d".into(), scope: "s".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false },
+        eligibility: Eligibility { provider: "dev".into(), domain: "d".into(), scope: "s".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false, oprf_key: None },
         validity: 3600,
         depth: 20,
     };

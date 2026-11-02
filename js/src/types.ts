@@ -34,6 +34,15 @@ export interface Eligibility {
 	nationality?: string[];
 	document_type?: string;
 	require_expiry?: boolean;
+	/** zkpassport: the pinned OPRF key of a salted identifier (SPEC §5). */
+	oprf_key?: OprfKey;
+}
+
+/** ZKPassport's OPRF public key: its id and point, decimal. */
+export interface OprfKey {
+	id: string;
+	x: string;
+	y: string;
 }
 
 /** The `registry` entry (SPEC §5). */

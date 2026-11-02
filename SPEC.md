@@ -142,9 +142,25 @@ A registry is a set of eligible voters, reusable by any number of polls.
 {"v":1,"id":1,"version":1,"name":"Adultes français",
  "eligibility":{"provider":"zkpassport","domain":"vote.example",
    "scope":"isoloir/registry/1","min_age":18,"nationality":["FRA"],
-   "document_type":"passport","require_expiry":true},
+   "document_type":"passport","require_expiry":true,
+   "oprf_key":{"id":"1",
+     "x":"18166959201346800007624274454748264099569154910741994195889360204497718998925",
+     "y":"17198643698593566948834308934687875815952052155871236424838876937611092999400"}},
  "validity":3600,"depth":20}
 ```
+
+- **The identifier** (`uid`) is one per passport for the registry's
+  domain and scope. ZKPassport derives it from a hash of the chip's
+  data and of the state's signature over it. With `oprf_key` it is
+  **salted**: the hash also takes the output of ZKPassport's threshold
+  OPRF (2 of 3 nodes, run by separate operators) under that key, on a
+  blinded query, so the state that issued the passport cannot compute it
+  alone. Without `oprf_key` it is the document's own, which that state
+  can compute. A registry takes one type only (two types would give a
+  passport two identifiers), and the key is pinned: the verifier checks
+  the proof's OPRF key against the registry's, never against what the
+  nodes serve, so an audit holds when they are gone. The key above is
+  ZKPassport's mainnet key 1.
 
 - The voter's **leaf** is `ID = H(T_id, registry, s)`; positions follow
   the log order (§4). The tree has fixed depth `depth` (≤ 32); empty
@@ -162,7 +178,8 @@ A registry is a set of eligible voters, reusable by any number of polls.
    (secp256k1) and opens the passport request with
    `custom_data = H(T_reg, registry, R_lo, R_hi)` (R's x-only public key
    in two 16-byte big-endian limbs), the registry's domain and scope, its
-   rules, a non-salted unique identifier, on-device proving, validity
+   rules, the registry's identifier type (salted with `oprfKeyId`, or
+   non-salted), on-device proving, validity
    `validity`.
 2. **Then the key.** The browser obtains `s` (§14) and computes `ID`. The
    proof waits with `R` in the browser's storage until then.
@@ -185,8 +202,11 @@ A registry is a set of eligible voters, reusable by any number of polls.
    unreachable) is not a refusal: the message waits (§11).
 
 What becomes public: that passport `uid` registered in this registry, at
-which checkpoint, with which leaf. The state that issued the passport can
-compute `uid`; participation is public to it. Votes are not.
+which checkpoint, with which leaf. With a salted identifier, only whoever
+can query the OPRF for that passport (its holder, or a state with 2 of
+the 3 OPRF operators) can tell it is theirs; without, the issuing state
+can compute every `uid`, and participation is public to it. Votes are
+not, either way.
 
 ## 7. Polls
 
@@ -634,7 +654,7 @@ checkpoint's commit are the log's.
 
 | | Passport ↔ leaf | Leaf ↔ ballot | Ballot content | Re-vote history |
 |---|---|---|---|---|
-| Public | yes (uid is public) | no | closed elgamal: aggregates only; open: tally differences, down to one ballot at low traffic or `k_real` 1 (§10.1); tlock: every ballot at the round | linked: per pseudonym, with the minute of each post; delta: the count of corrections per tally window |
+| Public | yes to the issuing state with a non-salted uid; salted: only with 2 of 3 OPRF operators (§5) | no | closed elgamal: aggregates only; open: tally differences, down to one ballot at low traffic or `k_real` 1 (§10.1); tlock: every ballot at the round | linked: per pseudonym, with the minute of each post; delta: the count of corrections per tally window |
 | Ingest | yes | no, but it chooses what each checkpoint holds (§10.1) | as public | as public |
 | Authority (elgamal) | yes | no | could decrypt any ballot of any poll under its key | as public |
 | Relay | yes | address and time of the post; under tlock, the content at the round | as public | as public |
