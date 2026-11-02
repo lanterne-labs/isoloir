@@ -37,6 +37,8 @@ enum Answer {
 struct Asked {
     answers: RefCell<HashMap<String, Answer>>,
     requests: RefCell<Vec<Value>>,
+    /// The dev provider accepted (a local trial); else its registrations are refused.
+    allow_dev: bool,
 }
 
 const PENDING: &str = "pending: verified in the page";
@@ -74,10 +76,10 @@ impl Proofs for Asked {
 
 impl Passports for Asked {
     fn verify(&self, e: &Eligibility, proof: &Value, custom_data: &str, proof_date: u64) -> Result<Option<String>, String> {
-        // The dev provider takes anyone: its registry says so in the log
-        // (the report warns), and its "proof" is the uid itself.
+        // The dev provider takes anyone, its "proof" is the uid itself:
+        // accepted in a trial only, refused otherwise (as the ingest does).
         if e.provider == "dev" {
-            return Ok(proof.get("uid").and_then(Value::as_str).map(String::from));
+            return Ok(if self.allow_dev { proof.get("uid").and_then(Value::as_str).map(String::from) } else { None });
         }
         let req = json!({ "eligibility": e, "proof": proof, "custom_data": custom_data, "proof_date": proof_date });
         let key = encoding::body_hash(&canonical::to_vec(&req).map_err(err)?);
@@ -100,9 +102,10 @@ pub struct Run {
 }
 
 impl Run {
-    /// A pass; `verdicts` the answers of an earlier pass (`{}` for the first).
-    pub fn new(log_key: Option<&str>, verdicts_json: &str) -> R<Run> {
-        let asked: &'static Asked = Box::leak(Box::default());
+    /// A pass; `verdicts` the answers of an earlier pass (`{}` for the
+    /// first); `allow_dev` accepts the dev provider (a local trial).
+    pub fn new(log_key: Option<&str>, verdicts_json: &str, allow_dev: bool) -> R<Run> {
+        let asked: &'static Asked = Box::leak(Box::new(Asked { allow_dev, ..Default::default() }));
         let v: HashMap<String, Value> = serde_json::from_str(verdicts_json).map_err(err)?;
         let mut answers = asked.answers.borrow_mut();
         for (k, a) in v {
@@ -151,10 +154,11 @@ impl Run {
         if self.finished.is_none() {
             let a = self.auditor.take().ok_or("the audit is finished")?;
             let (state, mut r) = a.finish();
-            // As the CLI: the dev provider is accepted, and said.
+            // As the CLI: a dev registry is a problem, a warning in a trial.
             for (id, reg) in &state.registries {
                 if reg.current().eligibility.provider == "dev" {
-                    r.warnings.push(format!("registry {id} takes the dev provider: anyone may register"));
+                    let w = format!("registry {id} takes the dev provider: anyone may register");
+                    if self.asked.allow_dev { r.warnings.push(w) } else { r.problems.push(w) }
                 }
             }
             self.finished = Some((state, r));
