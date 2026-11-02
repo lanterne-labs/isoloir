@@ -1714,10 +1714,12 @@ dependencies = [
 name = "isoloir-zk"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "hex",
  "isoloir-core",
  "isoloir-decrypt",
  "isoloir-proto",
+ "isoloir-wasm",
  "rand 0.8.8",
  "serde_json",
  "tempfile",

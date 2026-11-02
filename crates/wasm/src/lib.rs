@@ -5,6 +5,7 @@
 //! are all here, in the same Rust the ingest and the auditor run.
 
 pub mod api;
+pub mod audit;
 #[cfg(feature = "dev")]
 pub mod dev;
 pub mod link;
@@ -36,6 +37,57 @@ mod bind {
         } else {
             Err(JsError::new(&format!("{what}: a non-negative integer")))
         }
+    }
+
+    // The audit (audit.rs): runs kept by id between calls.
+    thread_local! {
+        static RUNS: std::cell::RefCell<(u32, std::collections::HashMap<u32, crate::audit::Run>)> = Default::default();
+    }
+
+    /// Starts an audit pass; `log_key` "" for the key the log names. Returns its id.
+    #[wasm_bindgen]
+    pub fn audit_start(log_key: &str, verdicts_json: &str) -> Result<u32, JsError> {
+        let run = crate::audit::Run::new((!log_key.is_empty()).then_some(log_key), verdicts_json).map_err(|e| JsError::new(&e))?;
+        Ok(RUNS.with(|r| {
+            let mut r = r.borrow_mut();
+            r.0 += 1;
+            let id = r.0;
+            r.1.insert(id, run);
+            id
+        }))
+    }
+
+    fn with_run<T>(id: u32, f: impl FnOnce(&mut crate::audit::Run) -> api::R<T>) -> Result<T, JsError> {
+        RUNS.with(|r| match r.borrow_mut().1.get_mut(&id) {
+            Some(run) => f(run).map_err(|e| JsError::new(&e)),
+            None => Err(JsError::new(&format!("no audit {id}"))),
+        })
+    }
+
+    /// Feeds one checkpoint (its signed note, its entries file).
+    #[wasm_bindgen]
+    pub fn audit_checkpoint(id: u32, note: &str, entries_json: &str) -> Out {
+        with_run(id, |run| run.checkpoint(note, entries_json))
+    }
+
+    /// Ends the pass: the report.
+    #[wasm_bindgen]
+    pub fn audit_finish(id: u32) -> Out {
+        with_run(id, |run| run.finish())
+    }
+
+    /// The relays' events against the finished pass: the problems.
+    #[wasm_bindgen]
+    pub fn audit_relays(id: u32, events_json: &str) -> Out {
+        with_run(id, |run| run.relays(events_json))
+    }
+
+    /// Forgets a pass.
+    #[wasm_bindgen]
+    pub fn audit_drop(id: u32) {
+        RUNS.with(|r| {
+            r.borrow_mut().1.remove(&id);
+        });
     }
 
     #[wasm_bindgen]

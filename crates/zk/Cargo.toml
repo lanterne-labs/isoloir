@@ -17,3 +17,5 @@ rand.workspace = true
 
 [dev-dependencies]
 isoloir-decrypt.workspace = true
+isoloir-wasm = { path = "../wasm" }
+base64 = "0.22"

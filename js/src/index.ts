@@ -46,4 +46,5 @@ export { IsoloirError, toIsoloirError, reasonOf, type IsoloirErrorCode, type Ses
 export { prfInput, prfCapability, createPrf, assertPrf, backupState, type CredentialsApi, type PasskeyOptions } from './passkey.js';
 export { WorkerProver, LocalProver, proveHere, type Prover, type ProofResult, type ArtifactLoader, type WorkerLike, type WorkerRequest, type WorkerResponse } from './prover.js';
 export { ServerClock } from './events.js';
+export { audit, bbVerifier, zkPassportVerifier, type AuditOptions, type AuditResult, type AuditReport, type AuditProgress, type AuditPhase, type AuditRequest, type ZkPassportSdk, type AuditWasm } from './audit.js';
 export type * from './types.js';

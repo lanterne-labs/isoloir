@@ -107,6 +107,15 @@ the spec.
 - From the log, the relays and the mirror, the audit recomputes every
   signature, proof, tree, tally, refusal and stamp (§16). A check that
   cannot run is a failure, not a pass.
+- The same audit runs in a browser (`audit` of `@isoloir/web`): the
+  wasm core replays the log with the same judge, the page checks the
+  ballot proofs with bb.js against the mirror's verification keys and
+  the passport proofs with the ZKPassport SDK (the registry roots read
+  on Ethereum through a public endpoint), then compares the relays'
+  copies with the log. The judge's verifiers are synchronous, so the
+  log is read twice: the first pass collects the proofs, the second
+  replays with the verdicts. Not in the browser yet: the Bitcoin
+  stamps, and tlock tallies (reported as not checked).
 - §17 tabulates what each party learns: the public, the ingest, the
   authority, a relay, the mirror host, a network observer.
 

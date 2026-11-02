@@ -72,6 +72,10 @@ isoloir audit --mirror mirror --log-key "…" --relays --skip-passports
 Run it from the repository root (`circuits/` is where variants are
 built from); create the database first.
 
+Anyone can also audit from a web page: `audit()` of `@isoloir/web` runs
+the same replay in the browser, with `bbVerifier` for the ballot proofs
+and `zkPassportVerifier` for the passports (DESIGN §1.7).
+
 The setup files are JSON bodies as SPEC §4.1, §5 and §7 show
 (`provider: "dev"` for a trial registry). `crates/server/tests/ingest.rs`
 and `crates/zk/tests/e2e.rs` do the same in code.
