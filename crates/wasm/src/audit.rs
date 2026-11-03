@@ -21,7 +21,7 @@ use isoloir_proto::body::{CircuitRef, Eligibility, EntryKind};
 use isoloir_proto::judge::{Checkers, Passports, Proofs};
 use isoloir_proto::state::State;
 use serde_json::{json, Value};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 /// A verdict the page gives back for a request.
@@ -39,6 +39,35 @@ struct Asked {
     requests: RefCell<Vec<Value>>,
     /// The dev provider accepted (a local trial); else its registrations are refused.
     allow_dev: bool,
+    /// Records no request (a replay that only builds the state, Run::quiet).
+    quiet: Cell<bool>,
+}
+
+impl Asked {
+    fn ask(&self, r: Value) {
+        if !self.quiet.get() {
+            self.requests.borrow_mut().push(r);
+        }
+    }
+}
+
+/// The verdicts the page gives (`{key: {type, ok | uid | error}}`).
+fn answers_of(verdicts_json: &str) -> R<HashMap<String, Answer>> {
+    let v: HashMap<String, Value> = serde_json::from_str(verdicts_json).map_err(err)?;
+    let mut out = HashMap::new();
+    for (k, a) in v {
+        let answer = if let Some(e) = a.get("error").and_then(Value::as_str) {
+            if a.get("type").and_then(Value::as_str) == Some("passport") { Answer::Passport(Err(e.into())) } else { Answer::Proof(Err(e.into())) }
+        } else if let Some(ok) = a.get("ok").and_then(Value::as_bool) {
+            Answer::Proof(Ok(ok))
+        } else if a.get("type").and_then(Value::as_str) == Some("passport") {
+            Answer::Passport(Ok(a.get("uid").and_then(Value::as_str).map(String::from)))
+        } else {
+            return Err(format!("verdict {k}: neither ok, uid nor error"));
+        };
+        out.insert(k, answer);
+    }
+    Ok(out)
 }
 
 const PENDING: &str = "pending: verified in the page";
@@ -62,7 +91,7 @@ impl Proofs for Asked {
         if let Some(Answer::Proof(a)) = self.answers.borrow().get(&key) {
             return a.clone();
         }
-        self.requests.borrow_mut().push(json!({
+        self.ask(json!({
             "key": key,
             "type": "proof",
             "circuit": circuit.name,
@@ -89,7 +118,7 @@ impl Passports for Asked {
         let mut r = req;
         r["key"] = json!(key);
         r["type"] = json!("passport");
-        self.requests.borrow_mut().push(r);
+        self.ask(r);
         Err(PENDING.into())
     }
 }
@@ -106,25 +135,66 @@ impl Run {
     /// first); `allow_dev` accepts the dev provider (a local trial).
     pub fn new(log_key: Option<&str>, verdicts_json: &str, allow_dev: bool) -> R<Run> {
         let asked: &'static Asked = Box::leak(Box::new(Asked { allow_dev, ..Default::default() }));
-        let v: HashMap<String, Value> = serde_json::from_str(verdicts_json).map_err(err)?;
-        let mut answers = asked.answers.borrow_mut();
-        for (k, a) in v {
-            let answer = if let Some(e) = a.get("error").and_then(Value::as_str) {
-                if a.get("type").and_then(Value::as_str) == Some("passport") { Answer::Passport(Err(e.into())) } else { Answer::Proof(Err(e.into())) }
-            } else if let Some(ok) = a.get("ok").and_then(Value::as_bool) {
-                Answer::Proof(Ok(ok))
-            } else if a.get("type").and_then(Value::as_str) == Some("passport") {
-                Answer::Passport(Ok(a.get("uid").and_then(Value::as_str).map(String::from)))
-            } else {
-                return Err(format!("verdict {k}: neither ok, uid nor error"));
-            };
-            answers.insert(k, answer);
-        }
-        drop(answers);
+        asked.answers.borrow_mut().extend(answers_of(verdicts_json)?);
         // The tlock opener needs drand: not in the page (a tlock tally is
         // then reported as not checked).
         let auditor = Auditor::new(log_key, Checkers { proofs: asked, passports: asked, tlock: None })?;
         Ok(Run { asked, auditor: Some(auditor), finished: None })
+    }
+
+    /// A replay that only builds the state (a complaint judged against the
+    /// log, SPEC §11.3): the proofs of the logged entries are not asked for.
+    pub fn quiet(&mut self, on: bool) {
+        self.asked.quiet.set(on);
+    }
+
+    /// More verdicts (the answers to a rejudge's requests).
+    pub fn answer(&mut self, verdicts_json: &str) -> R<()> {
+        self.asked.answers.borrow_mut().extend(answers_of(verdicts_json)?);
+        Ok(())
+    }
+
+    /// Judges a message again against the state of the checkpoints fed so
+    /// far, as the ingest would have at each of `times` (SPEC §11.3, a
+    /// refusal complained of), without and with `pending` (the entries of
+    /// the next checkpoint, `[{kind, body}]`: messages that may have been
+    /// waiting at the ingest then). Returns `{verdicts: [{time, pending,
+    /// outcome: accepted|rejected|deferred, reason}], requests}`: a proof
+    /// the page has not verified yet is a request, and its verdict
+    /// `deferred` until answered.
+    pub fn rejudge(&mut self, kind: &str, body: &str, times_json: &str, pending_json: &str) -> R<String> {
+        use isoloir_proto::judge::{self, Pending, Verdict};
+        let a = self.auditor.as_ref().ok_or("the audit is finished")?;
+        let kind = EntryKind::parse(kind).ok_or_else(|| format!("kind {kind}"))?;
+        let times: Vec<u64> = serde_json::from_str(times_json).map_err(err)?;
+        let listed: Vec<Value> = serde_json::from_str(pending_json).map_err(err)?;
+        let mut pending = Pending::default();
+        for e in &listed {
+            let k = e["kind"].as_str().and_then(EntryKind::parse).ok_or("pending: kind")?;
+            pending.admit(k, e["body"].as_str().ok_or("pending: body")?.as_bytes());
+        }
+        let quiet = self.asked.quiet.replace(false);
+        let checkers = Checkers { proofs: self.asked, passports: self.asked, tlock: None };
+        let mut verdicts = vec![];
+        let none = Pending::default();
+        for t in &times {
+            for (with, p) in [(false, &none), (true, &pending)] {
+                if with && listed.is_empty() {
+                    continue;
+                }
+                let (outcome, reason) = match judge::judge(&a.state, p, kind, body.as_bytes(), *t, &checkers) {
+                    Verdict::Accept => ("accepted", Value::Null),
+                    Verdict::Reject(r) => ("rejected", json!(r.as_str())),
+                    Verdict::Defer(why) => ("deferred", json!(why)),
+                };
+                verdicts.push(json!({ "time": t, "pending": with, "outcome": outcome, "reason": reason }));
+            }
+        }
+        self.asked.quiet.set(quiet);
+        let mut requests = std::mem::take(&mut *self.asked.requests.borrow_mut());
+        let mut seen = std::collections::HashSet::new();
+        requests.retain(|r| seen.insert(r["key"].to_string()));
+        Ok(json!({ "verdicts": verdicts, "requests": requests }).to_string())
     }
 
     /// Feeds a checkpoint: its signed note and its entries file (the

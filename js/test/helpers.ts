@@ -39,7 +39,9 @@ let uid = 0;
 export function passport(seen?: RegistrationRequest[], fixed?: string, date?: () => number) {
 	return async (req: RegistrationRequest): Promise<PassportProof> => {
 		seen?.push(req);
-		return { uid: fixed ?? `P${++uid}`, proof: { dev: true, custom_data: req.customData }, proofDate: date ? date() : Math.floor(Date.now() / 1000) };
+		// The dev provider's bundle names the passport (SPEC §5).
+		const id = fixed ?? `P${++uid}`;
+		return { uid: id, proof: { dev: true, uid: id, custom_data: req.customData }, proofDate: date ? date() : Math.floor(Date.now() / 1000) };
 	};
 }
 

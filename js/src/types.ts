@@ -182,6 +182,32 @@ export interface Ack {
 	checkpoint?: number;
 }
 
+/**
+ * A complaint as read (SPEC §11.3): the ingest's signed ack and the body
+ * it answered. `dropped`: the ack accepted the body, which must then be
+ * in the checkpoint it names; `wrong_refusal`: the ack refused it, and the
+ * body judged again against the log must be refused too.
+ */
+export interface ComplaintClaim {
+	claim: 'dropped' | 'wrong_refusal';
+	/** The kind of message the body is. */
+	kind: 'register' | 'ballot' | 'tally' | 'unknown';
+	/** The body's hash, as the ack names it. */
+	hash: Hex;
+	/** The body, canonical: what the ingest was sent. */
+	body: string;
+	ack: Ack;
+	ack_event: NostrEvent;
+	/** The key that signed the ack. */
+	ingest: string;
+	/** The ack's time (rounded down to the minute): when the ingest judged. */
+	time: number;
+	checkpoint: number | null;
+	reason: string | null;
+	/** The signed complaint event, when one was read (null for a bare complaint body). */
+	event: NostrEvent | null;
+}
+
 /** One entry of a checkpoint on the mirror (SPEC §15). */
 export interface Entry {
 	seq: number;

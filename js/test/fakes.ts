@@ -200,6 +200,8 @@ export class FakeIngest {
 	readonly withhold = new Set<string>();
 	/** Judges nothing (an ingest that is down). */
 	silent = false;
+	/** Refuses the next valid message with this reason. */
+	refuseNext: string | null = null;
 
 	/** Envelopes the direct endpoint took while the ingest was silent. */
 	readonly backlog: NostrEvent[] = [];
@@ -322,7 +324,12 @@ export class FakeIngest {
 		const hash = core.bodyHash(e.content);
 		// The same body under another envelope: the same outcome (crates/server/src/ingest.rs).
 		const before = this.accepted.get(hash);
-		const reason = before !== undefined ? null : kind === 'register' ? this.checkRegister(e.content) : this.checkBallot(e.content);
+		let reason = before !== undefined ? null : kind === 'register' ? this.checkRegister(e.content) : this.checkBallot(e.content);
+		// A wrong refusal (a dishonest or broken ingest): the next valid message is refused anyway.
+		if (!reason && before === undefined && this.refuseNext) {
+			reason = this.refuseNext;
+			this.refuseNext = null;
+		}
 		const ack = reason
 			? { v: 1, of: e.id, hash, outcome: 'rejected', reason }
 			: { v: 1, of: e.id, hash, outcome: 'accepted', checkpoint: before ?? this.index + 1 };
@@ -447,8 +454,7 @@ export class FakeIngest {
 			.map((p) => {
 				const l = this.ballotLeaves.get(p.id) ?? [];
 				return { poll: p.id, size: l.length, root: core.treeRoot(p.ballot_depth!, l) };
-			})
-			.filter((b) => b.size > 0);
+			});
 		// A new ingest names the pushed commit and the checkpoint it covers; the old one named nothing here.
 		const mirrorLine = this.version === 'new' && !this.opts.noMirror ? `c${Math.max(this.index - this.mirrorLag, 1)}:${Math.max(this.index - this.mirrorLag, 1)}` : null;
 		const cp = { origin: ORIGIN, size: this.seq, root: this.proof(0, this.seq).root, index: this.index, time: this.now(), registries: [{ id: 1, size: this.leaves.length, root: regRoot }], ballots, mirror: mirrorLine };

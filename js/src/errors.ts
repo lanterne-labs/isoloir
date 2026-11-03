@@ -78,6 +78,8 @@ export type SessionErrorCode =
 	/** A device link code that is not a public key. */
 	| 'bad_link_key'
 	| 'link_expired'
+	/** Not a complaint: its form, the event's or the ack's signature, or an ack of another body (SPEC §11.3). */
+	| 'bad_complaint'
 	| 'stopped';
 
 export type IsoloirErrorCode = SessionErrorCode | IngestReason | `reg:${IngestReason}`;

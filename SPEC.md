@@ -647,6 +647,26 @@ kept by the voter and posted by the ledger's channels (kind 27106) to
 whoever listens; anyone can judge it from the log and the ack's
 signature.
 
+The kind is ephemeral: a relay keeps no complaint, so the voter keeps
+the signed event (its id, the throwaway key, the body above) and hands
+it on whole, as a file or as the base64url (no padding) of its JSON,
+for example in a link fragment `#c=<base64url>`. Judging it:
+
+- **form**: the event's id and signature, the complaint body (`v`,
+  `ack`, `body`, nothing else), the ack an ack event (27102, or 7102)
+  signed by a key the ledger's setups named as `ingest`, its `e` tag its
+  `of`, its `hash` the SHA-256 of the canonical body;
+- **dropped** (an `accepted` ack naming checkpoint N): it holds when the
+  entries of N lack the body (logged late when a later checkpoint holds
+  it), fails when they hold it, and waits while the mirror does not
+  cover N;
+- **wrong refusal** (a `rejected` ack): the body is judged again (§9.3,
+  §6) against the log of the checkpoints up to the ack's `created_at`,
+  at the first and the last second of that minute, without and with the
+  entries of the next checkpoint as messages pending then. It holds when
+  every judgment accepts the body, fails when every one refuses it, and
+  is undecided when they differ.
+
 A message that is never answered proves nothing afterwards: no third
 party keeps a copy. The device retries on the next channel, `direct`
 last.

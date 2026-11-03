@@ -220,6 +220,24 @@ export class Mirror {
 		return { seq: last.seq, body, text: last.body, checkpoint: last.checkpoint };
 	}
 
+	/** Every version of a setup file, each proven in the log, in order (a ledger's ingest keys over time). */
+	async setupHistory<T>(path: string, kind: string, token = ''): Promise<Setup<T>[]> {
+		const raw = await this.json<{ setups?: Logged[] }>(path, token);
+		if (raw === null || !Array.isArray(raw.setups) || raw.setups.length === 0) throw new IsoloirError('no_setup', `${path}: no setup`);
+		const out: Setup<T>[] = [];
+		for (const s of raw.setups) {
+			await this.prove(s, kind, path);
+			let body: T;
+			try {
+				body = this.core.decodeBody<T>(kind, s.body);
+			} catch (e) {
+				throw new IsoloirError('no_setup', `${path}: ${e instanceof Error ? e.message : String(e)}`);
+			}
+			out.push({ seq: s.seq, body, text: s.body, checkpoint: s.checkpoint });
+		}
+		return out;
+	}
+
 	/** The first `size` leaves of a sharded tree file set. */
 	async leaves(dir: string, size: number, token = ''): Promise<string[]> {
 		const out: string[] = [];

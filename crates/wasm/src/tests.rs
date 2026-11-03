@@ -361,3 +361,31 @@ fn kinds_and_acks_of_both_ranges() {
     let e = api::sign_event(&ingest, 100, 27101, r#"[["e","abcd"]]"#, ack).unwrap();
     assert!(api::read_ack(&e, &pk).is_err());
 }
+
+#[test]
+fn complaints_are_read_with_their_ack_and_body() {
+    let ingest = api::new_reg_secret();
+    let pk = api::reg_pubkey(&ingest).unwrap();
+    let body = r#"{"poll":7,"v":1}"#;
+    let hash = api::body_hash(body);
+    let ack = json!({"v": 1, "of": "ab".repeat(32), "hash": hash, "outcome": "accepted", "checkpoint": 4});
+    let ack_ev = api::sign_event(&ingest, 120, crate::KIND_ACK, &json!([["e", "ab".repeat(32)]]).to_string(), &isoloir_core::canonical::to_string(&ack).unwrap()).unwrap();
+    let content = api::complaint_body(&ack_ev, body).unwrap();
+    let ev = api::sign_event("", 180, crate::KIND_COMPLAINT, r#"[["t","isoloir/1/x"]]"#, &content).unwrap();
+    let keys = json!([pk]).to_string();
+    let c = v(&api::read_complaint(&ev, &keys).unwrap());
+    assert_eq!((c["claim"].clone(), c["checkpoint"].clone(), c["hash"].clone(), c["time"].clone()), (json!("dropped"), json!(4), json!(hash), json!(120)));
+    // The bare body reads too; a legacy complaint kind is a complaint.
+    assert_eq!(v(&api::read_complaint(&content, &keys).unwrap())["event"], Value::Null);
+    let legacy = api::sign_event("", 180, crate::KIND_COMPLAINT - crate::LEGACY_OFFSET, "[]", &content).unwrap();
+    assert!(api::read_complaint(&legacy, &keys).is_ok());
+    // Another ingest, another body, another kind, a broken signature.
+    assert!(api::read_complaint(&ev, &json!(["cd".repeat(32)]).to_string()).unwrap_err().contains("ingest"));
+    let other = api::complaint_body(&ack_ev, r#"{"poll":8,"v":1}"#).unwrap();
+    assert!(api::read_complaint(&other, &keys).unwrap_err().contains("another body"));
+    let ballot_kind = api::sign_event("", 180, crate::KIND_BALLOT, "[]", &content).unwrap();
+    assert!(api::read_complaint(&ballot_kind, &keys).is_err());
+    let mut broken = v(&ev);
+    broken["content"] = json!(other);
+    assert!(api::read_complaint(&broken.to_string(), &keys).unwrap_err().contains("signature"));
+}

@@ -630,6 +630,85 @@ pub fn complaint_body(ack_event_json: &str, body_text: &str) -> R<String> {
     canonical::to_string(&json!({ "v": 1, "ack": e, "body": b })).map_err(err)
 }
 
+/// Reads a complaint (SPEC §11.3): the signed event that carries it (kind
+/// 27106, or 7106 from an earlier client), or the complaint body itself.
+/// Checks the event's id and signature, the body's form, the ack (an ack
+/// event signed by one of `ingest_keys`, JSON list; empty: any key, the
+/// caller checks it), that the ack names the body's hash, and the kind
+/// of the message the body is. Returns `{claim, kind, hash, body, ack,
+/// ack_event, ingest, time, checkpoint, reason, event}`: `claim` is
+/// `dropped` (an accepted ack: the body must be in the checkpoint it
+/// names) or `wrong_refusal` (a rejected ack: the body, judged again, must
+/// be refused); `time` is the ack's minute.
+pub fn read_complaint(text: &str, ingest_keys_json: &str) -> R<String> {
+    let v: Value = parse(text, "complaint")?;
+    let keys: Vec<String> = parse(ingest_keys_json, "ingest keys")?;
+    let (content, event) = if v.get("ack").is_some() {
+        (text.to_string(), Value::Null)
+    } else {
+        let e: sig::Event = serde_json::from_value(v.clone()).map_err(|e| format!("not a complaint event: {e}"))?;
+        if !crate::is_kind(e.kind, crate::KIND_COMPLAINT) {
+            return Err(format!("kind {}: not a complaint", e.kind));
+        }
+        if !e.verify() {
+            return Err("the complaint event's id or signature does not verify".into());
+        }
+        (e.content.clone(), v)
+    };
+    let c = canonical::parse(content.as_bytes()).map_err(|_| "the complaint is not canonical JSON")?;
+    if c.get("v").and_then(Value::as_u64) != Some(1) {
+        return Err("a complaint of an unknown version".into());
+    }
+    let obj = c.as_object().ok_or("the complaint is not an object")?;
+    if obj.len() != 3 || !obj.contains_key("ack") || !obj.contains_key("body") {
+        return Err("a complaint is {v, ack, body}".into());
+    }
+    let ack_event: sig::Event = serde_json::from_value(c["ack"].clone()).map_err(|e| format!("the ack is not an event: {e}"))?;
+    if !crate::is_kind(ack_event.kind, crate::KIND_ACK) {
+        return Err(format!("kind {}: the ack is not an ack", ack_event.kind));
+    }
+    if !keys.is_empty() && !keys.contains(&ack_event.pubkey) {
+        return Err("the ack is not signed by the ledger's ingest".into());
+    }
+    if !ack_event.verify() {
+        return Err("the ack's signature does not verify".into());
+    }
+    let ack = body::decode_ack(ack_event.content.as_bytes()).map_err(|r| format!("the ack: {}", r.as_str()))?;
+    if ack_event.tag("e") != Some(ack.of.as_str()) {
+        return Err("the ack's e tag is not the event it acknowledges".into());
+    }
+    let body_text = canonical::to_string(&c["body"]).map_err(err)?;
+    let hash = encoding::body_hash(body_text.as_bytes());
+    if ack.hash != hash {
+        return Err("the ack names another body".into());
+    }
+    let kind = [EntryKind::Register, EntryKind::Ballot, EntryKind::Tally]
+        .into_iter()
+        .find(|k| body::decode(*k, body_text.as_bytes()).is_ok())
+        .map(|k| k.as_str())
+        .unwrap_or("unknown");
+    let claim = match ack.outcome {
+        body::Outcome::Accepted => "dropped",
+        body::Outcome::Rejected => "wrong_refusal",
+    };
+    if claim == "dropped" && ack.checkpoint.is_none() {
+        return Err("an accepted ack without its checkpoint".into());
+    }
+    Ok(out(&json!({
+        "claim": claim,
+        "kind": kind,
+        "hash": hash,
+        "body": body_text,
+        "ack": ack,
+        "ack_event": ack_event,
+        "ingest": ack_event.pubkey,
+        "time": ack_event.created_at,
+        "checkpoint": ack.checkpoint,
+        "reason": ack.reason.map(|r| r.as_str()),
+        "event": event,
+    })))
+}
+
 // ------------------------------------------------------------ tallies
 
 pub(crate) fn tally_of(text: &str) -> R<Tally> {

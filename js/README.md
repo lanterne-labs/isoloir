@@ -76,7 +76,8 @@ await session.init();
 6. **Receipts and complaints.**
    - While something waits, `refresh()` reads the entries of every checkpoint since the post. It runs on a timer, and live checkpoints come from a relay that is neither the registration's nor the ballots'.
    - A note's `mirror <commit>:<index>` names the newest pushed commit and the newest checkpoint it covers. Files are read at that commit; the entries of a later checkpoint are read once a later note covers it, and a ballot is drafted against the roots of the covered checkpoint (`checkpoints/<index>.txt`, verified). Notes of earlier versions (`mirror <commit>`) cover themselves.
-   - A body that is missing from the checkpoint its ack named becomes a complaint. It is posted to the relays, or to the direct endpoint when there are none, and it stays on the device with the signed ack.
+   - A body that is missing from the checkpoint its ack named becomes a complaint. It is posted to the relays, or to the direct endpoint when there are none, and the device keeps it whole (relays keep no copy), see "Complaints" below.
+   - A refusal the voter holds wrong: `await session.complainOfRefusal('registration' | 'ballot')` makes a complaint of the signed rejected ack and the body, keeps it, posts it, and returns it.
 
 7. **Results.** `state.tally` holds the last tally that verified (proven in the log; signature, decryption proofs and values checked). A newer tally that fails is kept apart in `state.tallyUnverified`. A tlock tally never reaches `ok`: the browser only checks its beacon, and the openings are an auditor's job.
 
@@ -89,7 +90,7 @@ Other calls:
   - The sender counts the link as a backup only when its `confirmed` promise resolves to `true`.
 - `state.storage` is `persistent`, `best-effort` or `memory`. The session asks for `navigator.storage.persist()`.
 
-Every error is an `IsoloirError` whose `code` belongs to the `IsoloirErrorCode` union. Some codes carry `data`; for example `bad_words` includes `{ unknown: [3, 8] }`, and `too_soon` includes `{ retryAt, waitSeconds, exact }`. `pow` means the proof of work could not be made. An envelope the ingest drops for its work gets no answer: it shows as `no_ack` once every channel was tried.
+Every error is an `IsoloirError` whose `code` belongs to the `IsoloirErrorCode` union. Some codes carry `data`; for example `bad_words` includes `{ unknown: [3, 8] }`, and `too_soon` includes `{ retryAt, waitSeconds, exact }`. `pow` means the proof of work could not be made, `bad_complaint` that a complaint could not be read. An envelope the ingest drops for its work gets no answer: it shows as `no_ack` once every channel was tried.
 
 ## Envelopes: kinds, channels, proof of work
 
@@ -106,6 +107,37 @@ Acks are read in both ranges, and device links are listened for in both.
 - `state.pow` is `{ bits, state: 'none' | 'mining' | 'ready' }`.
 - The hashing is the wasm core's. It runs in slices of about 8 ms that give the thread back (`pow: { sliceMs, chunk, yieldTo }` to tune), so the page stays responsive.
 - Measured with Node 24 on an Apple M5 Pro, the wasm miner does about 0.16 µs per hash. For d = 16 that is 9 ms on average and 29 ms at the 95th percentile. Assuming a phone 8 times slower, that is 70 ms on average and 0.23 s at the 95th percentile. d = 18 stays under 1 s at the 95th percentile on such a phone.
+
+## Complaints
+
+A complaint (SPEC §11.3) is a signed event (kind 27106) carrying the ingest's signed ack and the body it answered. Relays keep none, so the device keeps each one whole, with the key (across re-votes and reloads):
+- `state.complaints`: every complaint this device made, oldest first (32 kept), as `SavedComplaint` `{ what: 'registration' | 'ballot', poll?, claim: 'dropped' | 'wrong_refusal', checkpoint, at, event, link }`. `link` is the event's base64url: put it in a link fragment (`https://…/complaint#c=${link}`) or a file the voter saves.
+- `state.ballot.complaints` and `state.registration.complaints` still give the ids, and `complaintEvents` the events themselves, for the current records.
+- The `complaint` event gives `{ what, checkpoint, events, complaint }`.
+
+Anyone judges a complaint against the mirror, with no account and no session:
+
+```ts
+import { decodeComplaint, judgeComplaint, jsDelivrSource, loadWasm } from '@isoloir/web';
+
+const wasm = await loadWasm();
+const event = decodeComplaint(location.hash);        // '#c=…', the base64url alone, or the event's JSON
+const v = await judgeComplaint(wasm, event, {
+	mirror: [jsDelivrSource('owner/repo')],
+	verifierKey: 'vote.example/isoloir+1a2b3c4d+AQ…',  // pinned, as for the session
+	verifyProof, verifyPassport                       // only a refusal of a ballot or a registration needs them (audit's verifiers)
+});
+// v.verdict: 'holds' | 'fails' | 'pending' | 'uncertain' | 'unchecked' | 'invalid'; v.detail says why.
+// v.claim: what it claims (claim, kind, body, hash, ack, ack_event, time, checkpoint, reason).
+// v.found: where a "dropped" body is in the log (late: after the checkpoint its ack named).
+// v.rejudged: a refusal's judgments again, at the first and last second of the ack's minute, without and with what was pending.
+```
+
+- **dropped** (an accepted ack): `holds` when the checkpoint the ack named lacks the body (`found.late` when a later one holds it), `fails` when it holds it, `pending` while the mirror does not cover that checkpoint.
+- **wrong_refusal** (a rejected ack): the wasm judge replays the log up to the ack's minute and judges the body again. `holds` when it accepts the body, `fails` when it refuses it (the detail says when the reason differs from the ack's), `uncertain` when the answer depends on the second or on what was pending, `unchecked` when a proof could not be verified.
+- `invalid`: not a complaint of this ledger (its form, a signature, an ack not signed by the ledger's ingest).
+
+`readComplaint(wasm, input, ingestKeys?)` checks the form alone and returns the claim. `encodeComplaint(event)` gives the base64url.
 
 ## The audit
 
