@@ -142,17 +142,6 @@ pub fn relay_ranking(s: &str, urls_json: &str) -> R<String> {
     Ok(out(&json!(scored.into_iter().map(|(_, u)| u).collect::<Vec<_>>())))
 }
 
-/// The proof of work of an envelope (SPEC §11.1): a nonce for the
-/// envelope's key (x-only hex) and a time, `bits` zero bits. Done in the
-/// background while the ballot is proved; the tag is `["pow", t, nonce]`.
-pub fn pow_nonce(origin: &str, pubkey_hex: &str, t: u64, bits: u32) -> R<String> {
-    if bits > 32 {
-        return Err("at most 32 bits".into());
-    }
-    bytes32(pubkey_hex, "public key")?;
-    Ok(out(&json!(isoloir_proto::pow::solve(origin, &pubkey_hex.to_lowercase(), t, bits))))
-}
-
 // ------------------------------------------------------- registration
 
 /// A fresh registration key: a secp256k1 secret, hex.
@@ -520,8 +509,23 @@ pub fn root_of(leaf: &str, position: u32, path_json: &str) -> R<String> {
 
 // --------------------------------------------------------- checkpoints
 
+/// A note's `mirror` line (SPEC §4): `mirror <commit>:<index>` names the
+/// newest pushed commit and the newest checkpoint it covers; notes of
+/// earlier versions name one commit, the one of the note's own files
+/// (no index). Returns the commit and the index.
+pub(crate) fn mirror_of(m: Option<&str>) -> (Option<&str>, Option<u64>) {
+    match m {
+        None => (None, None),
+        Some(m) => match m.split_once([' ', ':']) {
+            Some((c, i)) => (Some(c), i.parse().ok()),
+            None => (Some(m), None),
+        },
+    }
+}
+
 pub(crate) fn checkpoint_json(c: &Checkpoint) -> Value {
     use base64::Engine;
+    let (commit, mirror_index) = mirror_of(c.mirror.as_deref());
     json!({
         "origin": c.origin,
         "size": c.size,
@@ -530,7 +534,8 @@ pub(crate) fn checkpoint_json(c: &Checkpoint) -> Value {
         "time": c.time,
         "registries": c.registries.iter().map(|(id, n, r)| json!({ "id": id, "size": n, "root": hexf(r) })).collect::<Vec<_>>(),
         "ballots": c.ballots.iter().map(|(id, n, r)| json!({ "poll": id, "size": n, "root": hexf(r) })).collect::<Vec<_>>(),
-        "mirror": c.mirror,
+        "mirror": commit,
+        "mirror_index": mirror_index,
     })
 }
 
@@ -596,11 +601,12 @@ pub fn decode_ack(content: &str) -> R<String> {
     serde_json::to_string(&a).map_err(err)
 }
 
-/// Reads an ack event: of kind 7102, signed by the ingest's key, its
+/// Reads an ack event: of kind 27102 (or 7102, the answer to a legacy
+/// envelope), signed by the ingest's key, its
 /// content an ack. Returns the ack.
 pub fn read_ack(event_json: &str, ingest_pubkey: &str) -> R<String> {
     let e: sig::Event = parse(event_json, "event")?;
-    if e.kind != crate::KIND_ACK {
+    if !crate::is_kind(e.kind, crate::KIND_ACK) {
         return Err(format!("kind {}: not an ack", e.kind));
     }
     if e.pubkey != ingest_pubkey {

@@ -9,17 +9,26 @@ pub mod audit;
 #[cfg(feature = "dev")]
 pub mod dev;
 pub mod link;
+pub mod pow;
 pub mod results;
 pub mod words;
 
-/// The Nostr kinds of SPEC §11.1.
-pub const KIND_REGISTER: u32 = 7100;
-pub const KIND_BALLOT: u32 = 7101;
-pub const KIND_ACK: u32 = 7102;
-pub const KIND_CHECKPOINT: u32 = 7103;
-pub const KIND_LINK: u32 = 7104;
-pub const KIND_TALLY: u32 = 7105;
-pub const KIND_COMPLAINT: u32 = 7106;
+/// The Nostr kinds of SPEC §11.1: ephemeral (NIP-16), relays keep none.
+pub const KIND_REGISTER: u32 = 27100;
+pub const KIND_BALLOT: u32 = 27101;
+pub const KIND_ACK: u32 = 27102;
+pub const KIND_CHECKPOINT: u32 = 27103;
+pub const KIND_LINK: u32 = 27104;
+pub const KIND_TALLY: u32 = 27105;
+pub const KIND_COMPLAINT: u32 = 27106;
+/// The kinds of clients written before (7100–7106, stored by relays): an
+/// ingest of this version still reads them and answers in the same range.
+pub const LEGACY_OFFSET: u32 = 20000;
+
+/// Whether `k` is `kind` in either range.
+pub fn is_kind(k: u32, kind: u32) -> bool {
+    k == kind || k + LEGACY_OFFSET == kind
+}
 
 mod bind {
     use crate::{api, link, words};
@@ -90,15 +99,33 @@ mod bind {
         api::protocol()
     }
 
-    /// The Nostr kinds: `{register, ballot, ack, checkpoint, link, tally, complaint}`.
+    /// The Nostr kinds: `{register, ballot, ack, checkpoint, link, tally,
+    /// complaint}` (ephemeral) and `legacy`, the same names in 7100–7106.
     #[wasm_bindgen]
     pub fn kinds() -> String {
-        serde_json::json!({
-            "register": crate::KIND_REGISTER, "ballot": crate::KIND_BALLOT, "ack": crate::KIND_ACK,
-            "checkpoint": crate::KIND_CHECKPOINT, "link": crate::KIND_LINK, "tally": crate::KIND_TALLY,
-            "complaint": crate::KIND_COMPLAINT,
-        })
-        .to_string()
+        let set = |o: u32| {
+            serde_json::json!({
+                "register": crate::KIND_REGISTER - o, "ballot": crate::KIND_BALLOT - o, "ack": crate::KIND_ACK - o,
+                "checkpoint": crate::KIND_CHECKPOINT - o, "link": crate::KIND_LINK - o, "tally": crate::KIND_TALLY - o,
+                "complaint": crate::KIND_COMPLAINT - o,
+            })
+        };
+        let mut k = set(0);
+        k["legacy"] = set(crate::LEGACY_OFFSET);
+        k.to_string()
+    }
+
+    /// The first nonce in `start … start + count − 1` whose work has `bits`
+    /// leading zero bits (SPEC §11.1), or "" when none does.
+    #[wasm_bindgen]
+    pub fn pow_mine(origin: &str, pubkey: &str, t: f64, bits: u32, start: f64, count: u32) -> Result<String, JsError> {
+        Ok(crate::pow::mine(origin, pubkey, u64_of(t, "t")?, bits, u64_of(start, "start")?, count).unwrap_or_default())
+    }
+
+    /// Whether a nonce does the work of `bits` bits for a key and a time.
+    #[wasm_bindgen]
+    pub fn pow_check(origin: &str, pubkey: &str, t: f64, nonce: &str, bits: u32) -> Result<bool, JsError> {
+        Ok(crate::pow::check(origin, pubkey, u64_of(t, "t")?, nonce, bits))
     }
 
     #[wasm_bindgen]
@@ -175,12 +202,6 @@ mod bind {
     #[wasm_bindgen]
     pub fn relay_ranking(s: &str, urls_json: &str) -> Out {
         js(api::relay_ranking(s, urls_json))
-    }
-
-    /// A proof-of-work nonce for an envelope key and a time (SPEC §11.1).
-    #[wasm_bindgen]
-    pub fn pow_nonce(origin: &str, pubkey: &str, t: u64, bits: u32) -> Out {
-        js(api::pow_nonce(origin, pubkey, t, bits))
     }
 
     #[wasm_bindgen]
