@@ -1,4 +1,5 @@
-# Deploys main to the Railway service `ingest` (the ledger) on every push,
+# Deploys main to the Railway services `ingest` (the ledger) and `tally`
+# (the authority: the same image, its start command set on the service) on every push,
 # with a project token (RAILWAY_TOKEN, production environment).
 name: deploy
 
@@ -21,3 +22,7 @@ jobs:
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
         run: railway up --service ingest --ci
+      - name: railway up tally
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: railway up --service tally --ci
