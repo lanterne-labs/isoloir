@@ -513,13 +513,21 @@ async fn compact_migration_on_earlier_rows() {
     sqlx::query("INSERT INTO isoloir_submissions (kind, body, submitted, status) VALUES ('poll', 'a', 1, 'logged'), ('poll', 'b', 1, 'pending')").execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO isoloir_refused (event_id, checkpoint, entry, listed, body) VALUES ('x', 1, 'r1', true, 'junk'), ('y', 1, 'r2', false, 'junk')").execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO isoloir_log (seq, kind, body, hash, checkpoint) VALUES (0, 'ledger', '{\"v\":1}', 'h', 1)").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO isoloir_pending (event_id, kind, body, hash, relay, received, outcome, reason) VALUES ('p1', 'ballot', 'b1', 'h1', 'wss://a', 5, 'rejected', 'stale_seq'), ('p2', 'ballot', 'b2', 'h2', 'wss://a', 6, 'accepted', NULL)").execute(&pool).await.unwrap();
     let store = Store::connect(&url).await.unwrap();
     let subs: Vec<Option<Vec<u8>>> = sqlx::query_scalar("SELECT body FROM isoloir_submissions ORDER BY id").fetch_all(&store.pool).await.unwrap();
     assert_eq!(subs, vec![None, Some(b"b".to_vec())]);
     assert_eq!(store.submissions().await.unwrap().len(), 1);
-    assert_eq!(store.summed(1).await.unwrap(), vec![b"r2".to_vec()]);
+    let entries: Vec<Option<Vec<u8>>> = sqlx::query_scalar("SELECT entry FROM isoloir_refused WHERE event_id IN ('x', 'y') ORDER BY event_id").fetch_all(&store.pool).await.unwrap();
+    assert_eq!(entries, vec![None, Some(b"r2".to_vec())]);
+    let received: Vec<Option<i64>> = sqlx::query_scalar("SELECT received FROM isoloir_refused WHERE event_id IN ('x', 'y')").fetch_all(&store.pool).await.unwrap();
+    assert!(received.iter().all(Option::is_none), "no checkpoint 1 in this database: no time");
     assert_eq!(store.refused_body("x").await.unwrap(), Some(Some(b"junk".to_vec())));
     assert_eq!(store.entries().await.unwrap()[0].2, b"{\"v\":1}".to_vec());
+    // 0004: a refused message an earlier ingest left pending is a refusal now.
+    assert_eq!(store.pending().await.unwrap().iter().map(|r| r.event_id.as_str()).collect::<Vec<_>>(), vec!["p2"]);
+    assert_eq!(store.refused_body("p1").await.unwrap(), Some(Some(b"b1".to_vec())));
+    assert_eq!(store.purge_refused(6).await.unwrap(), 1);
 }
 
 struct Yes;

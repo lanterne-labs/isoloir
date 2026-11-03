@@ -77,12 +77,6 @@ mod bind {
         with_run(id, |run| run.finish())
     }
 
-    /// The relays' events against the finished pass: the problems.
-    #[wasm_bindgen]
-    pub fn audit_relays(id: u32, events_json: &str) -> Out {
-        with_run(id, |run| run.relays(events_json))
-    }
-
     /// Forgets a pass.
     #[wasm_bindgen]
     pub fn audit_drop(id: u32) {
@@ -181,6 +175,12 @@ mod bind {
     #[wasm_bindgen]
     pub fn relay_ranking(s: &str, urls_json: &str) -> Out {
         js(api::relay_ranking(s, urls_json))
+    }
+
+    /// A proof-of-work nonce for an envelope key and a time (SPEC §11.1).
+    #[wasm_bindgen]
+    pub fn pow_nonce(origin: &str, pubkey: &str, t: u64, bits: u32) -> Out {
+        js(api::pow_nonce(origin, pubkey, t, bits))
     }
 
     #[wasm_bindgen]

@@ -15,6 +15,7 @@ pub mod log;
 pub mod matrix;
 pub mod note;
 pub mod policy;
+pub mod pow;
 
 pub mod sig;
 pub mod state;

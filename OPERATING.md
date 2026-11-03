@@ -102,15 +102,13 @@ needed: any authority (or anyone) opens them at the round with
 
 ```sh
 isoloir audit --mirror https://… --circuits ./circuits-vk --zkverifier ./zkverifier/verify.mjs \
-  --log-key "<log_key>" --relays --bitcoin --ledger https://<the ingest's HTTP service>
+  --log-key "<log_key>" --bitcoin
 ```
 
 Exit 0 and no `PROBLEM` line. Run it from machines the operator does not
 control, with circuits you built. A proof the audit could not check is a
 problem, never a pass; `--skip-passports` reports every registration as
-unchecked. The log keeps the hash of a refused body, not the body:
-`--relays` judges again the refusals the relays still hold, `--ledger`
-asks the ingest for the others and for the lists of the refusals a
-checkpoint sums up (all checked against the log); what it could get from
-neither is a warning. `--bitcoin` checks the checkpoints' stamps against block
+unchecked. Refusals are not in the log (a refused voter holds the signed
+ack); the `reject` entries of earlier logs are read and counted.
+`--bitcoin` checks the checkpoints' stamps against block
 headers (stamps take hours to be attested).

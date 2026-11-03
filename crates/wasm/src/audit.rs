@@ -16,7 +16,7 @@
 use crate::api::{err, R};
 use base64::Engine as _;
 use isoloir_core::{canonical, encoding};
-use isoloir_proto::audit::{self, Auditor, Report};
+use isoloir_proto::audit::{Auditor, Report};
 use isoloir_proto::body::{CircuitRef, Eligibility, EntryKind};
 use isoloir_proto::judge::{Checkers, Passports, Proofs};
 use isoloir_proto::state::State;
@@ -165,7 +165,7 @@ impl Run {
         }
         let (state, r) = self.finished.as_ref().unwrap();
         let mut out = report_json(r);
-        // Where to read the relays' copies, and each poll's last tally.
+        // The ledger, and each poll's last tally.
         if let Some(l) = state.ledger() {
             out["ledger"] = json!({
                 "origin": l.origin,
@@ -183,16 +183,6 @@ impl Run {
             .into();
         Ok(out.to_string())
     }
-
-    /// Withholding (SPEC §11.3): the events the relays hold for this
-    /// ledger (after `finish`). Returns the problems found.
-    pub fn relays(&self, events_json: &str) -> R<String> {
-        let (state, _) = self.finished.as_ref().ok_or("finish the audit first")?;
-        let l = state.ledger().ok_or("no ledger")?;
-        let events: Vec<isoloir_proto::sig::Event> = serde_json::from_str(events_json).map_err(err)?;
-        let problems = audit::check_relays(state, &events, &l.ingest, 2 * l.checkpoint_period + 60);
-        Ok(json!(problems).to_string())
-    }
 }
 
 fn report_json(r: &Report) -> Value {
@@ -205,8 +195,5 @@ fn report_json(r: &Report) -> Value {
         "ballots": r.ballots,
         "rejects": r.rejects,
         "tallies": r.tallies,
-        "summarized": r.summarized,
-        "unjudged": r.unjudged,
-        "unlisted": r.unlisted,
     })
 }

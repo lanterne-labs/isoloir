@@ -259,17 +259,8 @@ impl Store {
         Ok(sqlx::query("DELETE FROM isoloir_refused WHERE received < $1").bind(before).execute(&self.pool).await?.rows_affected())
     }
 
-    /// The refusals a checkpoint's `rejects` entry sums up: their `reject`
-    /// bodies, in body-hash order (its leaves).
-    pub async fn summed(&self, idx: u64) -> anyhow::Result<Vec<Vec<u8>>> {
-        let rows = sqlx::query("SELECT entry FROM isoloir_refused WHERE checkpoint = $1 AND NOT listed").bind(idx as i64).fetch_all(&self.pool).await?;
-        let mut v: Vec<Vec<u8>> = rows.iter().map(|r| r.get("entry")).collect();
-        v.sort_by_cached_key(|b| isoloir_core::encoding::body_hash(b));
-        Ok(v)
-    }
-
-    /// A refused message's body: None when the ledger has no such refusal,
-    /// Some(None) when it was over the size limit and not kept.
+    /// A refused message's body (debugging): None when there is no such
+    /// refusal, Some(None) when it was over the size limit and not kept.
     pub async fn refused_body(&self, event_id: &str) -> anyhow::Result<Option<Option<Vec<u8>>>> {
         let r = sqlx::query("SELECT body, packed FROM isoloir_refused WHERE event_id = $1").bind(event_id).fetch_optional(&self.pool).await?;
         r.map(|r| match r.get::<Option<Vec<u8>>, _>("body") {
