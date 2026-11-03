@@ -6,6 +6,8 @@ name: deploy
 on:
   push:
     branches: [main]
+    # a change to the documentation alone deploys nothing
+    paths-ignore: ['**.md', 'docs/**']
   workflow_dispatch:
 
 concurrency:

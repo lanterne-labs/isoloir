@@ -1,18 +1,25 @@
 # isoloir
 
-Anonymous polls with passport eligibility: prove once, with a passport,
-that you may vote; vote anonymously and encrypted; let anyone recount
-from a public log. No blockchain needed: messages travel by the channels
-the ledger declares (public Nostr relays, the ingest's own HTTP endpoint,
-or both), results are files on a static mirror, checkpoints are
-timestamped in Bitcoin.
+**Anonymous polls with passport eligibility, recountable by anyone.**
+
+Prove once, with a passport, that you may vote. Vote anonymously and
+encrypted. Let anyone recount from a public log. No blockchain needed:
+messages travel by the channels the ledger declares (public Nostr relays,
+the ingest's own HTTP endpoint, or both), results are files on a static
+mirror, checkpoints are timestamped in Bitcoin.
 
 An isoloir is the voting booth: the curtain you vote behind, unseen.
 
-- The protocol: [SPEC.md](SPEC.md) (normative).
-- Running a ledger: [OPERATING.md](OPERATING.md).
-- What protects what, the limits, the extensions: [DESIGN.md](DESIGN.md).
-- The plan and its status: [PLAN.md](PLAN.md).
+## Documentation
+
+| Read | For |
+|---|---|
+| [SPEC.md](SPEC.md) | the protocol (normative): bodies, checks, the log, the mirror, the audit |
+| [DESIGN.md](DESIGN.md) | what protects what, the limits, the extensions |
+| [OPERATING.md](OPERATING.md) | running a ledger: keys, the ingest, the authority, the mirror |
+| [docs/comment-ca-marche.md](docs/comment-ca-marche.md) | how a vote works, in French, for a technical reader |
+| [js/README.md](js/README.md) | the browser library `@isoloir/web`: sessions, proving, the in-browser audit |
+| [PLAN.md](PLAN.md) | the plan and its status |
 
 ## What a deployment can be
 
