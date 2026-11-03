@@ -483,3 +483,43 @@ async fn refusals_are_bounded() {
     assert!(report.problems.iter().any(|p| p.contains("not its hash")), "{:#?}", report.problems);
     assert!(report.problems.iter().any(|p| p.contains("not the one the log names")), "{:#?}", report.problems);
 }
+
+/// Rows written before the compact form (migration 0003) are read as they
+/// are: a log body unpacked, a JSONB ack.
+#[tokio::test(flavor = "multi_thread")]
+async fn earlier_rows_are_read() {
+    let url = fresh_db().await;
+    let store = Store::connect(&url).await.unwrap();
+    let body = br#"{"v":1,"x":"0x00ff"}"#.to_vec();
+    sqlx::query("INSERT INTO isoloir_log (seq, kind, body, hash, checkpoint) VALUES (0, 'ledger', $1, 'h', 1)").bind(&body).execute(&store.pool).await.unwrap();
+    let ack = json!({"id": "ab".repeat(32), "content": "{}"});
+    sqlx::query("INSERT INTO isoloir_seen (event_id, relay, ack) VALUES ('e1', 'wss://a', $1)").bind(&ack).execute(&store.pool).await.unwrap();
+    assert_eq!(store.entries().await.unwrap()[0].2, body);
+    assert_eq!(store.seen("e1").await.unwrap().unwrap().1, ack);
+    // And the new rows, packed, read back the same.
+    store.seen_only("e2", "wss://a", &ack).await.unwrap();
+    assert_eq!(store.seen("e2").await.unwrap().unwrap().1, ack);
+    assert_eq!(store.unposted().await.unwrap().len(), 2);
+}
+
+/// Migration 0003 on a database written by the code before it: logged
+/// submissions and refusals logged on their own lose their copy of a log
+/// body, everything else stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn compact_migration_on_earlier_rows() {
+    let url = fresh_db().await;
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let mut before = sqlx::migrate!("./migrations");
+    before.migrations = std::borrow::Cow::Owned(before.migrations.iter().filter(|m| m.version < 3).cloned().collect());
+    before.run(&pool).await.unwrap();
+    sqlx::query("INSERT INTO isoloir_submissions (kind, body, submitted, status) VALUES ('poll', 'a', 1, 'logged'), ('poll', 'b', 1, 'pending')").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO isoloir_refused (event_id, checkpoint, entry, listed, body) VALUES ('x', 1, 'r1', true, 'junk'), ('y', 1, 'r2', false, 'junk')").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO isoloir_log (seq, kind, body, hash, checkpoint) VALUES (0, 'ledger', '{\"v\":1}', 'h', 1)").execute(&pool).await.unwrap();
+    let store = Store::connect(&url).await.unwrap();
+    let subs: Vec<Option<Vec<u8>>> = sqlx::query_scalar("SELECT body FROM isoloir_submissions ORDER BY id").fetch_all(&store.pool).await.unwrap();
+    assert_eq!(subs, vec![None, Some(b"b".to_vec())]);
+    assert_eq!(store.submissions().await.unwrap().len(), 1);
+    assert_eq!(store.summed(1).await.unwrap(), vec![b"r2".to_vec()]);
+    assert_eq!(store.refused_body("x").await.unwrap(), Some(Some(b"junk".to_vec())));
+    assert_eq!(store.entries().await.unwrap()[0].2, b"{\"v\":1}".to_vec());
+}

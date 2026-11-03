@@ -3,6 +3,7 @@
 //! cursors, the stamps. Migrations are numbered and embedded: the server
 //! refuses to start on a schema newer than it knows (SPEC §13).
 
+use crate::packed;
 use isoloir_proto::body::EntryKind;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{Postgres, Row, Transaction};
@@ -47,6 +48,29 @@ pub struct Submission {
     pub id: i64,
     pub kind: EntryKind,
     pub body: Vec<u8>,
+}
+
+/// A body as a row holds it: packed, or as it is (rows from before 0003).
+fn body_of(r: &sqlx::postgres::PgRow, col: &str) -> anyhow::Result<Vec<u8>> {
+    let b: Vec<u8> = r.get(col);
+    if r.get::<bool, _>("packed") {
+        packed::unpack(&b)
+    } else {
+        Ok(b)
+    }
+}
+
+/// An ack as a row holds it: packed (`ack_bin`), or JSONB (rows from
+/// before 0003).
+fn ack_of(r: &sqlx::postgres::PgRow) -> anyhow::Result<serde_json::Value> {
+    match r.get::<Option<Vec<u8>>, _>("ack_bin") {
+        Some(b) => Ok(serde_json::from_slice(&packed::unpack(&b)?)?),
+        None => r.get::<Option<serde_json::Value>, _>("ack").ok_or_else(|| anyhow::anyhow!("a seen row without its ack")),
+    }
+}
+
+fn ack_bin(ack: &serde_json::Value) -> anyhow::Result<Vec<u8>> {
+    Ok(packed::pack(&serde_json::to_vec(ack)?))
 }
 
 fn kind(s: &str) -> anyhow::Result<EntryKind> {
@@ -100,8 +124,8 @@ impl Store {
 
     /// The whole log, in order.
     pub async fn entries(&self) -> anyhow::Result<Vec<(i64, EntryKind, Vec<u8>, i64)>> {
-        let rows = sqlx::query("SELECT seq, kind, body, checkpoint FROM isoloir_log ORDER BY seq").fetch_all(&self.pool).await?;
-        rows.iter().map(|r| Ok((r.get("seq"), kind(r.get("kind"))?, r.get("body"), r.get("checkpoint")))).collect()
+        let rows = sqlx::query("SELECT seq, kind, body, packed, checkpoint FROM isoloir_log ORDER BY seq").fetch_all(&self.pool).await?;
+        rows.iter().map(|r| Ok((r.get("seq"), kind(r.get("kind"))?, body_of(r, "body")?, r.get("checkpoint")))).collect()
     }
 
     /// Every checkpoint note, in order.
@@ -147,10 +171,10 @@ impl Store {
             .bind(&p.author)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("INSERT INTO isoloir_seen (event_id, relay, ack) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING")
+        sqlx::query("INSERT INTO isoloir_seen (event_id, relay, ack_bin) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING")
             .bind(&p.event_id)
             .bind(&p.relay)
-            .bind(ack)
+            .bind(ack_bin(ack)?)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -160,10 +184,10 @@ impl Store {
     /// Records the ack of a repost (a body already judged under another
     /// event id): no new pending message.
     pub async fn seen_only(&self, event_id: &str, relay: &str, ack: &serde_json::Value) -> anyhow::Result<()> {
-        sqlx::query("INSERT INTO isoloir_seen (event_id, relay, ack) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING")
+        sqlx::query("INSERT INTO isoloir_seen (event_id, relay, ack_bin) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING")
             .bind(event_id)
             .bind(relay)
-            .bind(ack)
+            .bind(ack_bin(ack)?)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -171,8 +195,8 @@ impl Store {
 
     /// The ack of a message already judged.
     pub async fn seen(&self, event_id: &str) -> anyhow::Result<Option<(String, serde_json::Value, bool)>> {
-        let r = sqlx::query("SELECT relay, ack, posted FROM isoloir_seen WHERE event_id = $1").bind(event_id).fetch_optional(&self.pool).await?;
-        Ok(r.map(|r| (r.get("relay"), r.get("ack"), r.get("posted"))))
+        let r = sqlx::query("SELECT relay, ack, ack_bin, posted FROM isoloir_seen WHERE event_id = $1").bind(event_id).fetch_optional(&self.pool).await?;
+        r.map(|r| Ok((r.get("relay"), ack_of(&r)?, r.get("posted")))).transpose()
     }
 
     pub async fn ack_posted(&self, event_id: &str) -> anyhow::Result<()> {
@@ -182,8 +206,8 @@ impl Store {
 
     /// Acks not yet posted (a crash between the record and the post).
     pub async fn unposted(&self) -> anyhow::Result<Vec<(String, String, serde_json::Value)>> {
-        let rows = sqlx::query("SELECT event_id, relay, ack FROM isoloir_seen WHERE NOT posted").fetch_all(&self.pool).await?;
-        Ok(rows.iter().map(|r| (r.get("event_id"), r.get("relay"), r.get("ack"))).collect())
+        let rows = sqlx::query("SELECT event_id, relay, ack, ack_bin FROM isoloir_seen WHERE NOT posted").fetch_all(&self.pool).await?;
+        rows.iter().map(|r| Ok((r.get("event_id"), r.get("relay"), ack_of(r)?))).collect()
     }
 
     /// Writes a checkpoint: its entries, its note, its refusals, the
@@ -193,20 +217,21 @@ impl Store {
     pub async fn checkpoint(&self, entries: &[(u64, EntryKind, Vec<u8>, String)], idx: u64, note: &str, time: u64, size: u64, pending: &[String], submissions: &[i64], refused: &[Refused]) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
         for r in refused {
-            sqlx::query("INSERT INTO isoloir_refused (event_id, checkpoint, entry, listed, body) VALUES ($1,$2,$3,$4,$5)")
+            // A refusal logged on its own has its reject body in the log.
+            sqlx::query("INSERT INTO isoloir_refused (event_id, checkpoint, entry, listed, body, packed) VALUES ($1,$2,$3,$4,$5,true)")
                 .bind(&r.event_id)
                 .bind(idx as i64)
-                .bind(&r.entry)
+                .bind((!r.listed).then_some(&r.entry))
                 .bind(r.listed)
-                .bind(&r.body)
+                .bind(r.body.as_deref().map(packed::pack))
                 .execute(&mut *tx)
                 .await?;
         }
         for (seq, k, body, hash) in entries {
-            sqlx::query("INSERT INTO isoloir_log (seq, kind, body, hash, checkpoint) VALUES ($1,$2,$3,$4,$5)")
+            sqlx::query("INSERT INTO isoloir_log (seq, kind, body, hash, checkpoint, packed) VALUES ($1,$2,$3,$4,$5,true)")
                 .bind(*seq as i64)
                 .bind(k.as_str())
-                .bind(body)
+                .bind(packed::pack(body))
                 .bind(hash)
                 .bind(idx as i64)
                 .execute(&mut *tx)
@@ -220,7 +245,7 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM isoloir_pending WHERE event_id = ANY($1)").bind(pending).execute(&mut *tx).await?;
-        sqlx::query("UPDATE isoloir_submissions SET status = 'logged' WHERE id = ANY($1)").bind(submissions).execute(&mut *tx).await?;
+        sqlx::query("UPDATE isoloir_submissions SET status = 'logged', body = NULL WHERE id = ANY($1)").bind(submissions).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -237,8 +262,12 @@ impl Store {
     /// A refused message's body: None when the ledger has no such refusal,
     /// Some(None) when it was over the size limit and not kept.
     pub async fn refused_body(&self, event_id: &str) -> anyhow::Result<Option<Option<Vec<u8>>>> {
-        let r = sqlx::query("SELECT body FROM isoloir_refused WHERE event_id = $1").bind(event_id).fetch_optional(&self.pool).await?;
-        Ok(r.map(|r| r.get("body")))
+        let r = sqlx::query("SELECT body, packed FROM isoloir_refused WHERE event_id = $1").bind(event_id).fetch_optional(&self.pool).await?;
+        r.map(|r| match r.get::<Option<Vec<u8>>, _>("body") {
+            Some(_) => body_of(&r, "body").map(Some),
+            None => Ok(None),
+        })
+        .transpose()
     }
 
     pub async fn submit(&self, kind: EntryKind, body: &[u8], now: u64) -> anyhow::Result<i64> {
