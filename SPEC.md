@@ -139,7 +139,7 @@ trailing slash, no duplicate.
 A registry is a set of eligible voters, reusable by any number of polls.
 
 ```json
-{"v":1,"id":1,"version":1,"name":"Adultes français",
+{"v":1,"id":1,"version":1,"name":"French adults",
  "eligibility":{"provider":"zkpassport","domain":"vote.example",
    "scope":"isoloir/registry/1","min_age":18,"nationality":["FRA"],
    "document_type":"passport","require_expiry":true,
