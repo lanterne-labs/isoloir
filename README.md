@@ -17,7 +17,7 @@ An isoloir is the voting booth: the curtain you vote behind, unseen.
 | [SPEC.md](SPEC.md) | the protocol (normative): bodies, checks, the log, the mirror, the audit |
 | [DESIGN.md](DESIGN.md) | what protects what, the limits, the extensions |
 | [OPERATING.md](OPERATING.md) | running a ledger: keys, the ingest, the authority, the mirror |
-| [docs/comment-ca-marche.md](docs/comment-ca-marche.md) | how a vote works, in French, for a technical reader |
+| [docs/how-it-works.md](docs/how-it-works.md) | how a vote works, step by step, for a technical reader |
 | [js/README.md](js/README.md) | the browser library `@isoloir/web`: sessions, proving, the in-browser audit |
 | [PLAN.md](PLAN.md) | the plan and its status |
 
@@ -79,8 +79,8 @@ isoloir audit --mirror mirror --log-key "…" --relays --skip-passports --dev
 Run it from the repository root (`circuits/` is where variants are
 built from); create the database first.
 
-How a vote works, in French, for a technical reader:
-[docs/comment-ca-marche.md](docs/comment-ca-marche.md).
+How a vote works, step by step, for a technical reader:
+[docs/how-it-works.md](docs/how-it-works.md).
 
 Anyone can also audit from a web page: `audit()` of `@isoloir/web` runs
 the same replay in the browser, with `bbVerifier` for the ballot proofs
