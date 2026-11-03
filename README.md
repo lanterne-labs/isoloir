@@ -18,6 +18,7 @@ An isoloir is the voting booth: the curtain you vote behind, unseen.
 | [DESIGN.md](DESIGN.md) | what protects what, the limits, the extensions |
 | [OPERATING.md](OPERATING.md) | running a ledger: keys, the ingest, the authority, the mirror |
 | [docs/how-it-works.md](docs/how-it-works.md) | how a vote works, step by step, for a technical reader |
+| [docs/ranked-count.md](docs/ranked-count.md) | the ranked count: Condorcet on pairwise margins, its guarantees, and why not instant runoff |
 | [js/README.md](js/README.md) | the browser library `@isoloir/web`: sessions, proving, the in-browser audit |
 | [PLAN.md](PLAN.md) | the plan and its status |
 
