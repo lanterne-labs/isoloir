@@ -13,6 +13,8 @@ npm install
 npm run wasm                     # wasm/web (browsers) and wasm/node (tests, with the dev helpers)
 npm run check                    # tsc, strict
 npm test                         # vitest: fake relays, a fake direct endpoint, a fake mirror, a fake ingest
+# one real ballot, proven by bb.js's wasm with the SRS given by URL (opt-in):
+ISOLOIR_CIRCUITS=../circuits/build ISOLOIR_SRS_DIR=<g1_compressed.dat, g2.dat, grumpkin_g1_v2.dat> npx vitest run test/prove.e2e.test.ts
 npm run build                    # dist/
 ```
 
@@ -151,5 +153,37 @@ Cross-Origin-Embedder-Policy: require-corp      (or credentialless)
 ```
 
 Without these headers it proves on one thread, which still works but is several times slower on phones. If the host cannot set headers, a service worker can add them.
+
+### Pinned files: the SRS and bb.js's wasm from a CDN
+
+By default bb.js fetches the SRS from Aztec's CDN (`crs.aztec-cdn.foundation`, with Range requests) and its wasm from the app's bundle (a 4 MB JavaScript chunk holding it as base64). The provers take options that move both to URLs the app chooses, each file fetched whole and used only if its SHA-256 is the one pinned:
+
+```ts
+import { WorkerProver, type ProverOptions } from '@isoloir/web';
+
+const options: ProverOptions = {
+	srs: {
+		g1: { url: `${srs}/g1_compressed.dat`, sha256: 'fad8203ae1fd103658d4bb33b2b4cf126a28352b5de4684737cff23cc15fb94b' },
+		g2: { url: `${srs}/g2.dat`, sha256: '01797bfc4de5a96f0e516a9ea4537d18786dc30cb991aca4274c95822b69c32f' }
+		// grumpkin: { url, sha256 }  optional, see below
+	},
+	wasm: {
+		threads: {
+			url: 'https://cdn.jsdelivr.net/npm/@aztec/bb.js@5.0.0/dest/node/barretenberg_wasm/barretenberg-threads.wasm.gz',
+			sha256: '2da2861cee60c2af5a87621474517e56b5d833db8a765f075e6cbc5509308eaa'
+		}
+	}
+};
+const prover = new WorkerProver(spawn, loader, options); // or new LocalProver(loader, options)
+```
+
+A file whose hash differs fails the warm-up or the ballot with `pin_mismatch` (`data: { url, expected, actual }`), an unreachable one with `prover`. The options are plain data: `WorkerProver` hands them to the worker with each request. Without them, bb.js behaves as before.
+
+- **`srs.g1`**: BN254 G1 points in bb.js 5.0.0's compressed form (32 B a point), the head of Aztec's `g1_compressed.dat`. bb.js accepts only whole blocks of 2^17 points: the first 4,194,304 B hold 2^17 points, which every ballot circuit fits (the largest, `rankedm16_single_linked_d20`, is 46,800 gates, 65,536 once rounded up).
+- **`srs.g2`**: Aztec's `g2.dat`, 128 B.
+- **`srs.grumpkin`** (optional): Grumpkin points (64 B a point), the head of `grumpkin_g1_v2.dat`. UltraHonk ballots do not use them; without the file none is loaded (bb.js's own loader would fetch 4,194,304 B).
+- **`wasm.threads`**: the shared-memory build, used when the page is cross-origin isolated; the npm package ships it gzipped, which jsDelivr serves as is with CORS and `Cross-Origin-Resource-Policy: cross-origin` (fine under COEP `credentialless` or `require-corp`). **`wasm.single`** (optional): the build without shared memory, for pages that are not isolated; the package ships it only as base64 inside a JavaScript file, so an app pins its own copy or lets bb.js load its bundled one. Browsers only: in Node bb.js reads its wasm from its package.
+
+bb.js 5.0.0 takes no wasm bytes and no integrity, only a `wasmPath` it fetches itself. The prover gives it a path on a reserved host (`bb-wasm.isoloir.invalid`) and answers that one URL, through a `fetch` hook in the prover's thread, with the bytes it fetched and checked; every other request goes through. Unanswered, the reserved host does not resolve, so a wasm is never used unchecked. bb.js's JavaScript, its thread worker and noir_js stay in the app's bundle (about 3.9 MB, noir_js's two wasm files being 3.6 MB of it); the bundled wasm chunks are still emitted but never fetched.
 
 The session compares the public inputs bb.js reports with those the wasm core rebuilds from the body (`prover_mismatch`), so a wrong circuit fails before anything is posted.

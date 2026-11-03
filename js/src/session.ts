@@ -888,6 +888,7 @@ export class Session {
 					this.proverState = 'ready';
 				} catch (e) {
 					this.proverState = 'failed';
+					if (e instanceof IsoloirError && e.code === 'pin_mismatch') throw e;
 					throw new IsoloirError('prover', messageOf(e));
 				}
 				const body = this.core.finishBallot(draft.body, proof.proof);

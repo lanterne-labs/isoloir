@@ -55,6 +55,8 @@ export type SessionErrorCode =
 	| 'bad_choice'
 	| 'prover'
 	| 'prover_mismatch'
+	/** A file the prover pins (the SRS, bb.js's wasm) is not the one pinned: its SHA-256 differs (data: url, expected, actual). */
+	| 'pin_mismatch'
 	/** A ballot waits for its ack: resend or discard it first. */
 	| 'pending'
 	| 'cast_retries'
