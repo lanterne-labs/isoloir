@@ -161,6 +161,10 @@ A registry is a set of eligible voters, reusable by any number of polls.
   the proof's OPRF key against the registry's, never against what the
   nodes serve, so an audit holds when they are gone. The key above is
   ZKPassport's mainnet key 1.
+  A salted identifier comes with ZKPassport's strict **face match**:
+  the app matches the holder's face to the chip's photo, on the phone,
+  and the proofs carry that check; the SDK gives no salted identifier
+  without it.
 
 - The voter's **leaf** is `ID = H(T_id, registry, s)`; positions follow
   the log order (§4). The tree has fixed depth `depth` (≤ 32); empty
@@ -178,8 +182,8 @@ A registry is a set of eligible voters, reusable by any number of polls.
    (secp256k1) and opens the passport request with
    `custom_data = H(T_reg, registry, R_lo, R_hi)` (R's x-only public key
    in two 16-byte big-endian limbs), the registry's domain and scope, its
-   rules, the registry's identifier type (salted with `oprfKeyId`, or
-   non-salted), on-device proving, validity
+   rules, the registry's identifier type (salted with `oprfKeyId` and
+   the strict face match, or non-salted), on-device proving, validity
    `validity`.
 2. **Then the key.** The browser obtains `s` (§14) and computes `ID`. The
    proof waits with `R` in the browser's storage until then.

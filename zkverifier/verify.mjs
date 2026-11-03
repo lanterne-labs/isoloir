@@ -74,6 +74,10 @@ try {
 		}
 		builder = builder.gte('expiry_date', date);
 	}
+	// A salted identifier comes with ZKPassport's strict face match (the
+	// app matches the holder's face to the chip's photo, on the phone): the
+	// SDK asks for one, and the proofs carry it.
+	if (req.oprfKey) builder = builder.facematch('strict');
 	builder = builder.bind('custom_data', req.challenge);
 	const { query } = builder.done();
 
