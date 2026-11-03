@@ -375,6 +375,14 @@ valid for the kind and the mask; the values are those of the choice
 encrypt the packed values under `pk` (elgamal) or `vcmt` commits to them
 with `salt` (tlock).
 
+The browser proves with bb.js on Aztec's SRS (the BN254 points of its
+ceremony: 2^17 G1 points, compressed, and the G2 point; the ballot
+circuits need at most 2^16). Where the prover reads the SRS and bb.js's
+wasm is the app's choice (js/README.md, "Pinned files"): each file it
+pins is fetched whole and used only if its SHA-256 is the pinned one, so
+a CDN that serves another file stops the proof instead of changing the
+prover.
+
 ### 9.2 The body
 
 ```json
