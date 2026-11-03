@@ -4,9 +4,9 @@
 //! the mirror and posts the checkpoint notes.
 
 use crate::mirror::Mirror;
-use crate::store::{PendingRow, Store};
+use crate::store::{PendingRow, Refused, Store};
 use isoloir_core::{canonical, encoding};
-use isoloir_proto::body::{self, Ack, Body, Close, EntryKind, Outcome, Reject, REJECT_RAW_MAX, V1};
+use isoloir_proto::body::{self, Ack, Body, Close, EntryKind, Outcome, Reject, Rejects, MAX_BODY, REJECTS_LOGGED, V1};
 use isoloir_proto::judge::{self, Checkers, Passports, Pending, Proofs, Verdict};
 use isoloir_proto::note;
 use isoloir_proto::sig::Event;
@@ -74,6 +74,7 @@ pub struct Ingest {
     /// OpenTimestamps calendars; empty: no stamps (tests, local trials).
     pub calendars: Vec<String>,
     last_upgrade: u64,
+    last_push_try: u64,
 }
 
 /// The longest time between two checkpoints, even on a quiet ledger.
@@ -81,6 +82,9 @@ pub const HEARTBEAT: u64 = 600;
 
 /// How often incomplete stamps are upgraded.
 const UPGRADE_EVERY: u64 = 3_600;
+
+/// How often a failed mirror push is tried again.
+pub const PUSH_RETRY: u64 = 30;
 
 impl Ingest {
     /// Loads the ledger from the store: the log is replayed into the state,
@@ -141,6 +145,7 @@ impl Ingest {
             mirror,
             calendars: vec![],
             last_upgrade: 0,
+            last_push_try: 0,
         };
         if let Some(l) = ingest.state.ledger() {
             if l.log_key != ingest.signer.verifier() {
@@ -174,7 +179,7 @@ impl Ingest {
         state.apply(EntryKind::Ledger, &bytes, now).map_err(|e| anyhow::anyhow!(e))?;
         let cp = state.checkpoint(1, now, None);
         let signed = signer.sign(&cp.text());
-        store.checkpoint(&[(0, EntryKind::Ledger, bytes.clone(), encoding::body_hash(&bytes))], 1, &signed, now, 1, &[], &[]).await
+        store.checkpoint(&[(0, EntryKind::Ledger, bytes.clone(), encoding::body_hash(&bytes))], 1, &signed, now, 1, &[], &[], &[]).await
     }
 
     pub fn tag(&self) -> &str {
@@ -258,6 +263,7 @@ impl Ingest {
             received: now as i64,
             outcome: if outcome == Outcome::Accepted { "accepted".into() } else { "rejected".into() },
             reason: reason.map(|r| r.as_str().to_string()),
+            author: Some(ev.pubkey.clone()),
         };
         if fresh {
             // Durable before the ack: an accepted message is never lost.
@@ -288,6 +294,24 @@ impl Ingest {
         }
         self.take_submissions(now).await?;
         self.upgrade_stamps(now).await?;
+        // A checkpoint names its mirror commit: none is signed while the
+        // remote lacks the previous ones. On an ephemeral disk a restart
+        // loses unpushed commits, and every note that named one would name
+        // a commit no reader can fetch; the ledger waits instead (the
+        // messages are stored and acknowledged meanwhile).
+        if let Some(m) = &self.mirror {
+            if m.unpushed() {
+                if now < self.last_push_try + PUSH_RETRY {
+                    return Ok(None);
+                }
+                self.last_push_try = now;
+                if let Err(e) = m.push_pending() {
+                    tracing::error!(error = %e, "mirror push failed again: no checkpoint until it goes through");
+                    return Ok(None);
+                }
+                tracing::info!("mirror pushed; checkpoints resume");
+            }
+        }
         let Some(ledger) = self.state.ledger().cloned() else { return Ok(None) };
         let closes: Vec<u32> = self.state.polls.iter().filter(|(_, p)| p.close.is_none() && now >= p.current().closes).map(|(id, _)| *id).collect();
         let last = self.state.last_checkpoint().map(|c| c.time).unwrap_or(0);
@@ -402,20 +426,40 @@ impl Ingest {
         let index = self.next_index();
         let from = self.state.next_seq();
         let mut entries: Vec<(EntryKind, Vec<u8>)> = vec![];
+        // Refusals: the first REJECTS_LOGGED in arrival order are entries of
+        // their own, the others are summed up in one `rejects` entry; none
+        // carries its body (SPEC §11.4), which stays in the store.
+        let mut refused: Vec<Refused> = vec![];
         for r in &self.rows {
             if r.outcome == "accepted" {
                 entries.push((r.kind, r.body.clone()));
-            } else {
-                let reject = Reject {
-                    v: V1,
-                    of: r.event_id.clone(),
-                    hash: r.hash.clone(),
-                    reason: r.reason.as_deref().and_then(|s| serde_json::from_value(serde_json::Value::String(s.into())).ok()).unwrap_or(isoloir_proto::Reason::Malformed),
-                    kind: Some(r.kind.as_str().to_string()),
-                    raw: (r.body.len() <= REJECT_RAW_MAX).then(|| encoding::b64(&r.body)),
-                };
-                entries.push((EntryKind::Reject, Body::Reject(reject).encode()));
+                continue;
             }
+            let reject = Reject {
+                v: V1,
+                of: r.event_id.clone(),
+                author: r.author.clone(),
+                size: Some(r.body.len() as u64),
+                hash: r.hash.clone(),
+                reason: r.reason.as_deref().and_then(|s| serde_json::from_value(serde_json::Value::String(s.into())).ok()).unwrap_or(isoloir_proto::Reason::Malformed),
+                kind: Some(r.kind.as_str().to_string()),
+                raw: None,
+            };
+            let entry = Body::Reject(reject).encode();
+            let listed = refused.len() < REJECTS_LOGGED;
+            if listed {
+                entries.push((EntryKind::Reject, entry.clone()));
+            }
+            refused.push(Refused { event_id: r.event_id.clone(), entry, listed, body: (r.body.len() <= MAX_BODY).then(|| r.body.clone()) });
+        }
+        let mut summed: Vec<&Refused> = refused.iter().filter(|r| !r.listed).collect();
+        if !summed.is_empty() {
+            summed.sort_by_cached_key(|r| encoding::body_hash(&r.entry));
+            let bodies: Vec<&[u8]> = summed.iter().map(|r| r.entry.as_slice()).collect();
+            let size = self.rows.iter().filter(|r| r.outcome != "accepted").skip(REJECTS_LOGGED).map(|r| r.body.len() as u64).sum();
+            let sum = Rejects { v: V1, count: summed.len() as u64, size, root: body::rejects_root(&bodies) };
+            tracing::warn!(count = sum.count, size = sum.size, "refusals beyond the checkpoint's bound: summed up");
+            entries.push((EntryKind::Rejects, Body::Rejects(sum).encode()));
         }
         for (_, k, b) in &self.subs {
             entries.push((*k, b.clone()));
@@ -459,7 +503,7 @@ impl Ingest {
                 sub_ids.push(*id);
             }
         }
-        if let Err(e) = self.store.checkpoint(&logged, index, &signed, now, cp.size, &pending_ids, &sub_ids).await {
+        if let Err(e) = self.store.checkpoint(&logged, index, &signed, now, cp.size, &pending_ids, &sub_ids, &refused).await {
             // The database did not take the checkpoint: the state in memory
             // is ahead of it. Stop; a restart replays the database.
             anyhow::bail!("checkpoint {index} not stored ({e}); restart to replay the log");
@@ -469,7 +513,8 @@ impl Ingest {
         self.pending.clear();
         if let Some(m) = &self.mirror {
             if let Err(e) = m.write_note(index, &signed) {
-                tracing::error!(error = %e, index, "mirror");
+                self.last_push_try = now;
+                tracing::error!(error = %e, index, "mirror (the next checkpoint waits for the push)");
             }
         }
         let ev = Event::sign(&self.nostr_sk, now, kinds::CHECKPOINT, vec![vec!["t".into(), self.tag.clone()]], signed.clone());

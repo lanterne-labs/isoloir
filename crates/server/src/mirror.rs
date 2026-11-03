@@ -15,10 +15,13 @@ use std::process::Command;
 /// Leaves per shard.
 pub const SHARD: usize = 1024;
 
+#[derive(Default)]
 pub struct Mirror {
     pub dir: PathBuf,
     /// Commit and push to this remote after each checkpoint.
     pub git: Option<String>,
+    /// Commits the remote does not have yet (a push failed).
+    unpushed: std::sync::atomic::AtomicBool,
 }
 
 fn write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -44,9 +47,18 @@ fn prefix(hex: &str) -> &str {
 }
 
 impl Mirror {
+    pub fn new(dir: PathBuf, git: Option<String>) -> Mirror {
+        Mirror { dir, git, unpushed: Default::default() }
+    }
+
     /// Makes the directory a git mirror of `remote`: cloned when empty (an
     /// ephemeral disk: the circuits and the stamps come back with it),
     /// initialised when new, left alone when it already is one.
+    ///
+    /// The clone is partial (`--filter=blob:none`): every commit and tree,
+    /// the files of the newest commit, and no older version of a file,
+    /// which git fetches on demand (a merge in `push`). Not shallow: a
+    /// push the remote refuses is merged, which needs the history.
     pub fn prepare(&self) -> anyhow::Result<()> {
         let Some(remote) = &self.git else {
             std::fs::create_dir_all(&self.dir)?;
@@ -58,8 +70,10 @@ impl Mirror {
         }
         let empty = std::fs::read_dir(&self.dir)?.next().is_none();
         if empty {
-            let out = git_command().arg("clone").arg("-q").arg(remote).arg(&self.dir).output()?;
+            let started = std::time::Instant::now();
+            let out = git_command().arg("clone").arg("-q").arg("--filter=blob:none").arg(remote).arg(&self.dir).output()?;
             if out.status.success() {
+                tracing::info!(remote = %remote, seconds = started.elapsed().as_secs(), "mirror cloned (partial: blob:none)");
                 return Ok(());
             }
             let msg = String::from_utf8_lossy(&out.stderr);
@@ -70,6 +84,16 @@ impl Mirror {
         self.git(&["init", "-q", "-b", "main"])?;
         self.git(&["remote", "add", "origin", remote])?;
         Ok(())
+    }
+
+    /// Whether commits wait for a push that failed.
+    pub fn unpushed(&self) -> bool {
+        self.unpushed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Pushes the commits a failed push left behind.
+    pub fn push_pending(&self) -> anyhow::Result<()> {
+        self.push()
     }
 
     fn git(&self, args: &[&str]) -> anyhow::Result<String> {
@@ -100,11 +124,22 @@ impl Mirror {
         if self.git.is_none() {
             return Ok(());
         }
+        let r = self.push_merging();
+        self.unpushed.store(r.is_err(), std::sync::atomic::Ordering::SeqCst);
+        r
+    }
+
+    fn push_merging(&self) -> anyhow::Result<()> {
         if self.git(&["push", "-q", "origin", "HEAD:main"]).is_ok() {
             return Ok(());
         }
         self.git(&["fetch", "-q", "origin", "main"])?;
-        self.git(&["-c", "user.name=isoloir", "-c", "user.email=isoloir@localhost", "merge", "-q", "--no-edit", "FETCH_HEAD"])?;
+        if let Err(e) = self.git(&["-c", "user.name=isoloir", "-c", "user.email=isoloir@localhost", "merge", "-q", "--no-edit", "FETCH_HEAD"]) {
+            // A conflict: leave the tree as it was, never a half merge that
+            // the next commit would take.
+            let _ = self.git(&["merge", "--abort"]);
+            return Err(e);
+        }
         self.git(&["push", "-q", "origin", "HEAD:main"])?;
         Ok(())
     }
@@ -309,7 +344,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let remote = tmp.path().join("remote.git");
         run(tmp.path(), &["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
-        let m = Mirror { dir: tmp.path().join("mirror"), git: Some(remote.to_str().unwrap().to_string()) };
+        let m = Mirror::new(tmp.path().join("mirror"), Some(remote.to_str().unwrap().to_string()));
         m.prepare().unwrap();
         m.write_note(1, "note 1\n").unwrap();
         let first = run(&m.dir, &["rev-parse", "HEAD"]);
@@ -326,5 +361,87 @@ mod tests {
         assert_eq!(std::fs::read_to_string(other.join("README.md")).unwrap(), "# a mirror\n");
         assert_eq!(std::fs::read_to_string(other.join("checkpoint.txt")).unwrap(), "note 2\n");
         run(&other, &["merge-base", "--is-ancestor", &first, "HEAD"]);
+    }
+
+    // A boot on an empty disk clones without the old versions of files
+    // (blob:none); every step after it works: the index, the commits, the
+    // merge of an outside commit (which fetches the blobs it needs), the
+    // push; a failed push is known until one goes through.
+    #[test]
+    fn partial_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        run(tmp.path(), &["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
+        run(&remote, &["config", "uploadpack.allowFilter", "true"]);
+        let url = format!("file://{}", remote.display());
+        let lines = |first: &str, last: &str| format!("{first}\n{}{last}\n", (0..50).map(|i| format!("line {i}\n")).collect::<String>());
+
+        // A first life of the ingest: two versions of a file.
+        let a = Mirror::new(tmp.path().join("a"), Some(url.clone()));
+        a.prepare().unwrap();
+        write(&a.dir.join("shard.txt"), lines("first", "last").as_bytes()).unwrap();
+        a.write_note(1, "index 1\n").unwrap();
+        let old_blob = run(&a.dir, &["rev-parse", "HEAD:shard.txt"]);
+        write(&a.dir.join("shard.txt"), lines("first", "last v2").as_bytes()).unwrap();
+        a.write_note(2, "index 2\n").unwrap();
+        let second = run(&a.dir, &["rev-parse", "HEAD"]);
+
+        // The next boot, on an empty disk.
+        let m = Mirror::new(tmp.path().join("m"), Some(url.clone()));
+        m.prepare().unwrap();
+        assert_eq!(run(&m.dir, &["config", "remote.origin.partialclonefilter"]), "blob:none");
+        let missing = run(&m.dir, &["rev-list", "--objects", "--all", "--missing=print"]);
+        assert!(missing.lines().any(|l| l == format!("?{old_blob}")), "the old version is not fetched: {missing}");
+        assert_eq!(m.last_index(), 2);
+        assert_eq!(std::fs::read_to_string(m.dir.join("shard.txt")).unwrap(), lines("first", "last v2"));
+
+        // An outside commit changes the file's first line; the mirror its
+        // last: the merge needs the other side's blob, fetched on demand.
+        let other = tmp.path().join("other");
+        run(tmp.path(), &["clone", "-q", &url, other.to_str().unwrap()]);
+        std::fs::write(other.join("shard.txt"), lines("first (edited)", "last v2")).unwrap();
+        run(&other, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "edit"]);
+        run(&other, &["push", "-q", "origin", "HEAD:main"]);
+        write(&m.dir.join("shard.txt"), lines("first", "last v3").as_bytes()).unwrap();
+        m.write_stamp(3, b"ots").unwrap();
+        m.write_note(3, "index 3\n").unwrap();
+        assert!(!m.unpushed());
+        let mine = run(&m.dir, &["rev-parse", "HEAD"]);
+        run(&other, &["pull", "-q", "--no-rebase", "origin", "main"]);
+        assert_eq!(std::fs::read_to_string(other.join("shard.txt")).unwrap(), lines("first (edited)", "last v3"));
+        assert!(other.join("stamps/3.ots").is_file());
+        run(&other, &["merge-base", "--is-ancestor", &second, "HEAD"]);
+        run(&other, &["merge-base", "--is-ancestor", &mine, "HEAD"]);
+
+        // The remote gone: the push fails and is known; back, it goes through.
+        run(&m.dir, &["remote", "set-url", "origin", "file:///nonexistent/remote.git"]);
+        assert!(m.write_note(4, "index 4\n").is_err());
+        assert!(m.unpushed());
+        assert!(m.push_pending().is_err());
+        run(&m.dir, &["remote", "set-url", "origin", &url]);
+        m.push_pending().unwrap();
+        assert!(!m.unpushed());
+        assert_eq!(run(&remote, &["show", "main:checkpoint.txt"]), "index 4");
+    }
+
+    // A merge that conflicts is undone: the next commit takes no half
+    // merge, and the push stays known as pending.
+    #[test]
+    fn conflicting_merge_is_undone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        run(tmp.path(), &["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
+        let m = Mirror::new(tmp.path().join("m"), Some(remote.to_str().unwrap().to_string()));
+        m.prepare().unwrap();
+        m.write_note(1, "index 1\n").unwrap();
+        let other = tmp.path().join("other");
+        run(tmp.path(), &["clone", "-q", remote.to_str().unwrap(), other.to_str().unwrap()]);
+        std::fs::write(other.join("checkpoint.txt"), "not a note\n").unwrap();
+        run(&other, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "clash"]);
+        run(&other, &["push", "-q", "origin", "HEAD:main"]);
+        assert!(m.write_note(2, "index 2\n").is_err());
+        assert!(m.unpushed());
+        assert!(!m.dir.join(".git/MERGE_HEAD").exists());
+        assert_eq!(std::fs::read_to_string(m.dir.join("checkpoint.txt")).unwrap(), "index 2\n");
     }
 }

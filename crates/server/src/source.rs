@@ -77,3 +77,96 @@ impl LogSource for MirrorSource {
         Ok(out)
     }
 }
+
+/// What an audit gathers for the refusals, whose bodies the log does not
+/// hold (SPEC §11.4, §16).
+#[derive(Default)]
+pub struct Refusals {
+    /// Refused bodies by event id.
+    pub copies: std::collections::HashMap<String, isoloir_proto::audit::Copy>,
+    /// The lists of the `rejects` entries, by checkpoint index.
+    pub lists: std::collections::HashMap<u64, Vec<Vec<u8>>>,
+    /// What could not be read.
+    pub warnings: Vec<String>,
+}
+
+impl Refusals {
+    /// The refused messages the relays still hold: verified envelopes of
+    /// the message kinds, by event id.
+    pub fn add_events(&mut self, events: &[isoloir_proto::sig::Event]) {
+        for e in events {
+            if matches!(e.kind, 7100 | 7101 | 7105) && e.verify() {
+                self.copies.entry(e.id.clone()).or_insert_with(|| isoloir_proto::audit::Copy { author: Some(e.pubkey.clone()), body: e.content.as_bytes().to_vec() });
+            }
+        }
+    }
+
+    /// Asks the ingest (`ledger`: the base URL of its HTTP service) for the
+    /// lists of the `rejects` entries of `read` (checkpoints from 1, in
+    /// order) and for the bodies of the refusals no copy was found for.
+    /// The audit checks everything it gets against the log.
+    pub async fn ask_ledger(&mut self, ledger: &str, read: &[Read]) {
+        use isoloir_proto::body::{self, Body};
+        let base = ledger.trim_end_matches('/');
+        let client = reqwest::Client::new();
+        let mut wanted: Vec<String> = vec![];
+        for (i, (_, entries)) in read.iter().enumerate() {
+            let index = i as u64 + 1;
+            for (k, b) in entries {
+                match (k, body::decode(*k, b)) {
+                    (EntryKind::Reject, Ok(Body::Reject(r))) if r.raw.is_none() => wanted.push(r.of),
+                    (EntryKind::Rejects, Ok(Body::Rejects(_))) => {
+                        let got = async {
+                            let r = client.get(format!("{base}/v1/rejects/{index}")).send().await?.error_for_status()?;
+                            let v: serde_json::Value = r.json().await?;
+                            let list = v["rejects"].as_array().ok_or_else(|| anyhow::anyhow!("no list"))?;
+                            list.iter().map(|s| s.as_str().map(|s| s.as_bytes().to_vec()).ok_or_else(|| anyhow::anyhow!("not a string"))).collect::<anyhow::Result<Vec<_>>>()
+                        };
+                        match got.await {
+                            Ok(list) => {
+                                for rb in &list {
+                                    if let Ok(Body::Reject(r)) = body::decode(EntryKind::Reject, rb) {
+                                        wanted.push(r.of);
+                                    }
+                                }
+                                self.lists.insert(index, list);
+                            }
+                            Err(e) => self.warnings.push(format!("the refusals of checkpoint {index}: {e}")),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let (mut gone, mut missing) = (0, 0);
+        for id in wanted {
+            if self.copies.contains_key(&id) {
+                continue;
+            }
+            let r = match client.get(format!("{base}/v1/refused/{id}")).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    self.warnings.push(format!("the ingest's copy of {id}: {e}"));
+                    continue;
+                }
+            };
+            match r.status() {
+                reqwest::StatusCode::OK => match r.bytes().await {
+                    Ok(b) => {
+                        self.copies.insert(id, isoloir_proto::audit::Copy { author: None, body: b.to_vec() });
+                    }
+                    Err(e) => self.warnings.push(format!("the ingest's copy of {id}: {e}")),
+                },
+                reqwest::StatusCode::GONE => gone += 1,
+                reqwest::StatusCode::NOT_FOUND => missing += 1,
+                s => self.warnings.push(format!("the ingest's copy of {id}: {s}")),
+            }
+        }
+        if gone > 0 {
+            self.warnings.push(format!("{gone} refused bodies were over the size limit: the ingest did not keep them"));
+        }
+        if missing > 0 {
+            self.warnings.push(format!("the ingest has no copy of {missing} refused bodies"));
+        }
+    }
+}

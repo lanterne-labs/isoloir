@@ -205,5 +205,8 @@ fn report_json(r: &Report) -> Value {
         "ballots": r.ballots,
         "rejects": r.rejects,
         "tallies": r.tallies,
+        "summarized": r.summarized,
+        "unjudged": r.unjudged,
+        "unlisted": r.unlisted,
     })
 }
