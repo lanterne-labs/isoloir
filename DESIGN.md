@@ -39,7 +39,9 @@ the spec.
 - With Nostr channels the browser never talks to the operator: the
   ingest reads the relays (§11.1). A voter sends registrations and
   ballots to different relays, chosen by a hash of `s`, so no single
-  relay sees both.
+  relay sees both. The order of channels is nostr first, then iroh
+  through a relay (§11.1, later), then the ingest's HTTPS endpoint
+  last, which shows the voter's address to the operator.
 
 ### 1.3 Ballot secrecy: sums, not ballots
 
@@ -77,9 +79,9 @@ the spec.
   `checkpoint_period` seconds and at least every 10 minutes (§4).
   Entries within a checkpoint are ordered by body hash, so the log does
   not reveal arrival order.
-- Every refusal is logged by event id, author, size and body hash
-  (§11.4); the body is kept by the ingest and the relays, and the
-  auditor judges every refusal again from a copy that matches the hash.
+- The log holds accepted entries only (§11.4). A refusal is the signed
+  `rejected` ack the voter keeps: with the body, anyone judges it again
+  against the log (§11.3).
 - The mirror is static files served from a git repository by commit,
   the commit named in the checkpoint (§15). Setups and tallies carry
   inclusion proofs: the mirror cannot serve a key, a channel or a result
@@ -101,21 +103,19 @@ the spec.
 - The browser checks the named checkpoint on the mirror; a missing
   body becomes a complaint, posted with the ack: anyone judges it, and
   only the ingest can sign an ack (§11.3).
-- The relays keep copies of what they carried, so the auditor finds a
-  message the ingest never judged (withholding, §16) even if the voter
-  never complained.
+- A wrongly refused message is provable the same way: the `rejected`
+  ack names the body's hash, and the voter holds the body.
 
 ### 1.7 The audit: everything, or a failure
 
-- From the log, the relays and the mirror, the audit recomputes every
-  signature, proof, tree, tally, refusal and stamp (§16). A check that
+- From the log and the mirror, the audit recomputes every signature,
+  proof, tree, tally and stamp (§16). A check that
   cannot run is a failure, not a pass.
 - The same audit runs in a browser (`audit` of `@isoloir/web`): the
   wasm core replays the log with the same judge, the page checks the
   ballot proofs with bb.js against the mirror's verification keys and
   the passport proofs with the ZKPassport SDK (the registry roots read
-  on Ethereum through a public endpoint), then compares the relays'
-  copies with the log. The judge's verifiers are synchronous, so the
+  on Ethereum through a public endpoint). The judge's verifiers are synchronous, so the
   log is read twice: the first pass collects the proofs, the second
   replays with the verdicts. Not in the browser yet: the Bitcoin
   stamps, and tlock tallies (reported as not checked).
@@ -131,8 +131,8 @@ the spec.
 - **A fork of the log is detectable, not prevented.** The operator
   could keep two signed histories, show a voter the one that holds
   their ballot and tally the other. Catching it requires comparing
-  views: the mirror is one public repository and the relays hold every
-  checkpoint note, so the two histories must survive side by side, and
+  views: the mirror is one public repository and every reader keeps the
+  notes it saw, so the two histories must survive side by side, and
   any two conflicting notes prove the fork. But nothing pins one
   history as the only one: OpenTimestamps proves a note existed by a
   time, not that no other did, and the browser does not yet keep the
@@ -142,7 +142,16 @@ the spec.
 - **Network metadata.** A relay sees the address and the time of each
   post; a direct channel shows them to the operator. Acks are rounded
   to the minute so the public record dates nothing to the second, but
-  only Tor or a VPN hides the voter from the relay (§17).
+  only Tor or a VPN hides the voter from the relay (§17). An iroh
+  channel reached only through its relay (§11.1, not built) would hide
+  the voter's address from the ingest without a third-party Nostr
+  relay.
+- **An unanswered message proves nothing.** Channels are transport only
+  (ephemeral Nostr kinds: relays keep no copy), so a message the ingest
+  never answers leaves no trace a third party could show afterwards;
+  the earlier audit of withholding against the relays' copies is given
+  up. What remains: the device retries on the next channel, `direct`
+  last, and an answered message is proven by its ack (§11.3).
 - **Two chains are read or written.** Bitcoin carries the stamps (on
   by default, `--no-stamps` off), and the ZKPassport certificate
   registry root is read from Ethereum. A deployment that wants no chain
@@ -168,23 +177,26 @@ the spec.
 - **Scale.** The ingest holds the log in memory (about 100k ballots);
   the browser rebuilds the registry tree (about 100k voters); a tree of
   depth 20 holds a million leaves.
-- **Spam grows the log, boundedly.** Anyone can post junk with the
-  ledger's tag for free, under a fresh key each time, so a cap per
-  author bounds nothing. The log keeps no refused body, and a checkpoint
-  logs at most 16 refusals of its own and sums up the rest in one
-  `rejects` entry (§11.4): a flood adds at most about 7 KB per
-  checkpoint to the mirror, about 30 MB a day at a 20 s period. The
-  bodies stay in the ingest's database (up to 256 KiB each), which a
-  flood fills instead; that is the operator's disk, not the public
-  record. The cost is in the audit: a refusal is judged again only from
-  a copy of its body, which the relays may drop and the ingest may stop
-  serving; the audit then says it could not judge it.
+- **Spam costs the ingest, not the log.** Anyone can post junk with
+  the ledger's tag under a fresh key each time, so a cap per author
+  bounds nothing. The log keeps no refusal (§11.4), so junk never
+  reaches the public record. Each envelope carries a small proof of
+  work bound to its key (§11.1, the ledger's `pow`), checked with the
+  signature before anything else, and junk that fails it is dropped
+  unanswered; what passes waits behind fresh identifiers for the
+  expensive checks (§11.2). Refused bodies stay 30 days in the ingest's
+  database, then go.
+- **Re-votes are rate-limited, not counted.** With the ledger's
+  `revote_gap`, a pseudonym's ballots count at most one per gap (§7.4):
+  a coercer holding the voter's device can vote too, but cannot spend
+  the voter's re-votes, and the last ballot before the close counts.
 - **Liveness.** The ingest is one process and the only writer; a
   second waits for the first to stop (10 minutes at most), then refuses
   to start. It can refuse service, and a deploy pauses
-  the log; nothing is lost, since messages wait on the relays. A
-  checkpoint waits until the mirror's remote holds the previous ones
-  (§15): an outage of the git host pauses the log too.
+  the log; the devices retry, and the stored messages are not lost.
+  The git host down or full never stops the log: the mirror is pushed
+  in the background and notes name only what was pushed (§15); readers
+  then fall behind until it is back.
 
 ## 3. Extensions
 
@@ -195,7 +207,7 @@ Decided (2026-11-01). Two changes, no new party:
 - The browser keeps the last checkpoint it verified and accepts a new
   one only with the RFC 6962 consistency proof that the new tree
   extends it. A voter shown a different history later sees it fail.
-- The audit collects every checkpoint note the relays hold and the
+- The audit collects every checkpoint note readers kept and the
   mirror serves, and fails on two notes of the same index with
   different roots, or on a note that does not extend an earlier one.
 
