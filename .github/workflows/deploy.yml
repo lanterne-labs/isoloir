@@ -1,4 +1,5 @@
-# Deploys main to the host service `ingest` (the ledger) on every push,
+# Deploys main to the host services `ingest` (the ledger) and `tally`
+# (the authority: the same image, its start command set on the service) on every push,
 # with a project token (DEPLOY_TOKEN, production environment).
 name: deploy
 
@@ -21,3 +22,7 @@ jobs:
         env:
           DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
         run: host up --service ingest --ci
+      - name: host up tally
+        env:
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+        run: host up --service tally --ci
