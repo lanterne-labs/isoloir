@@ -33,16 +33,6 @@ pub struct PendingRow {
     pub author: Option<String>,
 }
 
-/// A refusal as a checkpoint stores it: its `reject` body, whether it is
-/// an entry of its own, and the refused body (None over the size limit).
-#[derive(Clone, Debug)]
-pub struct Refused {
-    pub event_id: String,
-    pub entry: Vec<u8>,
-    pub listed: bool,
-    pub body: Option<Vec<u8>>,
-}
-
 #[derive(Clone, Debug)]
 pub struct Submission {
     pub id: i64,
@@ -210,23 +200,11 @@ impl Store {
         rows.iter().map(|r| Ok((r.get("event_id"), r.get("relay"), ack_of(r)?))).collect()
     }
 
-    /// Writes a checkpoint: its entries, its note, its refusals, the
-    /// removal of the pending rows and submissions it logs, in one
-    /// transaction.
+    /// Writes a checkpoint: its entries, its note, the removal of the
+    /// pending rows and submissions it logs, in one transaction.
     #[allow(clippy::too_many_arguments)]
-    pub async fn checkpoint(&self, entries: &[(u64, EntryKind, Vec<u8>, String)], idx: u64, note: &str, time: u64, size: u64, pending: &[String], submissions: &[i64], refused: &[Refused]) -> anyhow::Result<()> {
+    pub async fn checkpoint(&self, entries: &[(u64, EntryKind, Vec<u8>, String)], idx: u64, note: &str, time: u64, size: u64, pending: &[String], submissions: &[i64]) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
-        for r in refused {
-            // A refusal logged on its own has its reject body in the log.
-            sqlx::query("INSERT INTO isoloir_refused (event_id, checkpoint, entry, listed, body, packed) VALUES ($1,$2,$3,$4,$5,true)")
-                .bind(&r.event_id)
-                .bind(idx as i64)
-                .bind((!r.listed).then_some(&r.entry))
-                .bind(r.listed)
-                .bind(r.body.as_deref().map(packed::pack))
-                .execute(&mut *tx)
-                .await?;
-        }
         for (seq, k, body, hash) in entries {
             sqlx::query("INSERT INTO isoloir_log (seq, kind, body, hash, checkpoint, packed) VALUES ($1,$2,$3,$4,$5,true)")
                 .bind(*seq as i64)
@@ -248,6 +226,37 @@ impl Store {
         sqlx::query("UPDATE isoloir_submissions SET status = 'logged', body = NULL WHERE id = ANY($1)").bind(submissions).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Records a refused message and its ack in one transaction, before the
+    /// ack is posted: the body is kept REFUSED_KEPT for debugging (SPEC
+    /// §11.4), never logged.
+    pub async fn refused(&self, p: &PendingRow, ack: &serde_json::Value) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let body = (p.body.len() <= isoloir_proto::body::MAX_BODY).then(|| packed::pack(&p.body));
+        sqlx::query("INSERT INTO isoloir_refused (event_id, body, packed, received, kind, reason, author, relay) VALUES ($1,$2,true,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING")
+            .bind(&p.event_id)
+            .bind(body)
+            .bind(p.received)
+            .bind(p.kind.as_str())
+            .bind(&p.reason)
+            .bind(&p.author)
+            .bind(&p.relay)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO isoloir_seen (event_id, relay, ack_bin) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING")
+            .bind(&p.event_id)
+            .bind(&p.relay)
+            .bind(ack_bin(ack)?)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Deletes the refused bodies received before `before`.
+    pub async fn purge_refused(&self, before: i64) -> anyhow::Result<u64> {
+        Ok(sqlx::query("DELETE FROM isoloir_refused WHERE received < $1").bind(before).execute(&self.pool).await?.rows_affected())
     }
 
     /// The refusals a checkpoint's `rejects` entry sums up: their `reject`

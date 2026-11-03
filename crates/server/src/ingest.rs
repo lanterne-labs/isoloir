@@ -1,29 +1,124 @@
-//! The ingest (SPEC §11): reads its channels, judges every message, records
-//! it before acknowledging it, logs the accepted ones and the refusals at
-//! the next checkpoint in one transaction, closes polls on time, writes
-//! the mirror and posts the checkpoint notes.
+//! The ingest (SPEC §11): reads its channels, judges every message (the
+//! cheap checks at once, the proofs from a queue that serves fresh
+//! identifiers first), records it before acknowledging it, logs the
+//! accepted ones at the next checkpoint in one transaction (a refusal is
+//! its signed ack, never an entry), closes polls on time, writes the
+//! mirror (pushed in the background) and posts the checkpoint notes.
 
 use crate::mirror::Mirror;
-use crate::store::{PendingRow, Refused, Store};
+use crate::store::{PendingRow, Store};
 use isoloir_core::{canonical, encoding};
-use isoloir_proto::body::{self, Ack, Body, Close, EntryKind, Outcome, Reject, Rejects, MAX_BODY, REJECTS_LOGGED, V1};
+use isoloir_proto::body::{self, Ack, Body, Close, EntryKind, Outcome, V1};
 use isoloir_proto::judge::{self, Checkers, Passports, Pending, Proofs, Verdict};
 use isoloir_proto::note;
 use isoloir_proto::sig::Event;
 use isoloir_proto::state::State;
 use isoloir_proto::tally::Tlock;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
+use std::cmp::Reverse;
 use std::sync::Arc;
 
-/// Nostr kinds (SPEC §11.1).
+/// Nostr kinds (SPEC §11.1): ephemeral, relays keep none.
 pub mod kinds {
-    pub const REGISTER: u32 = 7100;
-    pub const BALLOT: u32 = 7101;
-    pub const ACK: u32 = 7102;
-    pub const CHECKPOINT: u32 = 7103;
-    pub const LINK: u32 = 7104;
-    pub const TALLY: u32 = 7105;
-    pub const COMPLAINT: u32 = 7106;
+    pub const REGISTER: u32 = 27100;
+    pub const BALLOT: u32 = 27101;
+    pub const ACK: u32 = 27102;
+    pub const CHECKPOINT: u32 = 27103;
+    pub const LINK: u32 = 27104;
+    pub const TALLY: u32 = 27105;
+    pub const COMPLAINT: u32 = 27106;
+    /// The kinds of clients written before (stored by relays): still read,
+    /// and answered in the same range.
+    pub const LEGACY: u32 = 20000;
+
+    /// The entry kind of a message kind, and whether it is a legacy kind.
+    pub fn message(kind: u32) -> Option<(isoloir_proto::body::EntryKind, bool)> {
+        use isoloir_proto::body::EntryKind;
+        let (k, legacy) = if kind < LEGACY { (kind + LEGACY, true) } else { (kind, false) };
+        Some((
+            match k {
+                REGISTER => EntryKind::Register,
+                BALLOT => EntryKind::Ballot,
+                TALLY => EntryKind::Tally,
+                _ => return None,
+            },
+            legacy,
+        ))
+    }
+
+    /// Every message kind the ingest reads.
+    pub fn read() -> Vec<u32> {
+        vec![REGISTER, BALLOT, TALLY, REGISTER - LEGACY, BALLOT - LEGACY, TALLY - LEGACY]
+    }
+}
+
+/// How long refused bodies are kept (SPEC §11.4).
+pub const REFUSED_KEPT: u64 = 30 * 86_400;
+
+/// The window of a proof of work's time (SPEC §11.1).
+pub const POW_PAST: u64 = 7_200;
+pub const POW_AHEAD: u64 = 300;
+
+/// The most messages waiting for their proof check; beyond, a message is
+/// dropped unanswered (its device retries).
+pub const QUEUE_MAX: usize = 100_000;
+
+/// The proof of work of an envelope (SPEC §11.1): its `pow` tag's time and
+/// nonce make `SHA-256("isoloir/1/pow\n" ‖ origin ‖ "\n" ‖ pubkey ‖ "\n" ‖ t
+/// ‖ "\n" ‖ nonce)` start with `bits` zero bits. Returns its time.
+pub fn pow_check(origin: &str, ev: &Event, bits: u32, now: u64) -> Option<u64> {
+    let tag = ev.tags.iter().find(|t| t.first().map(String::as_str) == Some("pow"))?;
+    let (t, nonce) = (tag.get(1)?, tag.get(2)?);
+    let t: u64 = t.parse().ok().filter(|n: &u64| n.to_string() == *t)?;
+    if nonce.is_empty() || nonce.len() > 32 || !nonce.is_ascii() || t + POW_PAST < now || t > now + POW_AHEAD {
+        return None;
+    }
+    let h = encoding::sha256(format!("{}/pow\n{origin}\n{}\n{t}\n{nonce}", isoloir_proto::PROTOCOL, ev.pubkey).as_bytes());
+    (leading_zeros(&h) >= bits).then_some(t)
+}
+
+fn leading_zeros(h: &[u8]) -> u32 {
+    let mut n = 0;
+    for b in h {
+        if *b == 0 {
+            n += 8;
+        } else {
+            return n + b.leading_zeros();
+        }
+    }
+    n
+}
+
+/// Finds a nonce for a key (tests, the CLI's voter).
+pub fn pow_solve(origin: &str, pubkey: &str, t: u64, bits: u32) -> String {
+    (0u64..)
+        .map(|n| n.to_string())
+        .find(|nonce| leading_zeros(&encoding::sha256(format!("{}/pow\n{origin}\n{pubkey}\n{t}\n{nonce}", isoloir_proto::PROTOCOL).as_bytes())) >= bits)
+        .expect("a nonce")
+}
+
+/// The identifier a message claims (SPEC §11.2: the queue's order).
+fn claim(kind: EntryKind, bytes: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    match kind {
+        EntryKind::Register => Some(format!("u{}:{}", v["registry"], v["uid"].as_str()?)),
+        EntryKind::Ballot => Some(format!("b{}:{}", v["poll"], v["nullifier"].as_str().or(v["ident"].as_str())?)),
+        _ => None,
+    }
+}
+
+/// The checkers of the cheap pass: every proof check is left for later.
+struct Later;
+const LATER: &str = "the proof check comes later";
+impl isoloir_proto::judge::Proofs for Later {
+    fn verify(&self, _: &isoloir_proto::body::CircuitRef, _: &[u8], _: &[[u8; 32]]) -> Result<bool, String> {
+        Err(LATER.into())
+    }
+}
+impl Passports for Later {
+    fn verify(&self, _: &isoloir_proto::body::Eligibility, _: &serde_json::Value, _: &str, _: u64) -> Result<Option<String>, String> {
+        Err(LATER.into())
+    }
 }
 
 /// The relay tag of a ledger (Nostr channels).
@@ -70,11 +165,20 @@ pub struct Ingest {
     pub proofs: Box<dyn Proofs + Send + Sync>,
     pub passports: Box<dyn Passports + Send + Sync>,
     pub tlock: Option<Box<dyn Tlock + Send + Sync>>,
-    pub mirror: Option<Mirror>,
+    pub mirror: Option<Arc<Mirror>>,
     /// OpenTimestamps calendars; empty: no stamps (tests, local trials).
     pub calendars: Vec<String>,
     last_upgrade: u64,
-    last_push_try: u64,
+    last_purge: u64,
+    /// Messages past the cheap checks, waiting for their proof check:
+    /// (when their identifier was last claimed + 1, 0 for never; arrival).
+    queue: BinaryHeap<Reverse<(u64, u64)>>,
+    queued: HashMap<u64, Incoming>,
+    queued_ids: std::collections::HashSet<String>,
+    arrivals: u64,
+    last_claimed: HashMap<String, u64>,
+    /// The keys a proof of work was spent on: body hash and work time.
+    pow_keys: HashMap<String, (String, u64)>,
 }
 
 /// The longest time between two checkpoints, even on a quiet ledger.
@@ -83,8 +187,8 @@ pub const HEARTBEAT: u64 = 600;
 /// How often incomplete stamps are upgraded.
 const UPGRADE_EVERY: u64 = 3_600;
 
-/// How often a failed mirror push is tried again.
-pub const PUSH_RETRY: u64 = 30;
+/// How often the refused bodies past REFUSED_KEPT are purged.
+const PURGE_EVERY: u64 = 3_600;
 
 impl Ingest {
     /// Loads the ledger from the store: the log is replayed into the state,
@@ -99,13 +203,15 @@ impl Ingest {
         tlock: Option<Box<dyn Tlock + Send + Sync>>,
         mirror: Option<Mirror>,
     ) -> anyhow::Result<Ingest> {
+        let mirror = mirror.map(Arc::new);
         let mut state = State::new();
         let entries = store.entries().await?;
         let notes = store.checkpoints().await?;
         let mut it = entries.into_iter().peekable();
         let mut origin = String::new();
         // A mirror behind the database (lost, wiped, or the genesis) is
-        // written again as the log is replayed.
+        // written again as the log is replayed; a mirror that cannot be
+        // written never stops the log.
         let mirrored = mirror.as_ref().map(|m| m.last_index()).unwrap_or(u64::MAX);
         for (idx, signed) in &notes {
             let from = state.next_seq();
@@ -118,9 +224,8 @@ impl Ingest {
             origin = cp.origin.clone();
             state.record(&cp).map_err(|e| anyhow::anyhow!("replay: {e}"))?;
             if let (Some(m), true) = (&mirror, (*idx as u64) > mirrored) {
-                m.write_data(&state, *idx as u64, from)?;
-                if let Err(e) = m.write_note(*idx as u64, signed) {
-                    tracing::warn!(error = %e, index = idx, "mirror note during the replay (pushed with the next checkpoint)");
+                if let Err(e) = m.write_checkpoint(&state, *idx as u64, from, signed) {
+                    tracing::error!(error = %e, index = idx, "mirror during the replay");
                 }
             }
         }
@@ -145,8 +250,17 @@ impl Ingest {
             mirror,
             calendars: vec![],
             last_upgrade: 0,
-            last_push_try: 0,
+            last_purge: 0,
+            queue: BinaryHeap::new(),
+            queued: HashMap::new(),
+            queued_ids: Default::default(),
+            arrivals: 0,
+            last_claimed: HashMap::new(),
+            pow_keys: HashMap::new(),
         };
+        if let Some(m) = &ingest.mirror {
+            m.start();
+        }
         if let Some(l) = ingest.state.ledger() {
             if l.log_key != ingest.signer.verifier() {
                 anyhow::bail!("the log key given is not the ledger's");
@@ -158,8 +272,8 @@ impl Ingest {
         for r in ingest.store.pending().await? {
             if r.outcome == "accepted" {
                 ingest.pending.admit(r.kind, &r.body);
+                ingest.rows.push(r);
             }
-            ingest.rows.push(r);
         }
         Ok(ingest)
     }
@@ -179,7 +293,7 @@ impl Ingest {
         state.apply(EntryKind::Ledger, &bytes, now).map_err(|e| anyhow::anyhow!(e))?;
         let cp = state.checkpoint(1, now, None);
         let signed = signer.sign(&cp.text());
-        store.checkpoint(&[(0, EntryKind::Ledger, bytes.clone(), encoding::body_hash(&bytes))], 1, &signed, now, 1, &[], &[], &[]).await
+        store.checkpoint(&[(0, EntryKind::Ledger, bytes.clone(), encoding::body_hash(&bytes))], 1, &signed, now, 1, &[], &[]).await
     }
 
     pub fn tag(&self) -> &str {
@@ -194,11 +308,13 @@ impl Ingest {
         self.state.last_checkpoint().map(|c| c.index + 1).unwrap_or(1)
     }
 
-    fn ack_event(&self, of: &str, hash: &str, outcome: Outcome, reason: Option<isoloir_proto::Reason>, checkpoint: Option<u64>, now: u64) -> Event {
+    #[allow(clippy::too_many_arguments)]
+    fn ack_event(&self, of: &str, hash: &str, outcome: Outcome, reason: Option<isoloir_proto::Reason>, checkpoint: Option<u64>, legacy: bool, now: u64) -> Event {
         let ack = Ack { v: V1, of: of.to_string(), hash: hash.to_string(), outcome, reason, checkpoint };
+        let kind = if legacy { kinds::ACK - kinds::LEGACY } else { kinds::ACK };
         // To the minute: an ack is public, and its time would date the
         // entry it names to the second (SPEC §11.2).
-        Event::sign(&self.nostr_sk, now / 60 * 60, kinds::ACK, vec![vec!["t".into(), self.tag.clone()], vec!["e".into(), of.to_string()]], canonical::to_string(&ack).expect("ack"))
+        Event::sign(&self.nostr_sk, now / 60 * 60, kind, vec![vec!["t".into(), self.tag.clone()], vec!["e".into(), of.to_string()]], canonical::to_string(&ack).expect("ack"))
     }
 
     async fn send_ack(&self, origin: &str, ev: &Event) {
@@ -212,15 +328,12 @@ impl Ingest {
         }
     }
 
-    /// Handles one message from a channel.
+    /// Handles one message from a channel: the envelope, then the cheap
+    /// checks; a message that passes them waits for its proof check in the
+    /// queue ([`Ingest::work`]).
     pub async fn handle(&mut self, inc: Incoming, now: u64) -> anyhow::Result<()> {
         let ev = &inc.event;
-        let kind = match ev.kind {
-            kinds::REGISTER => EntryKind::Register,
-            kinds::BALLOT => EntryKind::Ballot,
-            kinds::TALLY => EntryKind::Tally,
-            _ => return Ok(()),
-        };
+        let Some((kind, _)) = kinds::message(ev.kind) else { return Ok(()) };
         if ev.tag("t") != Some(self.tag.as_str()) || !ev.verify() {
             return Ok(());
         }
@@ -230,29 +343,104 @@ impl Ingest {
             self.send_ack(&inc.origin, &ack).await;
             return Ok(());
         }
+        if self.queued_ids.contains(&ev.id) {
+            return Ok(());
+        }
+        // The proof of work, bound to the key (SPEC §11.1): junk without it
+        // is dropped unanswered.
+        let bits = self.state.ledger().map(|l| l.pow).unwrap_or(0);
+        if bits > 0 && kind != EntryKind::Tally {
+            let hash = encoding::body_hash(ev.content.as_bytes());
+            let origin = self.state.ledger().map(|l| l.origin.clone()).unwrap_or_default();
+            let Some(t) = pow_check(&origin, ev, bits, now) else { return Ok(()) };
+            match self.pow_keys.get(&ev.pubkey) {
+                Some((h, _)) if *h != hash => return Ok(()),
+                _ => {
+                    self.pow_keys.insert(ev.pubkey.clone(), (hash, t));
+                }
+            }
+        }
+        if let Some(c) = claim(kind, ev.content.as_bytes()) {
+            let last = self.last_claimed.insert(c, now);
+            if self.decide(&inc, kind, now, true).await? {
+                return Ok(());
+            }
+            if self.queued.len() >= QUEUE_MAX {
+                tracing::warn!(id = %ev.id, "the queue is full: message dropped");
+                return Ok(());
+            }
+            self.arrivals += 1;
+            self.queue.push(Reverse((last.map(|t| t + 1).unwrap_or(0), self.arrivals)));
+            self.queued.insert(self.arrivals, inc.clone());
+            self.queued_ids.insert(ev.id.clone());
+            return Ok(());
+        }
+        // Tallies (and what claims nothing): judged whole at once.
+        self.decide(&inc, kind, now, false).await?;
+        Ok(())
+    }
+
+    /// Whether messages wait for their proof check.
+    pub fn has_work(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    /// Judges the first message of the queue: never-claimed identifiers
+    /// first, then the longest unclaimed.
+    pub async fn work(&mut self, now: u64) -> anyhow::Result<()> {
+        let Some(Reverse((_, n))) = self.queue.pop() else { return Ok(()) };
+        let Some(inc) = self.queued.remove(&n) else { return Ok(()) };
+        self.queued_ids.remove(&inc.event.id);
+        let Some((kind, _)) = kinds::message(inc.event.kind) else { return Ok(()) };
+        self.decide(&inc, kind, now, false).await?;
+        Ok(())
+    }
+
+    /// Judges the whole queue (tests, and before a checkpoint in a trial).
+    pub async fn drain(&mut self, now: u64) -> anyhow::Result<()> {
+        while self.has_work() {
+            self.work(now).await?;
+        }
+        Ok(())
+    }
+
+    /// Judges a message (`cheap`: up to its proof check) and answers it.
+    /// Returns false when the cheap pass leaves it for the proof check.
+    async fn decide(&mut self, inc: &Incoming, kind: EntryKind, now: u64, cheap: bool) -> anyhow::Result<bool> {
+        let ev = &inc.event;
+        let legacy = ev.kind < kinds::LEGACY;
         let bytes = ev.content.as_bytes().to_vec();
         let hash = encoding::body_hash(&bytes);
         // The same body under another event (a repost): the same outcome.
         let logged = self.state.hashes.get(&hash).copied();
-        let pending_same = self.rows.iter().any(|r| r.hash == hash && r.outcome == "accepted");
+        let pending_same = self.rows.iter().any(|r| r.hash == hash);
         let (outcome, reason, checkpoint) = if let Some(seq) = logged.filter(|s| self.state.entries[*s as usize].0 == kind) {
             (Outcome::Accepted, None, self.state.checkpoint_of(seq).map(|c| c.index))
         } else if pending_same {
             (Outcome::Accepted, None, Some(self.next_index()))
         } else {
-            match judge::judge(&self.state, &self.pending, kind, &bytes, now, &self.checkers()) {
+            let verdict = if cheap {
+                let later = Later;
+                let c = Checkers { proofs: &later, passports: &later, tlock: self.tlock.as_deref().map(|t| t as &dyn Tlock) };
+                judge::judge(&self.state, &self.pending, kind, &bytes, now, &c)
+            } else {
+                judge::judge(&self.state, &self.pending, kind, &bytes, now, &self.checkers())
+            };
+            match verdict {
                 Verdict::Accept => (Outcome::Accepted, None, Some(self.next_index())),
                 Verdict::Reject(r) => (Outcome::Rejected, Some(r), None),
+                Verdict::Defer(why) if cheap && why.contains(LATER) => return Ok(false),
                 Verdict::Defer(why) => {
                     if !self.deferred.contains_key(&ev.id) {
                         tracing::warn!(id = %ev.id, why, deferred = self.deferred.len() + 1, "message deferred");
                     }
                     self.deferred.insert(ev.id.clone(), inc.clone());
-                    return Ok(());
+                    return Ok(true);
                 }
             }
         };
-        let ack = self.ack_event(&ev.id, &hash, outcome, reason, checkpoint, now);
+        let ack = self.ack_event(&ev.id, &hash, outcome, reason, checkpoint, legacy, now);
+        let ack_json = serde_json::to_value(&ack)?;
         let fresh = logged.is_none() && !pending_same;
         let row = PendingRow {
             event_id: ev.id.clone(),
@@ -265,19 +453,21 @@ impl Ingest {
             reason: reason.map(|r| r.as_str().to_string()),
             author: Some(ev.pubkey.clone()),
         };
-        if fresh {
-            // Durable before the ack: an accepted message is never lost.
-            self.store.judged(&row, &serde_json::to_value(&ack)?).await?;
-            if outcome == Outcome::Accepted {
+        match (fresh, outcome) {
+            (true, Outcome::Accepted) => {
+                // Durable before the ack: an accepted message is never lost.
+                self.store.judged(&row, &ack_json).await?;
                 self.pending.admit(kind, &bytes);
+                self.rows.push(row);
             }
-            self.rows.push(row);
-        } else {
-            self.store.seen_only(&ev.id, &inc.origin, &serde_json::to_value(&ack)?).await?;
+            // A refusal is its ack (SPEC §11.4): the body is kept a while
+            // for debugging, never logged.
+            (true, Outcome::Rejected) => self.store.refused(&row, &ack_json).await?,
+            (false, _) => self.store.seen_only(&ev.id, &inc.origin, &ack_json).await?,
         }
         self.deferred.remove(&ev.id);
         self.send_ack(&inc.origin, &ack).await;
-        Ok(())
+        Ok(true)
     }
 
     /// The periodic work: deferred messages, unposted acks, submissions,
@@ -294,23 +484,15 @@ impl Ingest {
         }
         self.take_submissions(now).await?;
         self.upgrade_stamps(now).await?;
-        // A checkpoint names its mirror commit: none is signed while the
-        // remote lacks the previous ones. On an ephemeral disk a restart
-        // loses unpushed commits, and every note that named one would name
-        // a commit no reader can fetch; the ledger waits instead (the
-        // messages are stored and acknowledged meanwhile).
-        if let Some(m) = &self.mirror {
-            if m.unpushed() {
-                if now < self.last_push_try + PUSH_RETRY {
-                    return Ok(None);
-                }
-                self.last_push_try = now;
-                if let Err(e) = m.push_pending() {
-                    tracing::error!(error = %e, "mirror push failed again: no checkpoint until it goes through");
-                    return Ok(None);
-                }
-                tracing::info!("mirror pushed; checkpoints resume");
+        if now >= self.last_purge + PURGE_EVERY {
+            self.last_purge = now;
+            match self.store.purge_refused(now.saturating_sub(REFUSED_KEPT) as i64).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(purged = n, "refused bodies past their time"),
+                Err(e) => tracing::error!(error = %e, "purging refused bodies"),
             }
+            self.pow_keys.retain(|_, (_, t)| *t + POW_PAST + POW_AHEAD >= now);
+            self.last_claimed.retain(|_, t| *t + 86_400 >= now);
         }
         let Some(ledger) = self.state.ledger().cloned() else { return Ok(None) };
         let closes: Vec<u32> = self.state.polls.iter().filter(|(_, p)| p.close.is_none() && now >= p.current().closes).map(|(id, _)| *id).collect();
@@ -419,48 +601,13 @@ impl Ingest {
         Ok(())
     }
 
-    /// Writes a checkpoint: the accepted messages and the refusals ordered
-    /// by body hash, then the closes; the note; the store, in one
-    /// transaction; then the mirror and the relays.
+    /// Writes a checkpoint: the accepted messages ordered by body hash,
+    /// then the closes; the note; the store, in one transaction; then the
+    /// mirror's files and the relays.
     pub async fn checkpoint(&mut self, now: u64, closes: &[u32]) -> anyhow::Result<u64> {
         let index = self.next_index();
         let from = self.state.next_seq();
-        let mut entries: Vec<(EntryKind, Vec<u8>)> = vec![];
-        // Refusals: the first REJECTS_LOGGED in arrival order are entries of
-        // their own, the others are summed up in one `rejects` entry; none
-        // carries its body (SPEC §11.4), which stays in the store.
-        let mut refused: Vec<Refused> = vec![];
-        for r in &self.rows {
-            if r.outcome == "accepted" {
-                entries.push((r.kind, r.body.clone()));
-                continue;
-            }
-            let reject = Reject {
-                v: V1,
-                of: r.event_id.clone(),
-                author: r.author.clone(),
-                size: Some(r.body.len() as u64),
-                hash: r.hash.clone(),
-                reason: r.reason.as_deref().and_then(|s| serde_json::from_value(serde_json::Value::String(s.into())).ok()).unwrap_or(isoloir_proto::Reason::Malformed),
-                kind: Some(r.kind.as_str().to_string()),
-                raw: None,
-            };
-            let entry = Body::Reject(reject).encode();
-            let listed = refused.len() < REJECTS_LOGGED;
-            if listed {
-                entries.push((EntryKind::Reject, entry.clone()));
-            }
-            refused.push(Refused { event_id: r.event_id.clone(), entry, listed, body: (r.body.len() <= MAX_BODY).then(|| r.body.clone()) });
-        }
-        let mut summed: Vec<&Refused> = refused.iter().filter(|r| !r.listed).collect();
-        if !summed.is_empty() {
-            summed.sort_by_cached_key(|r| encoding::body_hash(&r.entry));
-            let bodies: Vec<&[u8]> = summed.iter().map(|r| r.entry.as_slice()).collect();
-            let size = self.rows.iter().filter(|r| r.outcome != "accepted").skip(REJECTS_LOGGED).map(|r| r.body.len() as u64).sum();
-            let sum = Rejects { v: V1, count: summed.len() as u64, size, root: body::rejects_root(&bodies) };
-            tracing::warn!(count = sum.count, size = sum.size, "refusals beyond the checkpoint's bound: summed up");
-            entries.push((EntryKind::Rejects, Body::Rejects(sum).encode()));
-        }
+        let mut entries: Vec<(EntryKind, Vec<u8>)> = self.rows.iter().map(|r| (r.kind, r.body.clone())).collect();
         for (_, k, b) in &self.subs {
             entries.push((*k, b.clone()));
         }
@@ -486,10 +633,8 @@ impl Ingest {
             let seq = state.apply(EntryKind::Close, &c, now).map_err(|e| anyhow::anyhow!(e))?;
             logged.push((seq, EntryKind::Close, c.clone(), encoding::body_hash(&c)));
         }
-        let token = match &self.mirror {
-            Some(m) => m.write_data(state, index, from)?,
-            None => None,
-        };
+        // The newest pushed commit: a checkpoint never waits for the push.
+        let token = self.mirror.as_ref().and_then(|m| m.token());
         let cp = state.checkpoint(index, now, token);
         let signed = self.signer.sign(&cp.text());
         state.record(&cp).map_err(|e| anyhow::anyhow!(e))?;
@@ -503,7 +648,7 @@ impl Ingest {
                 sub_ids.push(*id);
             }
         }
-        if let Err(e) = self.store.checkpoint(&logged, index, &signed, now, cp.size, &pending_ids, &sub_ids, &refused).await {
+        if let Err(e) = self.store.checkpoint(&logged, index, &signed, now, cp.size, &pending_ids, &sub_ids).await {
             // The database did not take the checkpoint: the state in memory
             // is ahead of it. Stop; a restart replays the database.
             anyhow::bail!("checkpoint {index} not stored ({e}); restart to replay the log");
@@ -512,9 +657,8 @@ impl Ingest {
         self.subs.clear();
         self.pending.clear();
         if let Some(m) = &self.mirror {
-            if let Err(e) = m.write_note(index, &signed) {
-                self.last_push_try = now;
-                tracing::error!(error = %e, index, "mirror (the next checkpoint waits for the push)");
+            if let Err(e) = m.write_checkpoint(&self.state, index, from, &signed) {
+                tracing::error!(error = %e, index, "mirror (the log goes on; a restart writes it again)");
             }
         }
         let ev = Event::sign(&self.nostr_sk, now, kinds::CHECKPOINT, vec![vec!["t".into(), self.tag.clone()]], signed.clone());

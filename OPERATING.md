@@ -53,11 +53,11 @@ browsers read through a CDN by commit. Create an empty repository, give
 the ingest a deploy key with write access, and point it there: an empty
 mirror directory is cloned at start (so an ephemeral disk is fine, the
 circuits and the stamps come back with the clone, a partial one:
-`--filter=blob:none`), a new one is initialised. A checkpoint waits
-until the remote holds the previous checkpoints' commits (retried every
-30 s): a lasting push failure, such as a revoked deploy key, pauses the
-log, with an error in the logs, rather than sign notes naming commits
-that could be lost.
+`--filter=blob:none`), a new one is initialised. Checkpoints never
+wait for git: a background task commits and pushes, retrying every 30 s
+(an error in the logs while the remote refuses), and each note names
+the newest pushed commit. Refused messages are kept 30 days in
+`isoloir_refused`, then purged.
 
 ```sh
 isoloir ingest --mirror-dir /app/mirror --mirror-git git@github.com:org/ledger-data.git \
@@ -72,9 +72,8 @@ C2SP `PRIVATE+KEY+<origin>+…` string such as Go's note package writes),
 `ISOLOIR_NOSTR_KEY`, `ISOLOIR_MIRROR_GIT` (or `--mirror-git`),
 `ISOLOIR_MIRROR_SSH_KEY` (the private half of a write deploy key of the
 mirror's repository), `ISOLOIR_BB`, `ISOLOIR_ETH_RPC`
-(optional, for passport certificate roots), `PORT` (serves `/v1/health`, the refusals for auditors,
-`/v1/rejects/<index>` and `/v1/refused/<event id>`, and the direct
-channel when the ledger lists one). The ingest refuses to
+(optional, for passport certificate roots), `PORT` (serves `/v1/health`, and the direct channel when the ledger
+lists one). The ingest refuses to
 start when its keys are not the ledger's. One instance per database: a
 second one waits up to 10 minutes for the first to stop (a deploy starts
 the new process before the old one is gone), then refuses to start. The container image (`Dockerfile`) runs it

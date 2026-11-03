@@ -140,6 +140,17 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
+    /// The `mirror` token: a commit and the newest checkpoint it covers
+    /// (`<commit>:<index>`), or, in notes of earlier versions, the commit
+    /// of this checkpoint's own data (no index).
+    pub fn mirror_commit(&self) -> Option<(&str, Option<u64>)> {
+        let m = self.mirror.as_deref()?;
+        Some(match m.split_once(':') {
+            Some((c, i)) => (c, i.parse().ok()),
+            None => (m, None),
+        })
+    }
+
     pub fn text(&self) -> String {
         let mut s = format!("{}\n{}\n{}\nindex {}\ntime {}\n", self.origin, self.size, STANDARD.encode(self.root), self.index, self.time);
         for (id, n, r) in &self.registries {

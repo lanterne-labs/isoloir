@@ -163,13 +163,22 @@ fn ballot(state: &State, pending: &Pending, bytes: &[u8], now: u64, c: &Checkers
         Revote::None | Revote::Linked => {
             let n = b.nullifier.clone().expect("shape");
             let s = b.seq.expect("shape");
-            let last = p.latest.get(&n).map(|(s, _)| *s).into_iter().chain(pending.nullifiers.get(&(b.poll, n)).copied()).max();
+            let last = p.latest.get(&n).map(|(s, _)| *s).into_iter().chain(pending.nullifiers.get(&(b.poll, n.clone())).copied()).max();
             if let Some(last) = last {
                 if setup.revote == Revote::None {
                     return reject(Reason::RevoteOff);
                 }
                 if s <= last {
                     return reject(Reason::StaleSeq);
+                }
+                // A rate of counted re-votes (SPEC §7.4): a pending ballot,
+                // or one logged less than the gap ago.
+                if ledger.revote_gap > 0 {
+                    let pending_one = pending.nullifiers.contains_key(&(b.poll, n.clone()));
+                    let logged_at = p.latest.get(&n).and_then(|(_, i)| p.ballots.get(*i)).and_then(|lb| state.checkpoint_of(lb.seq)).map(|c| c.time);
+                    if pending_one || logged_at.is_some_and(|t| now < t + ledger.revote_gap) {
+                        return reject(Reason::TooSoon);
+                    }
                 }
             }
             // A seq is a counter: a huge one would make a ballot final and

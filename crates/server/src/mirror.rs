@@ -1,27 +1,41 @@
 //! The mirror (SPEC §15): the static files browsers read, written after
-//! each checkpoint. A checkpoint's data files are written first; with a
-//! git mirror they are committed, and the commit is the token the note
-//! names, so a reader can prove which files it was served; the note
-//! itself follows in a second commit.
+//! each checkpoint, in a git repository whose history only grows. A
+//! checkpoint writes its files and returns; a background task commits
+//! them and pushes, retrying what the remote lacks, so the git host down
+//! or full never stops the log. A note names the newest commit the remote
+//! is known to hold and the newest checkpoint that commit covers
+//! (`mirror <commit>:<index>`).
 
 use isoloir_core::field;
 use isoloir_proto::body::{self, Body, EntryKind};
 use isoloir_proto::state::State;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Leaves per shard.
 pub const SHARD: usize = 1024;
 
+/// How often the background task tries again a push that failed.
+pub const PUSH_RETRY: Duration = Duration::from_secs(30);
+
 #[derive(Default)]
 pub struct Mirror {
     pub dir: PathBuf,
-    /// Commit and push to this remote after each checkpoint.
+    /// Commit and push to this remote.
     pub git: Option<String>,
-    /// Commits the remote does not have yet (a push failed).
-    unpushed: std::sync::atomic::AtomicBool,
+    /// Held while files are written and while git reads the tree: a
+    /// commit holds whole checkpoints.
+    files: Mutex<()>,
+    /// The newest checkpoint whose files are all written.
+    written: AtomicU64,
+    /// The newest commit the remote holds, and the checkpoint it covers.
+    pushed: Mutex<Option<(String, u64)>>,
+    wake: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 fn write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -42,13 +56,13 @@ fn read_json(path: &Path) -> Value {
     std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null)
 }
 
-fn prefix(hex: &str) -> &str {
-    &hex[2..4]
+fn index_of(note: &str) -> Option<u64> {
+    note.lines().find_map(|l| l.strip_prefix("index ").and_then(|n| n.parse().ok()))
 }
 
 impl Mirror {
     pub fn new(dir: PathBuf, git: Option<String>) -> Mirror {
-        Mirror { dir, git, unpushed: Default::default() }
+        Mirror { dir, git, ..Default::default() }
     }
 
     /// Makes the directory a git mirror of `remote`: cloned when empty (an
@@ -60,40 +74,76 @@ impl Mirror {
     /// which git fetches on demand (a merge in `push`). Not shallow: a
     /// push the remote refuses is merged, which needs the history.
     pub fn prepare(&self) -> anyhow::Result<()> {
-        let Some(remote) = &self.git else {
-            std::fs::create_dir_all(&self.dir)?;
-            return Ok(());
-        };
         std::fs::create_dir_all(&self.dir)?;
-        if self.dir.join(".git").is_dir() {
-            return Ok(());
-        }
-        let empty = std::fs::read_dir(&self.dir)?.next().is_none();
-        if empty {
-            let started = std::time::Instant::now();
-            let out = git_command().arg("clone").arg("-q").arg("--filter=blob:none").arg(remote).arg(&self.dir).output()?;
-            if out.status.success() {
-                tracing::info!(remote = %remote, seconds = started.elapsed().as_secs(), "mirror cloned (partial: blob:none)");
-                return Ok(());
+        self.written.store(self.last_index(), Ordering::SeqCst);
+        let Some(remote) = &self.git else { return Ok(()) };
+        if !self.dir.join(".git").is_dir() {
+            let empty = std::fs::read_dir(&self.dir)?.next().is_none();
+            let mut cloned = false;
+            if empty {
+                let started = std::time::Instant::now();
+                let out = git_command().arg("clone").arg("-q").arg("--filter=blob:none").arg(remote).arg(&self.dir).output()?;
+                if out.status.success() {
+                    tracing::info!(remote = %remote, seconds = started.elapsed().as_secs(), "mirror cloned (partial: blob:none)");
+                    cloned = true;
+                } else {
+                    let msg = String::from_utf8_lossy(&out.stderr);
+                    if !msg.contains("empty repository") && !msg.contains("not found") && !msg.contains("does not exist") {
+                        anyhow::bail!("git clone {remote}: {msg}");
+                    }
+                }
             }
-            let msg = String::from_utf8_lossy(&out.stderr);
-            if !msg.contains("empty repository") && !msg.contains("not found") && !msg.contains("does not exist") {
-                anyhow::bail!("git clone {remote}: {msg}");
+            if !cloned {
+                self.git(&["init", "-q", "-b", "main"])?;
+                self.git(&["remote", "add", "origin", remote])?;
             }
         }
-        self.git(&["init", "-q", "-b", "main"])?;
-        self.git(&["remote", "add", "origin", remote])?;
+        self.written.store(self.last_index(), Ordering::SeqCst);
+        // What the remote holds already: its main, and the checkpoint its
+        // checkpoint.txt names.
+        if let Ok(head) = self.git(&["rev-parse", "--verify", "-q", "origin/main"]) {
+            let covered = self.git(&["show", "origin/main:checkpoint.txt"]).ok().and_then(|n| index_of(&n)).unwrap_or(0);
+            *self.pushed.lock().unwrap() = Some((head, covered));
+        }
         Ok(())
     }
 
-    /// Whether commits wait for a push that failed.
-    pub fn unpushed(&self) -> bool {
-        self.unpushed.load(std::sync::atomic::Ordering::SeqCst)
+    /// Starts the background task that commits and pushes: after each
+    /// checkpoint, and every PUSH_RETRY while the remote lacks commits.
+    pub fn start(self: &Arc<Self>) {
+        if self.git.is_none() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.wake.lock().unwrap() = Some(tx);
+        let m = self.clone();
+        std::thread::spawn(move || {
+            let mut failing = false;
+            loop {
+                match rx.recv_timeout(PUSH_RETRY) {
+                    Ok(()) => while rx.try_recv().is_ok() {},
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+                match m.sync() {
+                    Ok(()) if failing => {
+                        failing = false;
+                        tracing::info!("mirror pushed again");
+                    }
+                    Ok(()) => {}
+                    Err(e) => {
+                        failing = true;
+                        tracing::error!(error = %e, "mirror push (retried in the background; the log goes on)");
+                    }
+                }
+            }
+        });
     }
 
-    /// Pushes the commits a failed push left behind.
-    pub fn push_pending(&self) -> anyhow::Result<()> {
-        self.push()
+    /// The note's `mirror` token: the newest pushed commit and the
+    /// checkpoint it covers.
+    pub fn token(&self) -> Option<String> {
+        self.pushed.lock().unwrap().as_ref().map(|(c, i)| format!("{c}:{i}"))
     }
 
     fn git(&self, args: &[&str]) -> anyhow::Result<String> {
@@ -104,49 +154,75 @@ impl Mirror {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
-    fn commit(&self, message: &str) -> anyhow::Result<Option<String>> {
+    /// One round of the background task: commits the files written so
+    /// far (whole checkpoints) and pushes what the remote lacks.
+    pub fn sync(&self) -> anyhow::Result<()> {
         if self.git.is_none() {
-            return Ok(None);
+            return Ok(());
         }
-        self.git(&["add", "-A"])?;
-        if self.git(&["status", "--porcelain"])?.is_empty() {
-            return Ok(Some(self.git(&["rev-parse", "HEAD"])?));
+        let (head, covered) = {
+            let _g = self.files.lock().unwrap();
+            let covered = self.written.load(Ordering::SeqCst);
+            self.git(&["add", "-A"])?;
+            if !self.git(&["status", "--porcelain"])?.is_empty() {
+                self.git(&["-c", "user.name=isoloir", "-c", "user.email=isoloir@localhost", "commit", "-q", "-m", &format!("checkpoint {covered}")])?;
+            }
+            (self.git(&["rev-parse", "--verify", "-q", "HEAD"]).ok(), covered)
+        };
+        let Some(head) = head else { return Ok(()) };
+        if self.pushed.lock().unwrap().as_ref().is_some_and(|(c, _)| *c == head) {
+            return Ok(());
         }
-        self.git(&["-c", "user.name=isoloir", "-c", "user.email=isoloir@localhost", "commit", "-q", "-m", message])?;
-        Ok(Some(self.git(&["rev-parse", "HEAD"])?))
+        self.push_merging()?;
+        let head = self.git(&["rev-parse", "HEAD"])?;
+        *self.pushed.lock().unwrap() = Some((head, covered));
+        Ok(())
     }
 
     /// Pushes to the remote's main. The repository may take commits from
     /// elsewhere (a README): a push the remote refuses because it moved is
-    /// retried after merging it, never rebased, so every commit a
-    /// checkpoint names as its mirror token stays in the history.
-    fn push(&self) -> anyhow::Result<()> {
-        if self.git.is_none() {
-            return Ok(());
-        }
-        let r = self.push_merging();
-        self.unpushed.store(r.is_err(), std::sync::atomic::Ordering::SeqCst);
-        r
-    }
-
+    /// retried after merging it, never rebased, so every pushed commit
+    /// stays in the history.
     fn push_merging(&self) -> anyhow::Result<()> {
         if self.git(&["push", "-q", "origin", "HEAD:main"]).is_ok() {
             return Ok(());
         }
         self.git(&["fetch", "-q", "origin", "main"])?;
-        if let Err(e) = self.git(&["-c", "user.name=isoloir", "-c", "user.email=isoloir@localhost", "merge", "-q", "--no-edit", "FETCH_HEAD"]) {
-            // A conflict: leave the tree as it was, never a half merge that
-            // the next commit would take.
-            let _ = self.git(&["merge", "--abort"]);
-            return Err(e);
+        {
+            let _g = self.files.lock().unwrap();
+            if let Err(e) = self.git(&["-c", "user.name=isoloir", "-c", "user.email=isoloir@localhost", "merge", "-q", "--no-edit", "FETCH_HEAD"]) {
+                // A conflict: leave the tree as it was, never a half merge
+                // that the next commit would take.
+                let _ = self.git(&["merge", "--abort"]);
+                return Err(e);
+            }
         }
         self.git(&["push", "-q", "origin", "HEAD:main"])?;
         Ok(())
     }
 
-    /// Writes the data files of the entries `from..state.next_seq()` of
-    /// checkpoint `index` and returns the mirror token (the commit), if any.
-    pub fn write_data(&self, state: &State, index: u64, from: u64) -> anyhow::Result<Option<String>> {
+    /// Writes a checkpoint's files: the data of the entries
+    /// `from..state.next_seq()` and the signed note, as one step for the
+    /// background commit. The checkpoint is in the store already: the
+    /// mirror never holds one the log lacks.
+    pub fn write_checkpoint(&self, state: &State, index: u64, from: u64, note: &str) -> anyhow::Result<()> {
+        {
+            let _g = self.files.lock().unwrap();
+            self.write_data(state, index, from)?;
+            write(&self.dir.join(format!("checkpoints/{index}.txt")), note.as_bytes())?;
+            write(&self.dir.join("checkpoint.txt"), note.as_bytes())?;
+            self.written.store(index, Ordering::SeqCst);
+        }
+        if let Some(w) = self.wake.lock().unwrap().as_ref() {
+            let _ = w.send(());
+        }
+        Ok(())
+    }
+
+    /// The data files of the entries `from..state.next_seq()` of
+    /// checkpoint `index`. The positions and pseudonyms files of earlier
+    /// versions are no longer written (SPEC §15).
+    fn write_data(&self, state: &State, index: u64, from: u64) -> anyhow::Result<()> {
         let entries: Vec<Value> = (from..state.next_seq())
             .map(|seq| {
                 let (k, b) = &state.entries[seq as usize];
@@ -155,8 +231,6 @@ impl Mirror {
             .collect();
         write_json(&self.dir.join(format!("entries/{index}.json")), &Value::Array(entries))?;
         let mut leaves_touched: BTreeSet<(u32, usize)> = BTreeSet::new();
-        let mut positions_touched: BTreeSet<(u32, String)> = BTreeSet::new();
-        let mut pseudonyms_touched: BTreeSet<(u32, String)> = BTreeSet::new();
         let mut ballot_shards: BTreeSet<(u32, usize)> = BTreeSet::new();
         for seq in from..state.next_seq() {
             let (k, b) = &state.entries[seq as usize];
@@ -167,18 +241,11 @@ impl Mirror {
                 Ok(Body::Register(r)) => {
                     let pos = state.registries[&r.registry].ids[&r.id] as usize;
                     leaves_touched.insert((r.registry, pos / SHARD));
-                    positions_touched.insert((r.registry, prefix(&r.id).to_string()));
                 }
                 Ok(Body::Ballot(bal)) => {
                     let p = &state.polls[&bal.poll];
-                    match (&bal.nullifier, &p.btree) {
-                        (Some(n), _) => {
-                            pseudonyms_touched.insert((bal.poll, prefix(n).to_string()));
-                        }
-                        (None, Some(t)) => {
-                            ballot_shards.insert((bal.poll, (t.len() - 1) / SHARD));
-                        }
-                        _ => {}
+                    if let (None, Some(t)) = (&bal.nullifier, &p.btree) {
+                        ballot_shards.insert((bal.poll, (t.len() - 1) / SHARD));
                     }
                 }
                 Ok(Body::Tally(t)) => {
@@ -195,30 +262,12 @@ impl Mirror {
             let leaves: Vec<String> = (k * SHARD..((k + 1) * SHARD).min(t.len())).map(|i| field::to_hex(&t.leaf(i).unwrap())).collect();
             write_json(&self.dir.join(format!("registries/{reg}/leaves/{k}.json")), &json!(leaves))?;
         }
-        for (reg, pp) in positions_touched {
-            let mut m: Map<String, Value> = Map::new();
-            for (id, pos) in &state.registries[&reg].ids {
-                if prefix(id) == pp {
-                    m.insert(id.clone(), json!(pos));
-                }
-            }
-            write_json(&self.dir.join(format!("registries/{reg}/positions/{pp}.json")), &Value::Object(m))?;
-        }
-        for (poll, pp) in pseudonyms_touched {
-            let mut m: Map<String, Value> = Map::new();
-            for (n, (s, _)) in &state.polls[&poll].latest {
-                if prefix(n) == pp {
-                    m.insert(n.clone(), json!(s));
-                }
-            }
-            write_json(&self.dir.join(format!("polls/{poll}/pseudonyms/{pp}.json")), &Value::Object(m))?;
-        }
         for (poll, k) in ballot_shards {
             let t = state.polls[&poll].btree.as_ref().expect("delta");
             let leaves: Vec<String> = (k * SHARD..((k + 1) * SHARD).min(t.len())).map(|i| field::to_hex(&t.leaf(i).unwrap())).collect();
             write_json(&self.dir.join(format!("polls/{poll}/ballots/{k}.json")), &json!(leaves))?;
         }
-        self.commit(&format!("checkpoint {index}: data"))
+        Ok(())
     }
 
     fn append_setup(&self, path: &Path, entry: Value) -> anyhow::Result<()> {
@@ -230,24 +279,14 @@ impl Mirror {
         write_json(path, &v)
     }
 
-    /// Writes the signed note of a checkpoint, commits and pushes.
-    pub fn write_note(&self, index: u64, note: &str) -> anyhow::Result<()> {
-        write(&self.dir.join(format!("checkpoints/{index}.txt")), note.as_bytes())?;
-        write(&self.dir.join("checkpoint.txt"), note.as_bytes())?;
-        self.commit(&format!("checkpoint {index}"))?;
-        self.push()
-    }
-
     /// The index of the newest checkpoint on the mirror (0 for none).
     pub fn last_index(&self) -> u64 {
-        std::fs::read_to_string(self.dir.join("checkpoint.txt"))
-            .ok()
-            .and_then(|t| t.lines().find_map(|l| l.strip_prefix("index ").and_then(|n| n.parse().ok())))
-            .unwrap_or(0)
+        std::fs::read_to_string(self.dir.join("checkpoint.txt")).ok().and_then(|t| index_of(&t)).unwrap_or(0)
     }
 
     /// Writes a stamp.
     pub fn write_stamp(&self, index: u64, ots: &[u8]) -> anyhow::Result<()> {
+        let _g = self.files.lock().unwrap();
         write(&self.dir.join(format!("stamps/{index}.ots")), ots)
     }
 
@@ -337,53 +376,70 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// A checkpoint's files (no entries), then one round of the background
+    /// task.
+    fn checkpoint(m: &Mirror, index: u64) -> anyhow::Result<()> {
+        m.write_checkpoint(&State::new(), index, 0, &format!("index {index}\n"))?;
+        m.sync()
+    }
+
+    fn bare(tmp: &Path) -> (PathBuf, String) {
+        let remote = tmp.join("remote.git");
+        run(tmp, &["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
+        run(&remote, &["config", "uploadpack.allowFilter", "true"]);
+        let url = format!("file://{}", remote.display());
+        (remote, url)
+    }
+
     // A commit pushed from elsewhere (a README) is merged, not lost, and
-    // the mirror's own commits stay in the history.
+    // the mirror's own commits stay in the history; the note's token names
+    // the pushed commit and the checkpoint it covers.
     #[test]
     fn push_keeps_outside_commits() {
         let tmp = tempfile::tempdir().unwrap();
-        let remote = tmp.path().join("remote.git");
-        run(tmp.path(), &["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
-        let m = Mirror::new(tmp.path().join("mirror"), Some(remote.to_str().unwrap().to_string()));
+        let (_, url) = bare(tmp.path());
+        let m = Mirror::new(tmp.path().join("mirror"), Some(url.clone()));
         m.prepare().unwrap();
-        m.write_note(1, "note 1\n").unwrap();
+        assert_eq!(m.token(), None);
+        checkpoint(&m, 1).unwrap();
         let first = run(&m.dir, &["rev-parse", "HEAD"]);
+        assert_eq!(m.token(), Some(format!("{first}:1")));
 
         let other = tmp.path().join("other");
-        run(tmp.path(), &["clone", "-q", remote.to_str().unwrap(), other.to_str().unwrap()]);
+        run(tmp.path(), &["clone", "-q", &url, other.to_str().unwrap()]);
         std::fs::write(other.join("README.md"), "# a mirror\n").unwrap();
         run(&other, &["add", "README.md"]);
         run(&other, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "README"]);
         run(&other, &["push", "-q", "origin", "HEAD:main"]);
 
-        m.write_note(2, "note 2\n").unwrap();
+        checkpoint(&m, 2).unwrap();
         run(&other, &["pull", "-q", "--no-rebase", "origin", "main"]);
         assert_eq!(std::fs::read_to_string(other.join("README.md")).unwrap(), "# a mirror\n");
-        assert_eq!(std::fs::read_to_string(other.join("checkpoint.txt")).unwrap(), "note 2\n");
+        assert_eq!(std::fs::read_to_string(other.join("checkpoint.txt")).unwrap(), "index 2\n");
         run(&other, &["merge-base", "--is-ancestor", &first, "HEAD"]);
+        let head = run(&other, &["rev-parse", "HEAD"]);
+        assert_eq!(m.token(), Some(format!("{head}:2")));
     }
 
     // A boot on an empty disk clones without the old versions of files
-    // (blob:none); every step after it works: the index, the commits, the
-    // merge of an outside commit (which fetches the blobs it needs), the
-    // push; a failed push is known until one goes through.
+    // (blob:none) and knows what the remote holds; every step after it
+    // works: the commits, the merge of an outside commit (which fetches
+    // the blobs it needs), the push. With the remote gone, checkpoints go
+    // on and the token stays at the last pushed commit until it is back.
     #[test]
     fn partial_clone() {
         let tmp = tempfile::tempdir().unwrap();
-        let remote = tmp.path().join("remote.git");
-        run(tmp.path(), &["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
-        run(&remote, &["config", "uploadpack.allowFilter", "true"]);
-        let url = format!("file://{}", remote.display());
+        let (remote, url) = bare(tmp.path());
         let lines = |first: &str, last: &str| format!("{first}\n{}{last}\n", (0..50).map(|i| format!("line {i}\n")).collect::<String>());
 
         // A first life of the ingest: two versions of a file.
         let a = Mirror::new(tmp.path().join("a"), Some(url.clone()));
         a.prepare().unwrap();
         write(&a.dir.join("shard.txt"), lines("first", "last").as_bytes()).unwrap();
-        a.write_note(1, "index 1\n").unwrap();
+        checkpoint(&a, 1).unwrap();
         let old_blob = run(&a.dir, &["rev-parse", "HEAD:shard.txt"]);
         write(&a.dir.join("shard.txt"), lines("first", "last v2").as_bytes()).unwrap();
-        a.write_note(2, "index 2\n").unwrap();
+        checkpoint(&a, 2).unwrap();
         let second = run(&a.dir, &["rev-parse", "HEAD"]);
 
         // The next boot, on an empty disk.
@@ -393,6 +449,7 @@ mod tests {
         let missing = run(&m.dir, &["rev-list", "--objects", "--all", "--missing=print"]);
         assert!(missing.lines().any(|l| l == format!("?{old_blob}")), "the old version is not fetched: {missing}");
         assert_eq!(m.last_index(), 2);
+        assert_eq!(m.token(), Some(format!("{second}:2")));
         assert_eq!(std::fs::read_to_string(m.dir.join("shard.txt")).unwrap(), lines("first", "last v2"));
 
         // An outside commit changes the file's first line; the mirror its
@@ -404,44 +461,61 @@ mod tests {
         run(&other, &["push", "-q", "origin", "HEAD:main"]);
         write(&m.dir.join("shard.txt"), lines("first", "last v3").as_bytes()).unwrap();
         m.write_stamp(3, b"ots").unwrap();
-        m.write_note(3, "index 3\n").unwrap();
-        assert!(!m.unpushed());
-        let mine = run(&m.dir, &["rev-parse", "HEAD"]);
+        checkpoint(&m, 3).unwrap();
         run(&other, &["pull", "-q", "--no-rebase", "origin", "main"]);
         assert_eq!(std::fs::read_to_string(other.join("shard.txt")).unwrap(), lines("first (edited)", "last v3"));
         assert!(other.join("stamps/3.ots").is_file());
         run(&other, &["merge-base", "--is-ancestor", &second, "HEAD"]);
-        run(&other, &["merge-base", "--is-ancestor", &mine, "HEAD"]);
+        let pushed = m.token().unwrap();
+        assert!(pushed.ends_with(":3"));
 
-        // The remote gone: the push fails and is known; back, it goes through.
+        // The remote gone: the files are written, the push fails, the
+        // token stays; back, the next round pushes everything.
         run(&m.dir, &["remote", "set-url", "origin", "file:///nonexistent/remote.git"]);
-        assert!(m.write_note(4, "index 4\n").is_err());
-        assert!(m.unpushed());
-        assert!(m.push_pending().is_err());
+        assert!(checkpoint(&m, 4).is_err());
+        assert!(checkpoint(&m, 5).is_err());
+        assert_eq!(m.token().unwrap(), pushed);
         run(&m.dir, &["remote", "set-url", "origin", &url]);
-        m.push_pending().unwrap();
-        assert!(!m.unpushed());
-        assert_eq!(run(&remote, &["show", "main:checkpoint.txt"]), "index 4");
+        m.sync().unwrap();
+        assert!(m.token().unwrap().ends_with(":5"));
+        assert_eq!(run(&remote, &["show", "main:checkpoint.txt"]), "index 5");
+        assert_eq!(run(&remote, &["show", "main:checkpoints/4.txt"]), "index 4");
     }
 
     // A merge that conflicts is undone: the next commit takes no half
-    // merge, and the push stays known as pending.
+    // merge, and the push is tried again.
     #[test]
     fn conflicting_merge_is_undone() {
         let tmp = tempfile::tempdir().unwrap();
-        let remote = tmp.path().join("remote.git");
-        run(tmp.path(), &["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
-        let m = Mirror::new(tmp.path().join("m"), Some(remote.to_str().unwrap().to_string()));
+        let (_, url) = bare(tmp.path());
+        let m = Mirror::new(tmp.path().join("m"), Some(url.clone()));
         m.prepare().unwrap();
-        m.write_note(1, "index 1\n").unwrap();
+        checkpoint(&m, 1).unwrap();
         let other = tmp.path().join("other");
-        run(tmp.path(), &["clone", "-q", remote.to_str().unwrap(), other.to_str().unwrap()]);
+        run(tmp.path(), &["clone", "-q", &url, other.to_str().unwrap()]);
         std::fs::write(other.join("checkpoint.txt"), "not a note\n").unwrap();
         run(&other, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "clash"]);
         run(&other, &["push", "-q", "origin", "HEAD:main"]);
-        assert!(m.write_note(2, "index 2\n").is_err());
-        assert!(m.unpushed());
+        assert!(checkpoint(&m, 2).is_err());
+        assert!(m.token().unwrap().ends_with(":1"));
         assert!(!m.dir.join(".git/MERGE_HEAD").exists());
         assert_eq!(std::fs::read_to_string(m.dir.join("checkpoint.txt")).unwrap(), "index 2\n");
+    }
+
+    // The background task pushes after a checkpoint without being asked.
+    #[test]
+    fn background_push() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (remote, url) = bare(tmp.path());
+        let m = Arc::new(Mirror::new(tmp.path().join("m"), Some(url)));
+        m.prepare().unwrap();
+        m.start();
+        m.write_checkpoint(&State::new(), 1, 0, "index 1\n").unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(20);
+        while m.token().is_none() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(m.token().unwrap().ends_with(":1"));
+        assert_eq!(run(&remote, &["show", "main:checkpoint.txt"]), "index 1");
     }
 }

@@ -66,20 +66,27 @@ async fn post(dir: &Path, kind: u32, body: Vec<u8>) -> Result<()> {
     let sk: [u8; 32] = rand::random();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
     let tag = format!("{}/{}", isoloir_proto::PROTOCOL, l.origin);
-    let ev = Event::sign(&sk, now, kind, vec![vec!["t".into(), tag.clone()]], String::from_utf8(body)?);
+    let mut tags = vec![vec!["t".into(), tag.clone()]];
+    if l.pow > 0 {
+        // The proof of work, bound to the key (SPEC §11.1).
+        let pk = hex::encode(isoloir_proto::sig::xonly(&sk));
+        tags.push(vec!["pow".into(), now.to_string(), isoloir_server::ingest::pow_solve(&l.origin, &pk, now, l.pow)]);
+    }
+    let ev = Event::sign(&sk, now, kind, tags, String::from_utf8(body)?);
     let channel = l.channels.iter().find(|c| c.is_active()).context("no active channel")?;
     let ack = match channel {
         isoloir_proto::body::Channel::Direct { url, .. } => {
             println!("posting {} to {url}", ev.id);
             isoloir_server::direct::post_direct(url, &ev, Duration::from_secs(90)).await?
         }
+        isoloir_proto::body::Channel::Iroh { url, .. } => bail!("{url}: iroh channels are not served yet"),
         isoloir_proto::body::Channel::Nostr { .. } => {
             let relays = l.nostr(true);
             let pool = Pool::connect(relays.clone());
             let waiter = {
                 let pool = pool.clone();
                 let id = ev.id.clone();
-                tokio::spawn(async move { pool.wait_for(Filter { kinds: vec![7102], e: vec![id], ..Default::default() }, Duration::from_secs(90)).await })
+                tokio::spawn(async move { pool.wait_for(Filter { kinds: vec![isoloir_server::ingest::kinds::ACK], e: vec![id], ..Default::default() }, Duration::from_secs(90)).await })
             };
             tokio::time::sleep(Duration::from_millis(300)).await;
             let relay = pool.publish_any(&relays, &ev, Duration::from_secs(10)).await.map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -101,7 +108,7 @@ pub async fn register(dir: &Path, registry: u32, secret: &str, uid: &str) -> Res
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
     // The dev provider: the proof bundle names the passport.
     let body = client::register_body(registry, &s, uid, serde_json::json!({"uid": uid}), now, &reg_sk);
-    post(dir, 7100, body).await
+    post(dir, isoloir_server::ingest::kinds::REGISTER, body).await
 }
 
 pub async fn vote(dir: &Path, circuits: &Path, poll_id: u32, secret: &str, choice: &str, seq: u32) -> Result<()> {
@@ -134,5 +141,5 @@ pub async fn vote(dir: &Path, circuits: &Path, poll_id: u32, secret: &str, choic
     let t0 = std::time::Instant::now();
     let proof = prover.prove(&p.circuit.name, &d.inputs)?;
     println!("proved in {} ms", t0.elapsed().as_millis());
-    post(dir, 7101, d.finish(&proof.proof)).await
+    post(dir, isoloir_server::ingest::kinds::BALLOT, d.finish(&proof.proof)).await
 }

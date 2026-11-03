@@ -32,6 +32,9 @@ pub enum Reason {
     /// A linked seq more than `SEQ_GAP` above the pseudonym's last (or
     /// above it for a first ballot): a seq is a counter, not a lock.
     SeqGap,
+    /// A re-vote within the ledger's `revote_gap` of the pseudonym's
+    /// newest ballot.
+    TooSoon,
 }
 
 impl Reason {
@@ -55,12 +58,13 @@ impl Reason {
             Reason::BadTally => "bad_tally",
             Reason::Full => "full",
             Reason::SeqGap => "seq_gap",
+            Reason::TooSoon => "too_soon",
         }
     }
 
     /// The reasons that depend on the time of judgment.
     pub fn time_sensitive(&self) -> bool {
-        matches!(self, Reason::NotOpen | Reason::Closed | Reason::StaleDate | Reason::OldRoot | Reason::NotDue)
+        matches!(self, Reason::NotOpen | Reason::Closed | Reason::StaleDate | Reason::OldRoot | Reason::NotDue | Reason::TooSoon)
     }
 }
 
@@ -129,6 +133,21 @@ pub struct LedgerSetup {
     pub channels: Vec<Channel>,
     pub checkpoint_period: u64,
     pub anchor_age: u64,
+    /// The least time between two counted ballots of a pseudonym (SPEC
+    /// §7.4), seconds; 0: none.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub revote_gap: u64,
+    /// The proof of work of every envelope (SPEC §11.1), bits; 0: none.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub pow: u32,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 /// A way to the ingest (SPEC §11.1). Every channel carries the same
@@ -141,6 +160,9 @@ pub enum Channel {
     Nostr { url: String, state: ChannelState },
     /// The ingest's own HTTP endpoint (`https://`).
     Direct { url: String, state: ChannelState },
+    /// The ingest's iroh node (`iroh://<node id>`), reached only through
+    /// the iroh relay named (SPEC §11.1). Specified, not served yet.
+    Iroh { url: String, relay: String, state: ChannelState },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,13 +175,13 @@ pub enum ChannelState {
 impl Channel {
     pub fn url(&self) -> &str {
         match self {
-            Channel::Nostr { url, .. } | Channel::Direct { url, .. } => url,
+            Channel::Nostr { url, .. } | Channel::Direct { url, .. } | Channel::Iroh { url, .. } => url,
         }
     }
 
     pub fn state(&self) -> ChannelState {
         match self {
-            Channel::Nostr { state, .. } | Channel::Direct { state, .. } => *state,
+            Channel::Nostr { state, .. } | Channel::Direct { state, .. } | Channel::Iroh { state, .. } => *state,
         }
     }
 
