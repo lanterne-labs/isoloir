@@ -92,10 +92,20 @@ impl Mirror {
         Ok(Some(self.git(&["rev-parse", "HEAD"])?))
     }
 
+    /// Pushes to the remote's main. The repository may take commits from
+    /// elsewhere (a README): a push the remote refuses because it moved is
+    /// retried after merging it, never rebased, so every commit a
+    /// checkpoint names as its mirror token stays in the history.
     fn push(&self) -> anyhow::Result<()> {
-        if self.git.is_some() {
-            self.git(&["push", "-q", "origin", "HEAD:main"])?;
+        if self.git.is_none() {
+            return Ok(());
         }
+        if self.git(&["push", "-q", "origin", "HEAD:main"]).is_ok() {
+            return Ok(());
+        }
+        self.git(&["fetch", "-q", "origin", "main"])?;
+        self.git(&["-c", "user.name=isoloir", "-c", "user.email=isoloir@localhost", "merge", "-q", "--no-edit", "FETCH_HEAD"])?;
+        self.git(&["push", "-q", "origin", "HEAD:main"])?;
         Ok(())
     }
 
@@ -280,4 +290,41 @@ pub fn parse_entries(v: &Value) -> anyhow::Result<Vec<(u64, EntryKind, Vec<u8>)>
             Ok((seq, kind, body))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    // A commit pushed from elsewhere (a README) is merged, not lost, and
+    // the mirror's own commits stay in the history.
+    #[test]
+    fn push_keeps_outside_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        run(tmp.path(), &["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
+        let m = Mirror { dir: tmp.path().join("mirror"), git: Some(remote.to_str().unwrap().to_string()) };
+        m.prepare().unwrap();
+        m.write_note(1, "note 1\n").unwrap();
+        let first = run(&m.dir, &["rev-parse", "HEAD"]);
+
+        let other = tmp.path().join("other");
+        run(tmp.path(), &["clone", "-q", remote.to_str().unwrap(), other.to_str().unwrap()]);
+        std::fs::write(other.join("README.md"), "# a mirror\n").unwrap();
+        run(&other, &["add", "README.md"]);
+        run(&other, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "README"]);
+        run(&other, &["push", "-q", "origin", "HEAD:main"]);
+
+        m.write_note(2, "note 2\n").unwrap();
+        run(&other, &["pull", "-q", "--no-rebase", "origin", "main"]);
+        assert_eq!(std::fs::read_to_string(other.join("README.md")).unwrap(), "# a mirror\n");
+        assert_eq!(std::fs::read_to_string(other.join("checkpoint.txt")).unwrap(), "note 2\n");
+        run(&other, &["merge-base", "--is-ancestor", &first, "HEAD"]);
+    }
 }
