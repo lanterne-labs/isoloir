@@ -341,6 +341,7 @@ export function zkPassportVerifier(sdk: ZkPassportSdk, rpcUrl: string): (req: Ex
 			in(k: string, v: unknown): Builder;
 			eq(k: string, v: unknown): Builder;
 			bind(k: string, v: unknown): Builder;
+			facematch(mode: 'strict'): Builder;
 			done(): { query: unknown };
 		};
 		let b = zk.createQuery() as Builder;
@@ -357,6 +358,8 @@ export function zkPassportVerifier(sdk: ZkPassportSdk, rpcUrl: string): (req: Ex
 			if (!(date.getTime() >= ref - 2 * day && date.getTime() <= ref + day)) return null;
 			b = b.gte('expiry_date', date);
 		}
+		// A salted identifier comes with the strict face match (verify.mjs).
+		if (e.oprf_key) b = b.facematch('strict');
 		b = b.bind('custom_data', req.custom_data);
 		const { query } = b.done();
 		// The one identifier type the registry names (verify.mjs).
