@@ -6,6 +6,7 @@ pub mod direct;
 pub mod eligibility;
 pub mod ingest;
 pub mod mirror;
+pub mod packed;
 pub mod relays;
 pub mod source;
 pub mod store;
