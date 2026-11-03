@@ -3,13 +3,20 @@
 // audit.rs). The log is read twice: the first pass collects the proofs
 // the judge asks for, the page verifies them (ballots with bb.js against
 // the mirror's verification keys, passports with the ZKPassport SDK), and
-// the second pass replays the log with the verdicts. Then the relays'
-// copies are compared with the log (withholding). A check that could not
-// run is a problem, never a pass.
+// the second pass replays the log with the verdicts. A check that could
+// not run is a problem, never a pass.
+//
+// Mirrors of every version read alike: the entries of earlier logs hold
+// `reject` and `rejects` entries (counted, not judged, by the judge), and
+// an entry's body may be a string or its JSON. Channels keep no copies
+// (SPEC §11.1): there is no comparison with the relays. The newest note
+// may be ahead of the files the mirror holds (SPEC §15): the checkpoints
+// after the last one whose files are there are reported as not read yet,
+// never as missing.
 
 import type { IsoloirWasm } from './wasm.js';
-import type { Eligibility, NostrEvent, OprfKey } from './types.js';
-import type { RelayTransport } from './relay.js';
+import type { Eligibility, OprfKey } from './types.js';
+
 
 /** A proof the judge asked for. */
 export type AuditRequest =
@@ -39,13 +46,14 @@ export interface AuditResult extends AuditReport {
 	/** Ballot proofs and passport proofs checked in the page. */
 	proofs: { checked: number; failed: number };
 	passports: { checked: number; failed: number };
-	/** Events read from the relays, and the relays read (null: not checked). */
-	relays: { events: number; read: string[]; failed: string[] } | null;
+	/** The checkpoints read (1 … `upto`) and the newest note's index: above `upto` the mirror's files had not come yet. */
+	upto: number;
+	latest: number;
 	polls: { id: number; title: string; ballots: number }[];
 	ok: boolean;
 }
 
-export type AuditPhase = 'download' | 'proofs' | 'replay' | 'relays' | 'done';
+export type AuditPhase = 'download' | 'proofs' | 'replay' | 'done';
 
 export interface AuditProgress {
 	phase: AuditPhase;
@@ -67,8 +75,6 @@ export interface AuditOptions {
 	verifyProof(req: Extract<AuditRequest, { type: 'proof' }>): Promise<boolean>;
 	/** Verifies a passport proof: the document's unique identifier, null when refused, or throws. */
 	verifyPassport(req: Extract<AuditRequest, { type: 'passport' }>): Promise<string | null>;
-	/** Reads the relays' copies (withholding); absent, not checked. */
-	relays?: RelayTransport;
 	onProgress?(p: AuditProgress): void;
 	/** Stops the audit (it then throws). */
 	signal?: AbortSignal;
@@ -86,8 +92,12 @@ type Verdict = { type: 'proof'; ok?: boolean; error?: string } | { type: 'passpo
 export async function audit(wasm: IsoloirWasm & AuditWasm, opts: AuditOptions): Promise<AuditResult> {
 	const latest = await opts.text('checkpoint.txt');
 	if (latest === null) throw new Error('the mirror has no checkpoint');
-	const last = Number(/^index (\d+)$/m.exec(latest)?.[1] ?? NaN);
-	if (!Number.isFinite(last)) throw new Error('checkpoint.txt: no index');
+	const newest = Number(/^index (\d+)$/m.exec(latest)?.[1] ?? NaN);
+	if (!Number.isFinite(newest)) throw new Error('checkpoint.txt: no index');
+	// `mirror <commit>:<index>`: the files of the checkpoints after <index> may not be there yet.
+	const mi = /^mirror [^\s:]+[: ](\d+)$/m.exec(latest);
+	const coveredTo = mi ? Math.min(Number(mi[1]), newest) : newest;
+	let last = newest;
 
 	const verdicts: Record<string, Verdict> = {};
 	const progress: AuditProgress = { phase: 'download', checkpoint: 0, checkpoints: last, verified: 0, asked: 0, report: null };
@@ -136,9 +146,16 @@ export async function audit(wasm: IsoloirWasm & AuditWasm, opts: AuditOptions): 
 			for (let i = 1; i <= last; i++) {
 				opts.signal?.throwIfAborted();
 				const [note, entries] = await Promise.all([opts.text(`checkpoints/${i}.txt`), opts.text(`entries/${i}.json`)]);
-				if (note === null) throw new Error(`checkpoint ${i} is missing on the mirror`);
-				if (entries === null) throw new Error(`the entries of checkpoint ${i} are missing on the mirror`);
-				const out = JSON.parse(wasm.audit_checkpoint(id, note, entries)) as CheckpointOut;
+				if (note === null || entries === null) {
+					// Past the checkpoint the note's commit covers, the files may not be pushed yet.
+					if (i > coveredTo) {
+						last = i - 1;
+						progress.checkpoints = last;
+						break;
+					}
+					throw new Error(note === null ? `checkpoint ${i} is missing on the mirror` : `the entries of checkpoint ${i} are missing on the mirror`);
+				}
+				const out = JSON.parse(wasm.audit_checkpoint(id, note, normalizeEntries(entries))) as CheckpointOut;
 				progress.checkpoint = i;
 				progress.report = out.report;
 				onCheckpoint(out);
@@ -167,41 +184,13 @@ export async function audit(wasm: IsoloirWasm & AuditWasm, opts: AuditOptions): 
 		if (out.requests.length) ask(out.requests);
 	});
 	try {
-		const fin = JSON.parse(wasm.audit_finish(second)) as AuditReport & {
-			ledger?: { relays: string[]; tag: string; ingest: string; grace: number };
-			polls: AuditResult['polls'];
-		};
-
-		// 3. The relays' copies (withholding).
-		let relays: AuditResult['relays'] = null;
-		if (opts.relays && fin.ledger && fin.ledger.relays.length) {
-			progress.phase = 'relays';
-			tell();
-			const events: NostrEvent[] = [];
-			const read: string[] = [];
-			const failed: string[] = [];
-			await Promise.all(
-				fin.ledger.relays.map((url) =>
-					readRelay(opts.relays!, url, { kinds: [7100, 7101, 7102, 7105], '#t': [fin.ledger!.tag] }).then(
-						(es) => {
-							events.push(...es);
-							read.push(url);
-						},
-						() => failed.push(url)
-					)
-				)
-			);
-			const found = JSON.parse(wasm.audit_relays(second, JSON.stringify(events))) as string[];
-			fin.problems.push(...found);
-			for (const u of failed) fin.warnings.push(`relay ${u}: not read`);
-			relays = { events: events.length, read, failed };
-		}
+		const fin = JSON.parse(wasm.audit_finish(second)) as AuditReport & { polls: AuditResult['polls'] };
+		if (last < newest) fin.warnings.push(`checkpoints ${last + 1} to ${newest}: their files are not on the mirror yet`);
 
 		progress.phase = 'done';
 		progress.report = fin;
 		tell();
-		const { ledger: _ledger, ...report } = fin;
-		return { ...report, proofs, passports, relays, ok: fin.problems.length === 0 };
+		return { ...fin, proofs, passports, upto: last, latest: newest, ok: fin.problems.length === 0 };
 	} finally {
 		wasm.audit_drop(second);
 	}
@@ -219,32 +208,23 @@ export interface AuditWasm {
 	audit_start(log_key: string, verdicts_json: string, allow_dev: boolean): number;
 	audit_checkpoint(id: number, note: string, entries_json: string): string;
 	audit_finish(id: number): string;
-	audit_relays(id: number, events_json: string): string;
 	audit_drop(id: number): void;
 }
 
-/** A relay's stored events for a filter, up to its end-of-stored-events. */
-function readRelay(t: RelayTransport, url: string, filter: Parameters<RelayTransport['subscribe']>[1], timeoutMs = 30_000): Promise<NostrEvent[]> {
-	return new Promise((resolve, reject) => {
-		const events: NostrEvent[] = [];
-		let stop = () => {};
-		const timer = setTimeout(() => {
-			stop();
-			reject(new Error('timeout'));
-		}, timeoutMs);
-		stop = t.subscribe(url, filter, (e) => events.push(e), {
-			onEose: () => {
-				clearTimeout(timer);
-				stop();
-				resolve(events);
-			},
-			onDown: () => {
-				clearTimeout(timer);
-				stop();
-				reject(new Error('down'));
-			}
-		});
-	});
+/** An entries file with every body as its text (a mirror may write a body as JSON). */
+function normalizeEntries(text: string): string {
+	const list = JSON.parse(text) as { seq: number; kind: string; body: unknown }[];
+	if (!Array.isArray(list)) throw new Error('entries: not an array');
+	if (list.every((e) => typeof e.body === 'string')) return text;
+	return JSON.stringify(list.map((e) => ({ ...e, body: typeof e.body === 'string' ? e.body : canonicalJson(e.body) })));
+}
+
+/** Canonical JSON (SPEC §3): sorted keys, no whitespace, integers only. */
+function canonicalJson(v: unknown): string {
+	if (v === null || typeof v !== 'object') return JSON.stringify(v);
+	if (Array.isArray(v)) return '[' + v.map(canonicalJson).join(',') + ']';
+	const o = v as Record<string, unknown>;
+	return '{' + Object.keys(o).sort().map((k) => JSON.stringify(k) + ':' + canonicalJson(o[k])).join(',') + '}';
 }
 
 /**

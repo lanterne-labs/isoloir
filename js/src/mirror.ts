@@ -1,8 +1,12 @@
 // The mirror (SPEC §15): the static files the browser reads instead of
 // asking the operator anything. Every checkpoint note is verified under
 // the pinned verifier key before anything it names is trusted; files are
-// read at the checkpoint's commit (its `mirror` token) where a source
-// serves by commit, so a reader can prove which files it was served.
+// read at the commit the newest note names (its `mirror` line) where a
+// source serves by commit, so a reader can prove which files it was
+// served. A note of this version names the newest pushed commit and the
+// newest checkpoint it covers (`mirror <commit>:<index>`): the files of a
+// later checkpoint wait for a later note (covered()). A note of an earlier
+// version names the commit of its own files (`mirror <commit>`).
 //
 // A setup or a tally is used only once proven in the log: its file names
 // the checkpoint c whose log holds it and the RFC 6962 inclusion proof of
@@ -17,8 +21,6 @@
 //                                          {setups: [{seq, body, checkpoint, size, path}, …]}: every
 //                                          version in order, the last in force
 //   registries/<id>/leaves/<k>.json        ["0x…", …] leaves 1024·k … 1024·k+1023
-//   registries/<id>/positions/<pp>.json    {"0x<leaf>": position}, pp the leaf's first two hex digits
-//   polls/<id>/pseudonyms/<pp>.json        {"0x<nullifier>": last seq}
 //   polls/<id>/ballots/<k>.json            ["0x…", …] ballot tree leaves, 1024 per file
 //   polls/<id>/tallies/latest.json         {seq, body, checkpoint, size, path}
 //   circuits/<name>/artifact.json          the compiled Noir circuit
@@ -28,6 +30,16 @@ import type { Checkpoint, Entry, Logged, Setup } from './types.js';
 import type { Core } from './wasm.js';
 
 export const SHARD = 1024;
+
+/**
+ * The newest checkpoint whose files a note's commit holds (SPEC §15): the
+ * index its `mirror` line names, the note's own index for a note of an
+ * earlier version or one without a commit (a directory of the latest
+ * files).
+ */
+export function covered(cp: Checkpoint): number {
+	return cp.mirror && cp.mirror_index != null ? Math.min(cp.mirror_index, cp.index) : cp.index;
+}
 
 export interface FetchResponse {
 	status: number;
@@ -218,18 +230,6 @@ export class Mirror {
 		}
 		if (out.length < size) throw new IsoloirError('no_path', `${dir}: ${out.length} leaves, the checkpoint names ${size}`);
 		return out.slice(0, size);
-	}
-
-	/** A leaf's position in a registry, from its shard. */
-	async position(registry: number, leaf: string, token = ''): Promise<number | null> {
-		const shard = await this.json<Record<string, number>>(`registries/${registry}/positions/${leaf.slice(2, 4)}.json`, token);
-		return shard?.[leaf] ?? null;
-	}
-
-	/** The last seq a pseudonym cast in a linked poll. */
-	async pseudonymSeq(poll: number, nullifier: string, token = ''): Promise<number | null> {
-		const shard = await this.json<Record<string, number>>(`polls/${poll}/pseudonyms/${nullifier.slice(2, 4)}.json`, token);
-		return shard?.[nullifier] ?? null;
 	}
 
 	/** The latest tally: its body text and seq, proven in the log. */

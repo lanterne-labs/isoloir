@@ -19,6 +19,8 @@ export type IngestReason =
 	| 'revote_off'
 	| 'stale_seq'
 	| 'seq_gap'
+	/** A re-vote within the ledger's revote_gap of the pseudonym's newest ballot (SPEC §7.4): data.retryAt, data.waitSeconds. */
+	| 'too_soon'
 	| 'duplicate'
 	| 'not_due'
 	| 'bad_tally'
@@ -43,6 +45,8 @@ export type SessionErrorCode =
 	| 'no_relay'
 	/** Channels took it, none acknowledged it. */
 	| 'no_ack'
+	/** The proof of work of an envelope could not be made (SPEC §11.1). */
+	| 'pow'
 	/** The scanned proof is too old: scan again (the same registration key). */
 	| 'stale_proof'
 	| 'not_registered'
@@ -95,7 +99,7 @@ export function toIsoloirError(e: unknown, fallback: IsoloirErrorCode = 'unknown
 	return new IsoloirError(fallback, msg);
 }
 
-const REASONS: readonly string[] = ['malformed', 'version', 'unknown', 'not_open', 'closed', 'bad_sig', 'stale_date', 'uid_used', 'id_used', 'full', 'bad_proof', 'old_root', 'revote_off', 'stale_seq', 'seq_gap', 'duplicate', 'not_due', 'bad_tally', 'bad_setup', 'rejected'];
+const REASONS: readonly string[] = ['malformed', 'version', 'unknown', 'not_open', 'closed', 'bad_sig', 'stale_date', 'uid_used', 'id_used', 'full', 'bad_proof', 'old_root', 'revote_off', 'stale_seq', 'seq_gap', 'too_soon', 'duplicate', 'not_due', 'bad_tally', 'bad_setup', 'rejected'];
 
 /** An ack's reason as a code (an unknown one is 'rejected'). */
 export function reasonOf(r: string | undefined): IngestReason {

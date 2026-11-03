@@ -66,12 +66,20 @@ interface Sub {
 }
 
 interface FakeRelay {
+	/** What the relay stores: regular kinds only (ephemeral ones, 20000–29999, are forwarded and dropped, NIP-16). */
 	events: NostrEvent[];
+	/** Every event the relay took, stored or not (what the tests look at). */
+	seen: NostrEvent[];
 	subs: Set<Sub>;
 	down: boolean;
 	/** Takes acks and never delivers them (a relay that loses messages). */
 	dropAcks: boolean;
 }
+
+export const ephemeral = (kind: number) => kind >= 20000 && kind < 30000;
+
+/** A kind's both spellings: ephemeral and legacy. */
+export const both = (k: keyof typeof core.kinds.legacy) => [core.kinds[k], core.kinds.legacy[k]];
 
 function matches(f: Filter, e: NostrEvent): boolean {
 	if (f.ids && !f.ids.includes(e.id)) return false;
@@ -88,7 +96,7 @@ export class FakeRelays implements RelayTransport {
 	readonly subscriptions: { url: string; filter: Filter }[] = [];
 
 	constructor(urls: string[]) {
-		for (const u of urls) this.relays.set(u, { events: [], subs: new Set(), down: false, dropAcks: false });
+		for (const u of urls) this.relays.set(u, { events: [], seen: [], subs: new Set(), down: false, dropAcks: false });
 	}
 
 	relay(url: string): FakeRelay {
@@ -101,9 +109,10 @@ export class FakeRelays implements RelayTransport {
 		const r = this.relays.get(url);
 		if (!r || r.down) throw new Error(`${url}: connection failed`);
 		if (!core.verifyEvent(event)) throw new Error(`${url} refused: invalid: bad signature`);
-		if (r.dropAcks && event.kind === core.kinds.ack) return;
-		if (r.events.some((e) => e.id === event.id)) return;
-		r.events.push(event);
+		if (r.dropAcks && (event.kind === core.kinds.ack || event.kind === core.kinds.legacy.ack)) return;
+		if (r.seen.some((e) => e.id === event.id)) return;
+		r.seen.push(event);
+		if (!ephemeral(event.kind)) r.events.push(event);
 		for (const s of [...r.subs]) if (matches(s.filter, event)) queueMicrotask(() => s.onEvent(event));
 	}
 
@@ -124,9 +133,10 @@ export class FakeRelays implements RelayTransport {
 		return () => r.subs.delete(sub);
 	}
 
-	/** Every event of a kind on every relay. */
-	all(kind: number): NostrEvent[] {
-		return [...this.relays.values()].flatMap((r) => r.events.filter((e) => e.kind === kind));
+	/** Every event of a kind (or of either of kinds) every relay took. */
+	all(kind: number | number[]): NostrEvent[] {
+		const ks = Array.isArray(kind) ? kind : [kind];
+		return [...this.relays.values()].flatMap((r) => r.seen.filter((e) => ks.includes(e.kind)));
 	}
 }
 
@@ -145,6 +155,22 @@ export interface Authority {
 	pk: string;
 	sign_seed: string;
 	sign_key: string;
+}
+
+export interface IngestOptions {
+	/**
+	 * 'new' (default): reads both kinds, answers in the kind's range,
+	 * sends ephemeral checkpoint events, names `<commit>:<index>` in its
+	 * notes. 'old': the ingest before this version: legacy kinds only, no
+	 * mirror index, no proof of work, no re-vote rate.
+	 */
+	version?: 'old' | 'new';
+	/** The ledger's proof of work, bits. */
+	pow?: number;
+	/** The ledger's re-vote rate, seconds. */
+	revoteGap?: number;
+	/** Notes name no mirror commit (a ledger without a repository). */
+	noMirror?: boolean;
 }
 
 export class FakeIngest {
@@ -183,6 +209,15 @@ export class FakeIngest {
 	readonly accepted = new Map<string, number>();
 	/** Envelopes dated before this are never seen (the ingest reads relays by cursor − 120 s). */
 	minCreatedAt = 0;
+	/** How many checkpoints the mirror's pushed commit lags behind the note (new version). */
+	mirrorLag = 0;
+	/** The body each envelope key carried (one key, one body). */
+	readonly keyBodies = new Map<string, string>();
+	/** Envelopes dropped unanswered (no or bad proof of work, a key's second body). */
+	readonly dropped: NostrEvent[] = [];
+	/** The time of the checkpoint that logged each pseudonym's newest ballot. */
+	readonly loggedAt = new Map<string, number>();
+	readonly version: 'old' | 'new';
 	/** The setup files, every version. */
 	readonly setupFiles = new Map<string, { seq: number; body: string; checkpoint: number; size: number; path: string[] }[]>();
 
@@ -190,9 +225,14 @@ export class FakeIngest {
 		readonly relays: FakeRelays,
 		readonly mirror: FakeMirror,
 		readonly channels: Channel[] = RELAYS.map(nostr),
-		readonly now: () => number = () => Math.floor(Date.now() / 1000)
+		readonly now: () => number = () => Math.floor(Date.now() / 1000),
+		readonly opts: IngestOptions = {}
 	) {
+		this.version = opts.version ?? 'new';
 		this.ledger = { v: 1, version: 1, origin: ORIGIN, log_key: this.verifier, ingest: this.pubkey, channels, checkpoint_period: 20, anchor_age: 86400 };
+		// Left out at 0 (SPEC §4.1): one spelling.
+		if (opts.revoteGap) this.ledger.revote_gap = opts.revoteGap;
+		if (opts.pow) this.ledger.pow = opts.pow;
 		this.registry = { v: 1, id: 1, version: 1, name: 'Test', eligibility: { provider: 'dev', domain: 'vote.test', scope: 'isoloir/registry/1' }, validity: 3600, depth: 20 };
 		const elgamal = { mode: 'elgamal' as const, pk: this.authority.pk, authority: { type: 'single' as const, sign_key: this.authority.sign_key } };
 		const base = { v: 1 as const, version: 1, registry: 1, title: 'Q', kind: { type: 'choice' as const, options: ['Oui', 'Non'], blank: true }, encryption: elgamal, publish: { mode: 'open' as const, k_real: 1, min_gap: 0, coin: false }, opens: 0, closes: 4_000_000_000 };
@@ -216,8 +256,18 @@ export class FakeIngest {
 		this.publishCheckpoint(entries);
 		for (const e of entries) this.writeSetup(e.path, e.seq, e.body, this.index);
 		for (const url of this.relayUrls()) {
-			relays.subscribe(url, { kinds: [core.kinds.register, core.kinds.ballot], '#t': [TAG] }, (e) => this.onRelay(url, e));
+			relays.subscribe(url, { kinds: this.reads(), '#t': [TAG] }, (e) => this.onRelay(url, e));
 		}
+	}
+
+	/** The message kinds this ingest reads. */
+	reads(): number[] {
+		const legacy = [core.kinds.legacy.register, core.kinds.legacy.ballot];
+		return this.version === 'old' ? legacy : [core.kinds.register, core.kinds.ballot, ...legacy];
+	}
+
+	isMessage(e: NostrEvent): boolean {
+		return this.reads().includes(e.kind);
 	}
 
 	relayUrls(): string[] {
@@ -233,7 +283,7 @@ export class FakeIngest {
 	resume(): void {
 		this.silent = false;
 		for (const url of this.relayUrls()) {
-			for (const e of this.relays.relay(url).events) if ((e.kind === core.kinds.register || e.kind === core.kinds.ballot) && !this.acks.has(e.id)) this.onRelay(url, e);
+			for (const e of this.relays.relay(url).events) if (this.isMessage(e) && !this.acks.has(e.id)) this.onRelay(url, e);
 		}
 		for (const e of this.backlog.splice(0)) this.judge(e);
 	}
@@ -259,10 +309,16 @@ export class FakeIngest {
 
 	/** Judges an envelope once; returns its signed ack (the same on every channel), null when silent. */
 	judge(e: NostrEvent): NostrEvent | null {
-		if (this.silent || e.created_at < this.minCreatedAt) return null;
+		if (this.silent || e.created_at < this.minCreatedAt || !this.isMessage(e)) return null;
 		const prior = this.acks.get(e.id);
 		if (prior) return prior;
-		const kind = e.kind === core.kinds.register ? 'register' : 'ballot';
+		// The envelope first (SPEC §11.1): its work, one body per key; a failure is dropped unanswered.
+		if (!this.envelopeOk(e)) {
+			this.dropped.push(e);
+			return null;
+		}
+		const legacy = e.kind < 20000;
+		const kind = e.kind === core.kinds.register || e.kind === core.kinds.legacy.register ? 'register' : 'ballot';
 		const hash = core.bodyHash(e.content);
 		// The same body under another envelope: the same outcome (crates/server/src/ingest.rs).
 		const before = this.accepted.get(hash);
@@ -274,9 +330,27 @@ export class FakeIngest {
 			this.pending.push({ kind, body: e.content, hash });
 			this.accepted.set(hash, this.index + 1);
 		}
-		const ev = core.signEvent(this.secret, this.now(), core.kinds.ack, [['t', TAG], ['e', e.id]], core.canonical(ack));
+		// The answer in the range of the envelope (SPEC §11.1).
+		const ev = core.signEvent(this.secret, this.now(), legacy ? core.kinds.legacy.ack : core.kinds.ack, [['t', TAG], ['e', e.id]], core.canonical(ack));
 		this.acks.set(e.id, ev);
 		return ev;
+	}
+
+	/** The proof of work and the one-body rule of an envelope (crates/server/src/ingest.rs). */
+	private envelopeOk(e: NostrEvent): boolean {
+		const bits = this.version === 'new' ? (this.opts.pow ?? 0) : 0;
+		if (bits <= 0) return true;
+		const tag = e.tags.find((t) => t[0] === 'pow');
+		if (!tag || tag.length !== 3 || !/^\d+$/.test(tag[1])) return false;
+		const t = Number(tag[1]);
+		const now = this.now();
+		if (t < now - 7200 || t > now + 300) return false;
+		if (!core.powCheck(ORIGIN, e.pubkey, t, tag[2], bits)) return false;
+		const hash = core.bodyHash(e.content);
+		const had = this.keyBodies.get(e.pubkey);
+		if (had !== undefined && had !== hash) return false;
+		this.keyBodies.set(e.pubkey, hash);
+		return true;
 	}
 
 	private checkRegister(text: string): string | null {
@@ -315,6 +389,14 @@ export class FakeIngest {
 		);
 		if (last >= 0 && p.revote === 'none') return 'revote_off';
 		if (b.seq! <= last) return 'stale_seq';
+		// The re-vote rate (SPEC §7.4): a pending ballot, or one logged less than the gap ago.
+		const gap = this.version === 'new' ? (this.opts.revoteGap ?? 0) : 0;
+		if (gap > 0 && last >= 0) {
+			const pendingOne = this.pending.some((x) => x.kind === 'ballot' && (JSON.parse(x.body) as { nullifier?: string }).nullifier === b.nullifier);
+			const at = this.loggedAt.get(b.nullifier!);
+			if (pendingOne || (at !== undefined && this.now() < at + gap)) return 'too_soon';
+		}
+		if (b.seq! > last + 16) return 'seq_gap';
 		return null;
 	}
 
@@ -349,6 +431,7 @@ export class FakeIngest {
 					counted.set(b.ident, m.body);
 				} else {
 					this.pseudonyms.set(b.nullifier!, b.seq!);
+					this.loggedAt.set(b.nullifier!, this.now());
 					counted.set(b.nullifier!, m.body);
 				}
 			}
@@ -366,24 +449,31 @@ export class FakeIngest {
 				return { poll: p.id, size: l.length, root: core.treeRoot(p.ballot_depth!, l) };
 			})
 			.filter((b) => b.size > 0);
-		const cp = { origin: ORIGIN, size: this.seq, root: this.proof(0, this.seq).root, index: this.index, time: this.now(), registries: [{ id: 1, size: this.leaves.length, root: regRoot }], ballots, mirror: null };
+		// A new ingest names the pushed commit and the checkpoint it covers; the old one named nothing here.
+		const mirrorLine = this.version === 'new' && !this.opts.noMirror ? `c${Math.max(this.index - this.mirrorLag, 1)}:${Math.max(this.index - this.mirrorLag, 1)}` : null;
+		const cp = { origin: ORIGIN, size: this.seq, root: this.proof(0, this.seq).root, index: this.index, time: this.now(), registries: [{ id: 1, size: this.leaves.length, root: regRoot }], ballots, mirror: mirrorLine };
 		const note = wasm.dev_sign_checkpoint(this.logSeed, JSON.stringify(cp));
 		const m = this.mirror;
-		m.put(`entries/${this.index}.json`, entries);
-		m.put(`checkpoints/${this.index}.txt`, note);
 		m.put('checkpoint.txt', note);
-		this.shards('registries/1/leaves', this.leaves);
-		const positions = new Map<string, Record<string, number>>();
-		this.leaves.forEach((l, i) => {
-			const pp = l.slice(2, 4);
-			positions.set(pp, { ...(positions.get(pp) ?? {}), [l]: i });
-		});
-		for (const [pp, v] of positions) m.put(`registries/1/positions/${pp}.json`, v);
-		const pseud = new Map<string, Record<string, number>>();
-		for (const [n, s] of this.pseudonyms) pseud.set(n.slice(2, 4), { ...(pseud.get(n.slice(2, 4)) ?? {}), [n]: s });
-		for (const p of this.polls) if (p.revote !== 'delta') for (const [pp, v] of pseud) m.put(`polls/${p.id}/pseudonyms/${pp}.json`, v);
-		for (const [poll, l] of this.ballotLeaves) this.shards(`polls/${poll}/ballots`, l);
-		for (const r of this.relayUrls()) void this.relays.publish(r, core.signEvent(this.secret, this.now(), core.kinds.checkpoint, [['t', TAG]], note));
+		// The files of a checkpoint come with the push the note names (a lagging mirror holds them back).
+		this.held.push({ index: this.index, note, entries, leaves: [...this.leaves], ballots: new Map([...this.ballotLeaves].map(([k, v]) => [k, [...v]])) });
+		this.pushMirror();
+		const kind = this.version === 'new' ? core.kinds.checkpoint : core.kinds.legacy.checkpoint;
+		for (const r of this.relayUrls()) void this.relays.publish(r, core.signEvent(this.secret, this.now(), kind, [['t', TAG]], note));
+	}
+
+	private readonly held: { index: number; note: string; entries: unknown[]; leaves: string[]; ballots: Map<number, string[]> }[] = [];
+
+	/** Writes the files of every held checkpoint the mirror's commit covers (all of them without lag). */
+	pushMirror(upto = this.index - this.mirrorLag): void {
+		const m = this.mirror;
+		while (this.held.length && this.held[0].index <= upto) {
+			const h = this.held.shift()!;
+			m.put(`entries/${h.index}.json`, h.entries);
+			m.put(`checkpoints/${h.index}.txt`, h.note);
+			this.shards('registries/1/leaves', h.leaves);
+			for (const [poll, l] of h.ballots) this.shards(`polls/${poll}/ballots`, l);
+		}
 	}
 
 	private shards(dir: string, leaves: string[]) {
@@ -459,14 +549,16 @@ export class FakeDirect {
 		const e = JSON.parse(init!.body!) as NostrEvent;
 		if (!core.verifyEvent(e)) return { status: 400, ok: false, text: async () => "the envelope's signature does not verify" };
 		this.received.push(e);
-		if (e.kind !== core.kinds.register && e.kind !== core.kinds.ballot) return json(202, { pending: e.id });
+		if (!this.ingest.isMessage(e)) return json(202, { pending: e.id });
 		if (this.deferMs !== null) {
 			const ms = this.deferMs;
 			this.deferMs = null;
 			setTimeout(() => this.ingest.judge(e), ms);
 			return json(202, { pending: e.id });
 		}
-		const ack = this.ingest.judge(e)!;
+		const ack = this.ingest.judge(e);
+		// Dropped unanswered (its proof of work): the endpoint holds the request, then gives up.
+		if (!ack) return json(202, { pending: e.id });
 		if (this.dropResponse) {
 			this.dropResponse = false;
 			throw new TypeError('network error');
@@ -475,12 +567,13 @@ export class FakeDirect {
 	};
 }
 
-export function world(channels: Channel[] = RELAYS.map(nostr), now?: () => number) {
+export function world(channels: Channel[] = RELAYS.map(nostr), now?: () => number, opts: IngestOptions = {}) {
 	const relays = new FakeRelays(channels.filter((c) => c.type === 'nostr').map((c) => c.url));
 	const mirror = new FakeMirror();
-	const ingest = new FakeIngest(relays, mirror, channels, now);
+	const ingest = new FakeIngest(relays, mirror, channels, now, opts);
 	const endpoint = new FakeDirect(channels.find((c) => c.type === 'direct')?.url ?? DIRECT, ingest);
-	const factory: ChannelFactory = (c) => (c.type === 'nostr' ? new NostrChannel(c.url, relays) : new DirectChannel(c.url, endpoint.fetch, { pollMs: 10, publishTimeoutMs: 200, requestTimeoutMs: 100 }));
+	const factory: ChannelFactory = (c) =>
+		c.type === 'nostr' ? new NostrChannel(c.url, relays) : c.type === 'direct' ? new DirectChannel(c.url, endpoint.fetch, { pollMs: 10, publishTimeoutMs: 200, requestTimeoutMs: 100 }) : null;
 	return { relays, mirror, ingest, direct: endpoint, channels: factory };
 }
 
