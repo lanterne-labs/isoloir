@@ -105,6 +105,9 @@ async fn the_ingest_on_postgres() {
     let tag = ingest.tag().to_string();
     let _lease = store.lease().await.unwrap();
     assert!(store.lease().await.is_err(), "a second ingest is refused");
+    let t = std::time::Instant::now();
+    assert!(store.lease_wait(std::time::Duration::from_secs(3)).await.is_err(), "a second ingest waits, then gives up");
+    assert!(t.elapsed() >= std::time::Duration::from_secs(3));
 
     // The registry, submitted by the operator.
     let registry = RegistrySetup {

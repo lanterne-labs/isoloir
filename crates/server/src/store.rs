@@ -72,6 +72,32 @@ impl Store {
         Ok(c)
     }
 
+    /// Takes the lease, waiting up to `wait` for the ingest that holds it
+    /// to stop: a deploy starts the new process before the old one is
+    /// gone, and a new process that gave up at once would crash-loop.
+    pub async fn lease_wait(&self, wait: std::time::Duration) -> anyhow::Result<sqlx::pool::PoolConnection<Postgres>> {
+        let until = tokio::time::Instant::now() + wait;
+        let mut said = false;
+        loop {
+            match self.lease().await {
+                Ok(c) => {
+                    if said {
+                        tracing::info!("lease taken");
+                    }
+                    return Ok(c);
+                }
+                Err(e) if tokio::time::Instant::now() < until && e.to_string().contains("another ingest") => {
+                    if !said {
+                        tracing::warn!("another ingest holds this ledger: waiting for it to stop");
+                        said = true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// The whole log, in order.
     pub async fn entries(&self) -> anyhow::Result<Vec<(i64, EntryKind, Vec<u8>, i64)>> {
         let rows = sqlx::query("SELECT seq, kind, body, checkpoint FROM isoloir_log ORDER BY seq").fetch_all(&self.pool).await?;

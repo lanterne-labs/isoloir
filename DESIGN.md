@@ -180,7 +180,8 @@ the spec.
   a copy of its body, which the relays may drop and the ingest may stop
   serving; the audit then says it could not judge it.
 - **Liveness.** The ingest is one process and the only writer; a
-  second refuses to start. It can refuse service, and a deploy pauses
+  second waits for the first to stop (10 minutes at most), then refuses
+  to start. It can refuse service, and a deploy pauses
   the log; nothing is lost, since messages wait on the relays. A
   checkpoint waits until the mirror's remote holds the previous ones
   (§15): an outage of the git host pauses the log too.
