@@ -1,0 +1,23 @@
+# Deploys main to the Railway service `ingest` (the ledger) on every push,
+# with a project token (RAILWAY_TOKEN, production environment).
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm install -g @railway/cli@5.70.0
+      - name: railway up ingest
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: railway up --service ingest --ci
