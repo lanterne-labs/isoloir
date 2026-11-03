@@ -346,7 +346,7 @@ async fn main() -> Result<()> {
                 bail!("--dev is for local trials");
             }
             let store = Store::connect(&db).await?;
-            let _lease = store.lease().await?;
+            let _lease = store.lease_wait(Duration::from_secs(600)).await?;
             let entries = store.entries().await?;
             // The channels of the ledger's current version.
             let Some((_, _, last_ledger, _)) = entries.iter().filter(|e| e.1 == EntryKind::Ledger).last() else { bail!("no ledger: run isoloir genesis first") };

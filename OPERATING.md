@@ -76,7 +76,8 @@ mirror's repository), `ISOLOIR_BB`, `ISOLOIR_ETH_RPC`
 `/v1/rejects/<index>` and `/v1/refused/<event id>`, and the direct
 channel when the ledger lists one). The ingest refuses to
 start when its keys are not the ledger's. One instance per database: a
-second one refuses to start. The container image (`Dockerfile`) runs it
+second one waits up to 10 minutes for the first to stop (a deploy starts
+the new process before the old one is gone), then refuses to start. The container image (`Dockerfile`) runs it
 by default. At start it replays the log, brings the mirror up to date,
 and reads the relays from its saved cursors. It checkpoints when the
 log grew, and at least every 10 minutes.
