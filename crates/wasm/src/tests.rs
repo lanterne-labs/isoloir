@@ -277,3 +277,87 @@ fn a_tlock_tally_is_never_ok_in_the_browser() {
     let r = v(&api::verify_tally(&poll.to_string(), &tally(chain.sign(101))).unwrap());
     assert_eq!((r["ok"].clone(), r["beacon_ok"].clone()), (json!(false), json!(false)));
 }
+
+/// A log of the earlier versions (refusals logged: `reject` with a raw
+/// body, with `author` and `size`, a `rejects` summary) and notes of both
+/// mirror forms: the browser's audit and checkpoint reader take them all.
+#[test]
+fn old_and_new_mirrors_read_alike() {
+    use isoloir_core::encoding;
+    use isoloir_proto::body::{Body, EntryKind, Reject, Rejects};
+    use isoloir_proto::state::State;
+    use isoloir_proto::Reason;
+
+    let origin = "test.example/isoloir";
+    let signer = Signer::new(origin, &[9u8; 32]);
+    let verifier = signer.verifier();
+    let ledger = json!({
+        "v": 1, "version": 1, "origin": origin, "log_key": verifier, "ingest": api::reg_pubkey(&api::new_reg_secret()).unwrap(),
+        "channels": [{"type": "nostr", "url": "wss://relay.test", "state": "active"}],
+        "checkpoint_period": 20, "anchor_age": 86400,
+    });
+    let raw = br#"{"v":1}"#;
+    let old_reject = Body::Reject(Reject { v: 1, of: "01".repeat(32), author: None, size: None, hash: encoding::body_hash(raw), reason: Reason::Malformed, kind: Some("ballot".into()), raw: Some(encoding::b64(raw)) });
+    let new_reject = Body::Reject(Reject { v: 1, of: "02".repeat(32), author: Some("03".repeat(32)), size: Some(7), hash: encoding::body_hash(raw), reason: Reason::BadSig, kind: Some("ballot".into()), raw: None });
+    let summary = Body::Rejects(Rejects { v: 1, count: 2, size: 14, root: format!("0x{}", "ab".repeat(32)) });
+    let checkpoints: Vec<(Vec<(EntryKind, Vec<u8>)>, Option<String>)> = vec![
+        (vec![(EntryKind::Ledger, isoloir_core::canonical::to_string(&ledger).unwrap().into_bytes())], Some("aaaa".into())),
+        (vec![(EntryKind::Reject, old_reject.encode()), (EntryKind::Reject, new_reject.encode()), (EntryKind::Rejects, summary.encode())], Some("bbbb".into())),
+        (vec![], Some("cccc:2".into())),
+    ];
+    let mut state = State::new();
+    let mut run = crate::audit::Run::new(Some(&verifier), "{}", false).unwrap();
+    let mut seq = 0u64;
+    for (i, (entries, mirror)) in checkpoints.iter().enumerate() {
+        let time = 1_761_900_000 + 20 * i as u64;
+        let mut listed = vec![];
+        let mut entries = entries.clone();
+        entries.sort_by_key(|(_, b)| encoding::body_hash(b));
+        for (k, b) in &entries {
+            state.apply(*k, b, time).unwrap();
+            listed.push(json!({"seq": seq, "kind": k.as_str(), "body": String::from_utf8(b.clone()).unwrap()}));
+            seq += 1;
+        }
+        let cp = state.checkpoint(i as u64 + 1, time, mirror.clone());
+        let signed = signer.sign(&cp.text());
+        let text = isoloir_proto::note::Verifier::parse(&verifier).unwrap().open(&signed).unwrap().to_string();
+        state.record(&isoloir_proto::note::Checkpoint::parse(&text).unwrap()).unwrap();
+        // The note as the session reads it: the commit, and the checkpoint it covers when it names one.
+        let c = v(&api::verify_note(&signed, &verifier).unwrap());
+        match i {
+            0 => assert_eq!((c["mirror"].clone(), c["mirror_index"].clone()), (json!("aaaa"), Value::Null)),
+            2 => assert_eq!((c["mirror"].clone(), c["mirror_index"].clone()), (json!("cccc"), json!(2))),
+            _ => {}
+        }
+        run.checkpoint(&signed, &Value::Array(listed).to_string()).unwrap();
+    }
+    let report = v(&run.finish().unwrap());
+    assert_eq!(report["checkpoints"], json!(3));
+    assert_eq!(report["entries"], json!(4));
+    assert!(report["rejects"].as_u64().unwrap() >= 2, "{report}");
+    let problems: Vec<String> = serde_json::from_value(report["problems"].clone()).unwrap();
+    assert!(problems.is_empty(), "{problems:?}");
+}
+
+#[test]
+fn the_mirror_line_of_both_versions() {
+    assert_eq!(api::mirror_of(None), (None, None));
+    assert_eq!(api::mirror_of(Some("abc")), (Some("abc"), None));
+    assert_eq!(api::mirror_of(Some("abc:12")), (Some("abc"), Some(12)));
+    assert_eq!(api::mirror_of(Some("abc 12")), (Some("abc"), Some(12)));
+}
+
+#[test]
+fn kinds_and_acks_of_both_ranges() {
+    let k = v(&crate::bind::kinds());
+    assert_eq!((k["ballot"].clone(), k["legacy"]["ballot"].clone()), (json!(27101), json!(7101)));
+    let ingest = api::new_reg_secret();
+    let pk = api::reg_pubkey(&ingest).unwrap();
+    let ack = r#"{"checkpoint":3,"hash":"0x00","of":"abcd","outcome":"accepted","v":1}"#;
+    for kind in [27102, 7102] {
+        let e = api::sign_event(&ingest, 100, kind, r#"[["e","abcd"]]"#, ack).unwrap();
+        assert!(api::read_ack(&e, &pk).is_ok(), "{kind}");
+    }
+    let e = api::sign_event(&ingest, 100, 27101, r#"[["e","abcd"]]"#, ack).unwrap();
+    assert!(api::read_ack(&e, &pk).is_err());
+}
