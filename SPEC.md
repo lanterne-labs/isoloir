@@ -99,7 +99,7 @@ name, e.g. `vote.example/isoloir`). Entries are numbered from 0 (`seq`).
   time <unix seconds>
   registry <id> <tree size> <tree root>      one line per registry
   ballots <poll> <tree size> <tree root>     one line per delta poll
-  mirror <commit> <index>                    when the mirror has one
+  mirror <commit>:<index>                    when the mirror has one
   ```
 
   The note's key name is the origin; its key id is the first 4 bytes of
@@ -117,8 +117,11 @@ name, e.g. `vote.example/isoloir`). Entries are numbered from 0 (`seq`).
   repository that the ingest knows its remote holds, and the newest
   checkpoint whose files that commit holds (§15): a checkpoint is never
   delayed by the mirror, so its own files are named by a later note.
-  Notes written before this version name one commit, the one holding
-  that checkpoint's own data files (`mirror <commit>`).
+  One token, `<commit>:<index>`, so that readers of earlier versions
+  (which take the line's one field as a commit) still parse the note,
+  then fall back to the latest files. Notes written before this version
+  name one commit, the one holding that checkpoint's own data files
+  (`mirror <commit>`).
 - **Stamps**: every checkpoint note's SHA-256 is timestamped with
   OpenTimestamps; the stamps are upgraded until they carry a Bitcoin
   attestation and are published with the mirror.
@@ -743,7 +746,7 @@ last `seq` (§7.4).
 Each checkpoint writes its files and commits them locally; a background
 task pushes, and retries every 30 s what the remote lacks. A checkpoint
 never waits for the push: the git host down or full never stops the
-log. A note's `mirror <commit> <index>` (§4) names the newest commit the
+log. A note's `mirror <commit>:<index>` (§4) names the newest commit the
 ingest knows the remote holds and the newest checkpoint that commit
 covers. A reader takes the latest note from any source (its signature
 and its time are what it trusts), reads `checkpoints/<index>.txt` and

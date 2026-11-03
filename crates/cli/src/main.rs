@@ -402,6 +402,7 @@ async fn main() -> Result<()> {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             loop {
                 tokio::select! {
+                    biased;
                     m = rx.recv() => match m {
                         Some(inc) => ing.handle(inc, now()).await?,
                         None => bail!("every channel stopped"),
@@ -417,6 +418,8 @@ async fn main() -> Result<()> {
                         }
                         return Ok(());
                     }
+                    // The proof checks, one at a time, between messages.
+                    _ = std::future::ready(()), if ing.has_work() => ing.work(now()).await?,
                 }
             }
         }

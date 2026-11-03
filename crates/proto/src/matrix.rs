@@ -40,9 +40,10 @@ pub fn check_ledger(l: &LedgerSetup) -> Result<(), String> {
         let ok = match c {
             Channel::Nostr { .. } => u.starts_with("wss://") || u.strip_prefix("ws://").is_some_and(local),
             Channel::Direct { .. } => u.starts_with("https://") || u.strip_prefix("http://").is_some_and(local),
+            Channel::Iroh { relay, .. } => u.strip_prefix("iroh://").is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_alphanumeric())) && (relay.starts_with("https://") || relay.strip_prefix("http://").is_some_and(local)),
         };
         if !ok || u.ends_with('/') {
-            return Err(format!("channel {u}: nostr is wss://, direct https:// (ws:// and http:// on this machine only), no trailing slash"));
+            return Err(format!("channel {u}: nostr is wss://, direct https://, iroh iroh://<node id> with an https:// relay (ws:// and http:// on this machine only), no trailing slash"));
         }
     }
     let mut urls: Vec<&str> = l.channels.iter().map(Channel::url).collect();

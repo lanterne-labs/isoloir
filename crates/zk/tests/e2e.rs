@@ -53,6 +53,8 @@ impl Ledger {
             channels: vec![Channel::Nostr { url: "wss://relay.test".into(), state: ChannelState::Active }],
             checkpoint_period: 20,
             anchor_age: 86_400,
+            revote_gap: 0,
+            pow: 0,
         };
         l.setup(Body::Ledger(ledger));
         l.checkpoint();

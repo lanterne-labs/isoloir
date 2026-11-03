@@ -64,6 +64,8 @@ async fn storage_per_ballot() {
         channels: vec![Channel::Nostr { url: "wss://a.test".into(), state: ChannelState::Active }],
         checkpoint_period: 20,
         anchor_age: 86_400 * 30,
+        revote_gap: 0,
+        pow: 0,
     };
     Ingest::genesis(&store, &config, &ledger, now).await.unwrap();
     let mut ingest = Ingest::load(store.clone(), config, Arc::new(Quiet), Box::new(Yes), Box::new(Verifiers { zkpassport: None, rpc_url: None, allow_dev: true }), None, None).await.unwrap();
@@ -89,6 +91,7 @@ async fn storage_per_ballot() {
     for (i, s) in secrets.iter().enumerate() {
         let b = client::register_body(1, s, &format!("p{i}"), json!({"uid": format!("p{i}")}), now, &rand::random());
         ingest.handle(post(kinds::REGISTER, b, now), now).await.unwrap();
+        ingest.drain(now).await.unwrap();
         if i % 500 == 499 {
             now += 30;
             ingest.tick(now).await.unwrap();
@@ -132,6 +135,7 @@ async fn storage_per_ballot() {
             let d = client::draft(&poll, setup_seq, &variant, &m, s, &Choice::Rank(pick), &Revoting::Linked { seq: round }, None, &mut rng).unwrap();
             let proof: Vec<u8> = (0..PROOF).map(|_| rng.r#gen()).collect();
             ingest.handle(post(kinds::BALLOT, d.finish(&proof), now), now).await.unwrap();
+            ingest.drain(now).await.unwrap();
             ballots += 1;
             if ballots % 500 == 0 {
                 now += 30;

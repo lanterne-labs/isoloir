@@ -49,7 +49,7 @@ pub async fn subscribe(pool: &Pool, store: &Store, tag: &str, tx: tokio::sync::m
     for (relay, since) in store.cursors().await? {
         pool.set_since(&relay, since as u64);
     }
-    let mut rx = pool.subscribe(Filter { kinds: vec![kinds::REGISTER, kinds::BALLOT, kinds::TALLY], t: Some(tag.to_string()), ..Default::default() });
+    let mut rx = pool.subscribe(Filter { kinds: kinds::read(), t: Some(tag.to_string()), ..Default::default() });
     tokio::spawn(async move {
         while let Some(d) = rx.recv().await {
             if tx.send(Incoming { origin: d.relay, event: d.event }).await.is_err() {
