@@ -74,6 +74,7 @@ pub enum EntryKind {
     Poll,
     Ballot,
     Reject,
+    Rejects,
     Tally,
     Close,
 }
@@ -87,6 +88,7 @@ impl EntryKind {
             EntryKind::Poll => "poll",
             EntryKind::Ballot => "ballot",
             EntryKind::Reject => "reject",
+            EntryKind::Rejects => "rejects",
             EntryKind::Tally => "tally",
             EntryKind::Close => "close",
         }
@@ -100,6 +102,7 @@ impl EntryKind {
             "poll" => EntryKind::Poll,
             "ballot" => EntryKind::Ballot,
             "reject" => EntryKind::Reject,
+            "rejects" => EntryKind::Rejects,
             "tally" => EntryKind::Tally,
             "close" => EntryKind::Close,
             _ => return None,
@@ -349,25 +352,58 @@ pub struct Ballot {
     pub proof: String,
 }
 
-/// A refusal (SPEC §11.4): the message's event id, its body hash, the
-/// reason and, up to 16 KiB, the raw body so that an auditor can judge it
-/// again.
+/// A refusal (SPEC §11.4): the message's event id, its author, its size,
+/// its body hash and the reason. The body itself is not logged (anyone
+/// can post junk for free, and the log is public forever): the ingest
+/// keeps it and an auditor judges it again from a relay's copy or the
+/// ingest's. Refusals logged before carry `raw`, the body in base64, and
+/// no `author` or `size`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reject {
     pub v: u32,
     pub of: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
     pub hash: String,
     pub reason: Reason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// The earlier form only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<String>,
 }
 
-/// The largest body a message may have; a refusal keeps it whole (up to
-/// this size) so that an auditor can judge it again.
-pub const REJECT_RAW_MAX: usize = 256 * 1024;
+/// The refusals of a checkpoint beyond the first [`REJECTS_LOGGED`]
+/// (SPEC §11.4): how many, their total size, and the RFC 6962 root over
+/// their `reject` bodies in body-hash order. The ingest keeps the list and
+/// serves it (`GET /v1/rejects/<checkpoint>`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rejects {
+    pub v: u32,
+    pub count: u64,
+    pub size: u64,
+    pub root: String,
+}
+
+/// The largest body a message may have: a larger one is refused as
+/// `malformed`, and the ingest does not keep it.
+pub const MAX_BODY: usize = 256 * 1024;
+
+/// The refusals a checkpoint logs one by one; the others are summed up in
+/// one `rejects` entry, so that junk cannot grow the log faster than
+/// this per checkpoint.
+pub const REJECTS_LOGGED: usize = 16;
+
+/// The root of a list of `reject` bodies (a `rejects` entry): the RFC 6962
+/// root over `SHA-256(0x00 ‖ body)`, in the order given (body-hash order).
+pub fn rejects_root<B: AsRef<[u8]>>(bodies: &[B]) -> String {
+    let leaves: Vec<crate::log::Hash> = bodies.iter().map(|b| crate::log::leaf_hash(b.as_ref())).collect();
+    format!("0x{}", hex::encode(crate::log::root_of(&leaves)))
+}
 
 /// A result (SPEC §10.3, §10.4).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -455,6 +491,7 @@ pub enum Body {
     Poll(PollSetup),
     Ballot(Ballot),
     Reject(Reject),
+    Rejects(Rejects),
     Tally(Tally),
     Close(Close),
 }
@@ -468,6 +505,7 @@ impl Body {
             Body::Poll(_) => EntryKind::Poll,
             Body::Ballot(_) => EntryKind::Ballot,
             Body::Reject(_) => EntryKind::Reject,
+            Body::Rejects(_) => EntryKind::Rejects,
             Body::Tally(_) => EntryKind::Tally,
             Body::Close(_) => EntryKind::Close,
         }
@@ -482,6 +520,7 @@ impl Body {
             Body::Poll(b) => canonical::to_vec(b),
             Body::Ballot(b) => canonical::to_vec(b),
             Body::Reject(b) => canonical::to_vec(b),
+            Body::Rejects(b) => canonical::to_vec(b),
             Body::Tally(b) => canonical::to_vec(b),
             Body::Close(b) => canonical::to_vec(b),
         };
@@ -513,6 +552,7 @@ pub fn decode(kind: EntryKind, bytes: &[u8]) -> Result<Body, Reason> {
         EntryKind::Poll => Body::Poll(one(value, bytes)?),
         EntryKind::Ballot => Body::Ballot(one(value, bytes)?),
         EntryKind::Reject => Body::Reject(one(value, bytes)?),
+        EntryKind::Rejects => Body::Rejects(one(value, bytes)?),
         EntryKind::Tally => Body::Tally(one(value, bytes)?),
         EntryKind::Close => Body::Close(one(value, bytes)?),
     })
@@ -541,6 +581,7 @@ pub fn decode_verbose(kind: EntryKind, bytes: &[u8]) -> Result<Body, String> {
         EntryKind::Poll => Body::Poll(one(value, bytes)?),
         EntryKind::Ballot => Body::Ballot(one(value, bytes)?),
         EntryKind::Reject => Body::Reject(one(value, bytes)?),
+        EntryKind::Rejects => Body::Rejects(one(value, bytes)?),
         EntryKind::Tally => Body::Tally(one(value, bytes)?),
         EntryKind::Close => Body::Close(one(value, bytes)?),
     })

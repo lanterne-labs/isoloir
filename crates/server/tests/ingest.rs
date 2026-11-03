@@ -68,7 +68,7 @@ async fn the_ingest_on_postgres() {
     let name = "choice4_single_linked_d20";
     let built = circuits.build(&tools, name).unwrap();
     let mirror_dir = tempfile::tempdir().unwrap();
-    let mirror = Mirror { dir: mirror_dir.path().to_path_buf(), git: None };
+    let mirror = Mirror::new(mirror_dir.path().to_path_buf(), None);
     mirror.install_circuit(name, &built.artifact, &built.vk).unwrap();
     let vk_dir = mirror_dir.path().join("circuits");
     let prover = Prover::new(tools.clone(), circuits);
@@ -98,7 +98,7 @@ async fn the_ingest_on_postgres() {
         let config = Config { log_seed: [11u8; 32], nostr_sk: [12u8; 32] };
         let proofs = Box::new(BbProofs::new(tools.bb.clone(), vk_dir.clone()));
         let passports = Box::new(Verifiers { zkpassport: None, rpc_url: None, allow_dev: true });
-        let mirror = Mirror { dir: mirror_dir.path().to_path_buf(), git: None };
+        let mirror = Mirror::new(mirror_dir.path().to_path_buf(), None);
         Ingest::load(store, config, mem, proofs, passports, Some(Box::new(DrandTlock)), Some(mirror))
     };
     let mut ingest = load(store.clone(), mem.clone()).await.unwrap();
@@ -328,4 +328,155 @@ async fn the_direct_channel() {
     now += 30;
     ingest.tick(now).await.unwrap().unwrap();
     assert_eq!(ingest.state.registries[&1].tree.len(), 1);
+}
+
+/// Junk refused in bulk: no body in the log, at most REJECTS_LOGGED
+/// refusals of their own per checkpoint and one `rejects` entry for the
+/// rest, the bodies and the list in the store and served; the audit reads
+/// the new form, with and without the copies.
+#[tokio::test(flavor = "multi_thread")]
+async fn refusals_are_bounded() {
+    use isoloir_server::direct;
+    use isoloir_server::source::Refusals;
+    let url = fresh_db().await;
+    let store = Store::connect(&url).await.unwrap();
+    let config = Config { log_seed: [15u8; 32], nostr_sk: [16u8; 32] };
+    let origin = "junk.example/isoloir";
+    let signer = note::Signer::new(origin, &config.log_seed);
+    let mut now = 1_800_000_000u64;
+    let ledger = LedgerSetup {
+        v: 1,
+        version: 1,
+        origin: origin.into(),
+        log_key: signer.verifier(),
+        ingest: hex::encode(isoloir_proto::sig::xonly(&config.nostr_sk)),
+        channels: vec![Channel::Nostr { url: "wss://a.test".into(), state: ChannelState::Active }],
+        checkpoint_period: 20,
+        anchor_age: 86_400,
+    };
+    Ingest::genesis(&store, &config, &ledger, now).await.unwrap();
+    let tools = Tools::find().expect("bb");
+    let mirror_dir = tempfile::tempdir().unwrap();
+    let mem = Arc::new(Mem::default());
+    let mut ingest = Ingest::load(
+        store.clone(),
+        config,
+        mem.clone(),
+        Box::new(BbProofs::new(tools.bb.clone(), std::env::temp_dir())),
+        Box::new(Verifiers { zkpassport: None, rpc_url: None, allow_dev: true }),
+        None,
+        Some(Mirror::new(mirror_dir.path().to_path_buf(), None)),
+    )
+    .await
+    .unwrap();
+    let registry = RegistrySetup {
+        v: 1,
+        id: 1,
+        version: 1,
+        name: "test".into(),
+        eligibility: Eligibility { provider: "dev".into(), domain: "d".into(), scope: "s".into(), min_age: None, nationality: vec![], document_type: None, require_expiry: false, oprf_key: None },
+        validity: 3600,
+        depth: 20,
+    };
+    store.submit(EntryKind::Registry, &Body::Registry(registry).encode(), now).await.unwrap();
+    now += 30;
+    ingest.tick(now).await.unwrap().unwrap();
+    let tag = ingest.tag().to_string();
+
+    // A registration, its second try under another key (uid_used), and junk.
+    let mut rng = rand::rngs::StdRng::seed_from_u64(51);
+    let ok = event(kinds::REGISTER, &tag, &client::register_body(1, &grumpkin::random_fr(&mut rng), "bob", json!({"uid": "bob"}), now, &[0x51; 32]), now);
+    let dup = event(kinds::REGISTER, &tag, &client::register_body(1, &grumpkin::random_fr(&mut rng), "bob", json!({"uid": "bob"}), now, &[0x52; 32]), now);
+    let mut posted = vec![ok.clone(), dup.clone()];
+    let junk = REJECTS_LOGGED + 24;
+    for i in 0..junk {
+        let body = if i == 0 { vec![b'x'; MAX_BODY + 1] } else { format!("junk {i}").into_bytes() };
+        posted.push(event(if i % 2 == 0 { kinds::REGISTER } else { kinds::BALLOT }, &tag, &body, now));
+    }
+    for ev in &posted {
+        ingest.handle(Incoming { origin: "wss://a.test".into(), event: ev.clone() }, now).await.unwrap();
+    }
+    assert_eq!(mem.ack_of(&dup.id).reason, Some(isoloir_proto::Reason::UidUsed));
+    now += 30;
+    let cp = ingest.tick(now).await.unwrap().unwrap();
+
+    // The log: REJECTS_LOGGED refusals of their own, the dup among them
+    // (arrival order), one summary for the rest; no body anywhere.
+    let entries: serde_json::Value = serde_json::from_slice(&std::fs::read(mirror_dir.path().join(format!("entries/{cp}.json"))).unwrap()).unwrap();
+    let kinds_of = |k: &str| entries.as_array().unwrap().iter().filter(|e| e["kind"] == k).count();
+    assert_eq!(kinds_of("reject"), REJECTS_LOGGED);
+    assert_eq!(kinds_of("rejects"), 1);
+    assert_eq!(kinds_of("register"), 1);
+    assert!(!entries.to_string().contains("\\\"raw\\\""), "a reject carries a body");
+    let rejects: Vec<Reject> = entries.as_array().unwrap().iter().filter(|e| e["kind"] == "reject").map(|e| canonical::from_slice(e["body"].as_str().unwrap().as_bytes()).unwrap()).collect();
+    let d = rejects.iter().find(|r| r.of == dup.id).expect("the dup is logged on its own");
+    assert_eq!((d.author.as_deref(), d.size), (Some(dup.pubkey.as_str()), Some(dup.content.len() as u64)));
+    assert_eq!(d.hash, isoloir_core::encoding::body_hash(dup.content.as_bytes()));
+    let sum = entries.as_array().unwrap().iter().find(|e| e["kind"] == "rejects").unwrap();
+    let sum: Rejects = canonical::from_slice(sum["body"].as_str().unwrap().as_bytes()).unwrap();
+    let summed = junk + 1 - REJECTS_LOGGED;
+    assert_eq!(sum.count, summed as u64);
+    let list = store.summed(cp).await.unwrap();
+    assert_eq!(list.len(), summed);
+    assert_eq!(rejects_root(&list), sum.root);
+    // The oversized body is not kept; the others are.
+    assert_eq!(store.refused_body(&posted[2].id).await.unwrap(), Some(None));
+    assert_eq!(store.refused_body(&posted[3].id).await.unwrap(), Some(Some(posted[3].content.as_bytes().to_vec())));
+    assert_eq!(store.refused_body(&ok.id).await.unwrap(), None);
+
+    // Served over HTTP.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = direct::health_router(store.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let got = reqwest::get(format!("{base}/v1/refused/{}", dup.id)).await.unwrap();
+    assert_eq!(got.bytes().await.unwrap().as_ref(), dup.content.as_bytes());
+    assert_eq!(reqwest::get(format!("{base}/v1/refused/{}", posted[2].id)).await.unwrap().status(), 410);
+    assert_eq!(reqwest::get(format!("{base}/v1/refused/{}", ok.id)).await.unwrap().status(), 404);
+
+    // The audit from the mirror alone: nothing wrong, nothing judged again
+    // for lack of bodies, said as warnings.
+    let src = MirrorSource::parse(mirror_dir.path().to_str().unwrap());
+    let read = src.from(1).await.unwrap();
+    let proofs = BbProofs::new(tools.bb.clone(), std::env::temp_dir());
+    let passports = Verifiers { zkpassport: None, rpc_url: None, allow_dev: true };
+    let audit = |r: &mut Refusals| {
+        let mut a = Auditor::new(Some(&signer.verifier()), Checkers { proofs: &proofs, passports: &passports, tlock: None }).unwrap();
+        a.copies = r.copies.clone();
+        a.lists = r.lists.clone();
+        for (n, es) in &read {
+            a.checkpoint(n, es).unwrap();
+        }
+        a.finish()
+    };
+    let ingest_pk = hex::encode(isoloir_proto::sig::xonly(&[16u8; 32]));
+    let (state, report) = audit(&mut Refusals::default());
+    assert!(report.problems.is_empty(), "{:#?}", report.problems);
+    assert_eq!((report.rejects, report.unjudged, report.unlisted, report.summarized), (REJECTS_LOGGED as u64, REJECTS_LOGGED as u64, summed as u64, summed as u64));
+    assert_eq!(report.warnings.len(), 2, "{:#?}", report.warnings);
+    // The relays' copies of the summed refusals cannot be told from
+    // withheld messages without the list: warnings, not problems.
+    let (problems, warnings) = isoloir_proto::audit::check_relays_report(&state, &posted, &ingest_pk, 0);
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!(warnings.len(), 1);
+
+    // With the relays' copies and the ingest's list: every refusal judged.
+    let mut r = Refusals::default();
+    r.add_events(&posted[..3]);
+    r.ask_ledger(&base, &read).await;
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    let (state, report) = audit(&mut r);
+    assert!(report.problems.is_empty(), "{:#?}", report.problems);
+    assert_eq!((report.rejects, report.unjudged, report.unlisted), ((junk + 1) as u64, 0, 0));
+    let (problems, warnings) = isoloir_proto::audit::check_relays_report(&state, &posted, &ingest_pk, 0);
+    assert!(problems.is_empty() && warnings.is_empty(), "{problems:?} {warnings:?}");
+
+    // A copy that is not the refused body, a list that is not the logged
+    // one: problems.
+    let mut bad = Refusals::default();
+    bad.copies.insert(dup.id.clone(), isoloir_proto::audit::Copy { author: None, body: b"other".to_vec() });
+    bad.lists.insert(cp, list[1..].to_vec());
+    let (_, report) = audit(&mut bad);
+    assert!(report.problems.iter().any(|p| p.contains("not its hash")), "{:#?}", report.problems);
+    assert!(report.problems.iter().any(|p| p.contains("not the one the log names")), "{:#?}", report.problems);
 }

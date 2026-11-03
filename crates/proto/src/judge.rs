@@ -94,6 +94,9 @@ fn reject<T>(r: Reason) -> Result<T, Verdict> {
 /// Judges a message from a relay (a registration, a ballot, a tally) at
 /// time `now`.
 pub fn judge(state: &State, pending: &Pending, kind: EntryKind, bytes: &[u8], now: u64, c: &Checkers) -> Verdict {
+    if bytes.len() > body::MAX_BODY {
+        return Verdict::Reject(Reason::Malformed);
+    }
     let r = match kind {
         EntryKind::Register => register(state, pending, bytes, now, c),
         EntryKind::Ballot => ballot(state, pending, bytes, now, c),

@@ -72,12 +72,15 @@ impl Ledger {
                 self.pending.admit(kind, &bytes);
                 self.queue.push((kind, bytes));
             }
-            // Every refusal is logged, with the raw body (SPEC §11.4).
+            // Every refusal is logged; here in the earlier form, with the
+            // raw body, which the audit still reads (SPEC §11.4).
             Verdict::Reject(reason) => {
                 self.posted += 1;
                 let r = Reject {
                     v: 1,
                     of: format!("{:064x}", self.posted),
+                    author: None,
+                    size: None,
                     hash: isoloir_core::encoding::body_hash(&bytes),
                     reason,
                     kind: Some(kind.as_str().into()),

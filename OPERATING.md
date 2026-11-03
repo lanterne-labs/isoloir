@@ -52,8 +52,12 @@ The mirror is a git repository the ingest commits to and pushes, and
 browsers read through a CDN by commit. Create an empty repository, give
 the ingest a deploy key with write access, and point it there: an empty
 mirror directory is cloned at start (so an ephemeral disk is fine, the
-circuits and the stamps come back with the clone), a new one is
-initialised.
+circuits and the stamps come back with the clone, a partial one:
+`--filter=blob:none`), a new one is initialised. A checkpoint waits
+until the remote holds the previous checkpoints' commits (retried every
+30 s): a lasting push failure, such as a revoked deploy key, pauses the
+log, with an error in the logs, rather than sign notes naming commits
+that could be lost.
 
 ```sh
 isoloir ingest --mirror-dir /app/mirror --mirror-git git@github.com:org/ledger-data.git \
@@ -68,8 +72,9 @@ C2SP `PRIVATE+KEY+<origin>+…` string such as Go's note package writes),
 `ISOLOIR_NOSTR_KEY`, `ISOLOIR_MIRROR_GIT` (or `--mirror-git`),
 `ISOLOIR_MIRROR_SSH_KEY` (the private half of a write deploy key of the
 mirror's repository), `ISOLOIR_BB`, `ISOLOIR_ETH_RPC`
-(optional, for passport certificate roots), `PORT` (serves `/v1/health`
-and the direct channel when the ledger lists one). The ingest refuses to
+(optional, for passport certificate roots), `PORT` (serves `/v1/health`, the refusals for auditors,
+`/v1/rejects/<index>` and `/v1/refused/<event id>`, and the direct
+channel when the ledger lists one). The ingest refuses to
 start when its keys are not the ledger's. One instance per database: a
 second one refuses to start. The container image (`Dockerfile`) runs it
 by default. At start it replays the log, brings the mirror up to date,
@@ -97,11 +102,15 @@ needed: any authority (or anyone) opens them at the round with
 
 ```sh
 isoloir audit --mirror https://… --circuits ./circuits-vk --zkverifier ./zkverifier/verify.mjs \
-  --log-key "<log_key>" --relays --bitcoin
+  --log-key "<log_key>" --relays --bitcoin --ledger https://<the ingest's HTTP service>
 ```
 
 Exit 0 and no `PROBLEM` line. Run it from machines the operator does not
 control, with circuits you built. A proof the audit could not check is a
 problem, never a pass; `--skip-passports` reports every registration as
-unchecked. `--bitcoin` checks the checkpoints' stamps against block
+unchecked. The log keeps the hash of a refused body, not the body:
+`--relays` judges again the refusals the relays still hold, `--ledger`
+asks the ingest for the others and for the lists of the refusals a
+checkpoint sums up (all checked against the log); what it could get from
+neither is a warning. `--bitcoin` checks the checkpoints' stamps against block
 headers (stamps take hours to be attested).

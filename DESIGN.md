@@ -77,8 +77,9 @@ the spec.
   `checkpoint_period` seconds and at least every 10 minutes (§4).
   Entries within a checkpoint are ordered by body hash, so the log does
   not reveal arrival order.
-- Every refusal is logged with the refused body (§11.4), so the auditor
-  judges every message the ingest judged.
+- Every refusal is logged by event id, author, size and body hash
+  (§11.4); the body is kept by the ingest and the relays, and the
+  auditor judges every refusal again from a copy that matches the hash.
 - The mirror is static files served from a git repository by commit,
   the commit named in the checkpoint (§15). Setups and tallies carry
   inclusion proofs: the mirror cannot serve a key, a channel or a result
@@ -167,9 +168,22 @@ the spec.
 - **Scale.** The ingest holds the log in memory (about 100k ballots);
   the browser rebuilds the registry tree (about 100k voters); a tree of
   depth 20 holds a million leaves.
+- **Spam grows the log, boundedly.** Anyone can post junk with the
+  ledger's tag for free, under a fresh key each time, so a cap per
+  author bounds nothing. The log keeps no refused body, and a checkpoint
+  logs at most 16 refusals of its own and sums up the rest in one
+  `rejects` entry (§11.4): a flood adds at most about 7 KB per
+  checkpoint to the mirror, about 30 MB a day at a 20 s period. The
+  bodies stay in the ingest's database (up to 256 KiB each), which a
+  flood fills instead; that is the operator's disk, not the public
+  record. The cost is in the audit: a refusal is judged again only from
+  a copy of its body, which the relays may drop and the ingest may stop
+  serving; the audit then says it could not judge it.
 - **Liveness.** The ingest is one process and the only writer; a
   second refuses to start. It can refuse service, and a deploy pauses
-  the log; nothing is lost, since messages wait on the relays.
+  the log; nothing is lost, since messages wait on the relays. A
+  checkpoint waits until the mirror's remote holds the previous ones
+  (§15): an outage of the git host pauses the log too.
 
 ## 3. Extensions
 

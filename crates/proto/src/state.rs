@@ -169,8 +169,11 @@ pub struct State {
     pub checkpoints: Vec<CheckpointRec>,
     /// Every logged body's hash, to its seq.
     pub hashes: HashMap<String, u64>,
-    /// The event ids of logged rejects.
+    /// The event ids of logged rejects (and, in an audit, of the
+    /// refusals of the `rejects` lists it read).
     pub rejected: HashSet<String>,
+    /// The `rejects` entries: seq, and whether the audit read their list.
+    pub summaries: Vec<(u64, bool)>,
     /// Every entry's kind and body, by seq.
     pub entries: Vec<(EntryKind, Vec<u8>)>,
 }
@@ -347,6 +350,7 @@ impl State {
             Body::Reject(r) => {
                 self.rejected.insert(r.of.clone());
             }
+            Body::Rejects(_) => self.summaries.push((seq, false)),
             Body::Tally(t) => {
                 let st = self.polls.get_mut(&t.poll).ok_or("tally: unknown poll")?;
                 st.tallies.push((seq, t));

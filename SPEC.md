@@ -83,7 +83,7 @@ name, e.g. `vote.example/isoloir`). Entries are numbered from 0 (`seq`).
   decimal. The log is an RFC 6962 Merkle tree over the leaves (SHA-256,
   `0x00` leaf prefix, `0x01` node prefix).
 - **Kinds**: `ledger`, `registry`, `register`, `poll`, `ballot`, `reject`,
-  `tally`, `close`. Later versions add `partial` and `dkg` (threshold
+  `rejects`, `tally`, `close`. Later versions add `partial` and `dkg` (threshold
   decryption, §9.4).
 - **Checkpoint**: a signed note (C2SP `signed-note`) by the ledger's log
   key (Ed25519), text:
@@ -557,11 +557,39 @@ signature, which no one but the ingest can make.
 
 ### 11.4 Every refusal is logged
 
-Refusals are `reject` entries `{"v":1,"of":"<event id>","hash":"…",
-"reason":"…","kind":"ballot","raw":"<the body, base64>"}`, so the log
-accounts for every message the ingest judged and an auditor judges it
-again (§16). `raw` is absent only for a body over 256 KiB, refused as
-`malformed`.
+A body over 256 KiB is refused as `malformed`. Every refusal is
+accounted for in the log, and none carries the refused body: anyone can
+post junk for free under fresh keys, and the log is public and kept
+forever.
+
+- A refusal is a `reject` entry:
+
+  ```json
+  {"v":1,"of":"<event id>","author":"<the envelope's pubkey>","size":1234,
+   "hash":"<SHA-256 of the body>","reason":"…","kind":"ballot"}
+  ```
+
+  The ingest keeps the body (up to 256 KiB) and serves it to anyone,
+  `GET <ingest>/v1/refused/<event id>` (404: no such refusal; 410: over
+  the size limit, not kept). The relays keep their copies too. Either
+  copy is checked against `hash` (and a relay's envelope against
+  `author`), so neither the ingest nor a relay can substitute another.
+- A checkpoint logs its first 16 refusals, in arrival order, as `reject`
+  entries. The others are summed up in one `rejects` entry:
+
+  ```json
+  {"v":1,"count":5000,"size":1048576,"root":"0x…"}
+  ```
+
+  `count` refusals, `size` the total of their body sizes, `root` the
+  RFC 6962 root (§4's hashing, `SHA-256(0x00 ‖ body)` per leaf) over
+  their `reject` bodies in body-hash order. The ingest serves the list,
+  `GET <ingest>/v1/rejects/<checkpoint index>` answers
+  `{"checkpoint":i,"rejects":["<reject body>",…]}` in that order. A
+  checkpoint thus adds at most 16 refusals and one summary to the log,
+  however much junk arrived.
+- Refusals logged before this form carry `raw` (the body, base64) and
+  no `author` or `size`; readers accept both forms.
 
 ## 12. Reasons
 
@@ -629,6 +657,18 @@ polls/<id>/tallies/latest.json, polls/<id>/tallies/<seq>.json
                                      <proven entry>
 ```
 
+The refused bodies and the lists of `rejects` entries are not on the
+mirror: the ingest serves them (§11.4).
+
+The ingest clones the mirror's repository at start when its disk is
+empty, as a partial clone (`--filter=blob:none`: every commit and tree,
+the newest version of each file, older versions fetched when a merge
+needs them), not a shallow one: a push the remote refuses because it
+moved (a commit from elsewhere, a README) is merged, never rebased, so
+every commit a note names stays in the history. A checkpoint is signed
+only once the remote holds the commits of the previous ones: a lost
+disk then loses no commit a note names.
+
 A **proven entry** is `{"seq","kind","body","checkpoint","size","path"}`:
 the entry's log position, its body as a string, the checkpoint whose
 note a reader verifies it against, that checkpoint's log size, and the
@@ -648,10 +688,17 @@ between checkpoints; the stamps against Bitcoin block headers; every
 setup against its predecessor (§13) and the matrix (§8); every
 registration (signature, freshness, provider proof, uniqueness, tree
 positions and roots); every ballot (roots in age, re-vote rule, proof);
-every reject's reason, recomputed; every tally (due by §10.1, aggregate,
+every reject's reason, recomputed from a copy of the refused body (a
+relay's, or the ingest's, checked against the logged hash), and every
+`rejects` entry against the list the ingest serves (count, size, root,
+order), each refusal of it judged the same way; every tally (due by §10.1, aggregate,
 shares, combination, values, signature; tlock: beacon, openings, void
 list); every close. With the relays: every message the relays hold was
-judged (else withholding). With the mirror: its files at each
+judged (else withholding). A refusal whose body the audit could not get
+(the relays dropped it, the ingest did not keep it) is reported as not
+judged again, and so is a `rejects` entry whose list it could not read;
+an event on a relay that such a list may cover is reported as such, not
+as withheld. Both are said, never passed. With the mirror: its files at each
 checkpoint's commit are the log's.
 
 ## 17. What each party learns

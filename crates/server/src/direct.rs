@@ -53,11 +53,45 @@ struct Ctx {
     store: Store,
 }
 
-/// Health only (a ledger without a direct channel): `GET /v1/health`
-/// answers 200 with the last checkpoint's index and time, 503 when the
-/// store does not answer.
+/// Without a direct channel: `GET /v1/health` (200 with the last
+/// checkpoint's index and time, 503 when the store does not answer) and
+/// the refusals ([`rejects`], [`refused`]).
 pub fn health_router(store: Store) -> Router {
-    Router::new().route("/v1/health", get(health)).with_state(Ctx { hub: DirectHub::new(""), inbound: mpsc::channel(1).0, store })
+    Router::new()
+        .route("/v1/health", get(health))
+        .route("/v1/rejects/{index}", get(rejects))
+        .route("/v1/refused/{id}", get(refused))
+        .layer(tower_http::cors::CorsLayer::permissive())
+        .with_state(Ctx { hub: DirectHub::new(""), inbound: mpsc::channel(1).0, store })
+}
+
+/// The refusals the log does not hold whole (SPEC §11.4), for auditors:
+/// `GET /v1/rejects/<checkpoint>` answers the list a `rejects` entry sums
+/// up, `{"checkpoint":i,"rejects":["<reject body>",…]}` in body-hash
+/// order (empty when the checkpoint has none); `GET /v1/refused/<event
+/// id>` answers a refused message's body, 404 when the ledger refused no
+/// such event since it keeps them, 410 when it was over the size limit.
+/// An auditor checks both against the log: the root and count, the hash.
+async fn rejects(State(c): State<Ctx>, Path(index): Path<u64>) -> Response {
+    match c.store.summed(index).await {
+        Ok(list) => Json(serde_json::json!({"checkpoint": index, "rejects": list.iter().map(|b| String::from_utf8_lossy(b)).collect::<Vec<_>>()})).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "rejects");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn refused(State(c): State<Ctx>, Path(id): Path<String>) -> Response {
+    match c.store.refused_body(&id).await {
+        Ok(Some(Some(b))) => ([(axum::http::header::CONTENT_TYPE, "application/octet-stream")], b).into_response(),
+        Ok(Some(None)) => StatusCode::GONE.into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "refused");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 async fn health(State(c): State<Ctx>) -> Response {
@@ -70,12 +104,15 @@ async fn health(State(c): State<Ctx>) -> Response {
     }
 }
 
-/// The routes: `POST /v1/messages`, `GET /v1/acks/{id}`, `GET /v1/health`.
+/// The routes: `POST /v1/messages`, `GET /v1/acks/{id}`, `GET /v1/health`,
+/// `GET /v1/rejects/{index}`, `GET /v1/refused/{id}`.
 pub fn router(hub: Arc<DirectHub>, inbound: mpsc::Sender<Incoming>, store: Store) -> Router {
     Router::new()
         .route("/v1/messages", post(message))
         .route("/v1/acks/{id}", get(ack))
         .route("/v1/health", get(health))
+        .route("/v1/rejects/{index}", get(rejects))
+        .route("/v1/refused/{id}", get(refused))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(MAX_BODY))
         // Browsers post from the app's origin.
         .layer(tower_http::cors::CorsLayer::permissive())
