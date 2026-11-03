@@ -142,6 +142,17 @@ pub fn relay_ranking(s: &str, urls_json: &str) -> R<String> {
     Ok(out(&json!(scored.into_iter().map(|(_, u)| u).collect::<Vec<_>>())))
 }
 
+/// The proof of work of an envelope (SPEC §11.1): a nonce for the
+/// envelope's key (x-only hex) and a time, `bits` zero bits. Done in the
+/// background while the ballot is proved; the tag is `["pow", t, nonce]`.
+pub fn pow_nonce(origin: &str, pubkey_hex: &str, t: u64, bits: u32) -> R<String> {
+    if bits > 32 {
+        return Err("at most 32 bits".into());
+    }
+    bytes32(pubkey_hex, "public key")?;
+    Ok(out(&json!(isoloir_proto::pow::solve(origin, &pubkey_hex.to_lowercase(), t, bits))))
+}
+
 // ------------------------------------------------------- registration
 
 /// A fresh registration key: a secp256k1 secret, hex.

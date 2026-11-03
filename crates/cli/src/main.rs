@@ -160,15 +160,6 @@ enum Cmd {
         node: PathBuf,
         #[arg(long, env = "ISOLOIR_ETH_RPC")]
         rpc_url: Option<String>,
-        /// Also read the ledger's relays: withholding, and the refused
-        /// messages they still hold (judged again).
-        #[arg(long)]
-        relays: bool,
-        /// The ingest's HTTP service (its base URL): the lists of the
-        /// refusals a checkpoint sums up, and the refused bodies the relays
-        /// no longer hold; all checked against the log.
-        #[arg(long)]
-        ledger: Option<String>,
         /// Do not check the passport proofs (they are then reported as not checked).
         #[arg(long)]
         skip_passports: bool,
@@ -529,7 +520,7 @@ async fn main() -> Result<()> {
             }
             println!("ok: {}", String::from_utf8_lossy(&bytes));
         }
-        Cmd::Audit { mirror, log_key, circuits, zkverifier, node, rpc_url, relays, ledger, skip_passports, bitcoin, dev } => {
+        Cmd::Audit { mirror, log_key, circuits, zkverifier, node, rpc_url, skip_passports, bitcoin, dev } => {
             let bb = Tools::find_bb()?;
             let vk_dir = match circuits {
                 Some(c) => c,
@@ -544,49 +535,10 @@ async fn main() -> Result<()> {
             // and its registrations are refused, unless --dev (a trial).
             let passports = passports(zkverifier, node, rpc_url, dev);
             let mut a = Auditor::new(log_key.as_deref(), Checkers { proofs: &proofs, passports: &passports, tlock: Some(&DrandTlock) }).map_err(|e| anyhow::anyhow!(e))?;
-            let read = MirrorSource::parse(&mirror).from(1).await?;
-            // The relays first: their copies of the refused messages are
-            // judged again in the replay (the log keeps only their hash).
-            let mut events = vec![];
-            let mut relay_warnings = vec![];
-            let mut relay_count = 0;
-            if relays {
-                let mut urls: Vec<String> = vec![];
-                let mut origin = None;
-                for (k, b) in read.iter().flat_map(|(_, es)| es.iter()) {
-                    if let (EntryKind::Ledger, Ok(Body::Ledger(l))) = (k, body::decode(*k, b)) {
-                        origin = Some(l.origin.clone());
-                        for u in l.nostr(false) {
-                            if !urls.contains(&u) {
-                                urls.push(u);
-                            }
-                        }
-                    }
-                }
-                let tag = format!("{}/{}", isoloir_proto::PROTOCOL, origin.context("no ledger")?);
-                let pool = Pool::connect(urls.clone());
-                for u in &urls {
-                    let f = isoloir_relay::Filter { kinds: vec![7100, 7101, 7102, 7105, 7106], t: Some(tag.clone()), ..Default::default() };
-                    match pool.fetch(u, f, Duration::from_secs(30)).await {
-                        Ok(es) => events.extend(es),
-                        Err(e) => relay_warnings.push(format!("relay {u}: {e}")),
-                    }
-                }
-                relay_count = urls.len();
-            }
-            let mut refusals = isoloir_server::source::Refusals::default();
-            refusals.add_events(&events);
-            if let Some(l) = &ledger {
-                refusals.ask_ledger(l, &read).await;
-            }
-            a.copies = std::mem::take(&mut refusals.copies);
-            a.lists = std::mem::take(&mut refusals.lists);
-            for (n, es) in read {
+            for (n, es) in MirrorSource::parse(&mirror).from(1).await? {
                 a.checkpoint(&n, &es).map_err(|e| anyhow::anyhow!(e))?;
             }
             let (state, mut r) = a.finish();
-            r.warnings.extend(relay_warnings);
-            r.warnings.extend(refusals.warnings);
             for (id, reg) in &state.registries {
                 if reg.current().eligibility.provider == "dev" {
                     let w = format!("registry {id} takes the dev provider: anyone may register");
@@ -619,16 +571,9 @@ async fn main() -> Result<()> {
                 }
                 println!("stamps: {attested} attested in Bitcoin, {pending} pending");
             }
-            if relays {
-                let l = state.ledger().context("no ledger")?.clone();
-                println!("{} events read from {} relays", events.len(), relay_count);
-                let (problems, warnings) = isoloir_proto::audit::check_relays_report(&state, &events, &l.ingest, 2 * l.checkpoint_period + 60);
-                r.problems.extend(problems);
-                r.warnings.extend(warnings);
-            }
             println!(
-                "{} checkpoints, {} entries: {} registrations, {} ballots, {} refusals ({} summed up, {} not judged again), {} tallies",
-                r.checkpoints, r.entries, r.registrations, r.ballots, r.rejects + r.unlisted, r.summarized, r.unjudged + r.unlisted, r.tallies
+                "{} checkpoints, {} entries: {} registrations, {} ballots, {} tallies, {} refusals of an earlier log (read, not judged)",
+                r.checkpoints, r.entries, r.registrations, r.ballots, r.tallies, r.rejects
             );
             for w in &r.warnings {
                 println!("warning: {w}");

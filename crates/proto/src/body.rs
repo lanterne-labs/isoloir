@@ -374,12 +374,10 @@ pub struct Ballot {
     pub proof: String,
 }
 
-/// A refusal (SPEC §11.4): the message's event id, its author, its size,
-/// its body hash and the reason. The body itself is not logged (anyone
-/// can post junk for free, and the log is public forever): the ingest
-/// keeps it and an auditor judges it again from a relay's copy or the
-/// ingest's. Refusals logged before carry `raw`, the body in base64, and
-/// no `author` or `size`.
+/// A refusal, as logs of earlier versions hold them (SPEC §11.4): the
+/// message's event id, its body hash, the reason and the raw body in
+/// base64 (or, for a few weeks, its author and size instead). Read, never
+/// written.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reject {
@@ -393,15 +391,12 @@ pub struct Reject {
     pub reason: Reason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
-    /// The earlier form only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<String>,
 }
 
-/// The refusals of a checkpoint beyond the first [`REJECTS_LOGGED`]
-/// (SPEC §11.4): how many, their total size, and the RFC 6962 root over
-/// their `reject` bodies in body-hash order. The ingest keeps the list and
-/// serves it (`GET /v1/rejects/<checkpoint>`).
+/// A count of refusals, as logs of a few weeks hold them (SPEC §11.4).
+/// Read, never written.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rejects {
@@ -412,20 +407,8 @@ pub struct Rejects {
 }
 
 /// The largest body a message may have: a larger one is refused as
-/// `malformed`, and the ingest does not keep it.
+/// `malformed`.
 pub const MAX_BODY: usize = 256 * 1024;
-
-/// The refusals a checkpoint logs one by one; the others are summed up in
-/// one `rejects` entry, so that junk cannot grow the log faster than
-/// this per checkpoint.
-pub const REJECTS_LOGGED: usize = 16;
-
-/// The root of a list of `reject` bodies (a `rejects` entry): the RFC 6962
-/// root over `SHA-256(0x00 ‖ body)`, in the order given (body-hash order).
-pub fn rejects_root<B: AsRef<[u8]>>(bodies: &[B]) -> String {
-    let leaves: Vec<crate::log::Hash> = bodies.iter().map(|b| crate::log::leaf_hash(b.as_ref())).collect();
-    format!("0x{}", hex::encode(crate::log::root_of(&leaves)))
-}
 
 /// A result (SPEC §10.3, §10.4).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -651,5 +634,17 @@ mod tests {
         assert_eq!(canonical::to_string(&k).unwrap(), r#"{"blank":true,"options":["Oui","Non"],"type":"choice"}"#);
         let p = Publish::Closed;
         assert_eq!(canonical::to_string(&p).unwrap(), r#"{"mode":"closed"}"#);
+    }
+
+    // The refusals of earlier logs decode in each of their forms.
+    #[test]
+    fn earlier_refusals_decode() {
+        let h = format!("0x{}", "ab".repeat(32));
+        let raw = format!(r#"{{"hash":"{h}","kind":"ballot","of":"{0}","raw":"e30=","reason":"stale_seq","v":1}}"#, "cd".repeat(32));
+        let sized = format!(r#"{{"author":"{0}","hash":"{h}","kind":"ballot","of":"{0}","reason":"malformed","size":4,"v":1}}"#, "cd".repeat(32));
+        let sum = format!(r#"{{"count":5,"root":"{h}","size":20,"v":1}}"#);
+        assert!(matches!(decode(EntryKind::Reject, raw.as_bytes()), Ok(Body::Reject(r)) if r.raw.is_some()));
+        assert!(matches!(decode(EntryKind::Reject, sized.as_bytes()), Ok(Body::Reject(r)) if r.size == Some(4)));
+        assert!(matches!(decode(EntryKind::Rejects, sum.as_bytes()), Ok(Body::Rejects(r)) if r.count == 5));
     }
 }

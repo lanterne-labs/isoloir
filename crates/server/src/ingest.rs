@@ -56,45 +56,21 @@ pub mod kinds {
 pub const REFUSED_KEPT: u64 = 30 * 86_400;
 
 /// The window of a proof of work's time (SPEC §11.1).
-pub const POW_PAST: u64 = 7_200;
-pub const POW_AHEAD: u64 = 300;
+pub use isoloir_proto::pow::{AHEAD as POW_AHEAD, PAST as POW_PAST};
 
 /// The most messages waiting for their proof check; beyond, a message is
 /// dropped unanswered (its device retries).
 pub const QUEUE_MAX: usize = 100_000;
 
-/// The proof of work of an envelope (SPEC §11.1): its `pow` tag's time and
-/// nonce make `SHA-256("isoloir/1/pow\n" ‖ origin ‖ "\n" ‖ pubkey ‖ "\n" ‖ t
-/// ‖ "\n" ‖ nonce)` start with `bits` zero bits. Returns its time.
+/// The proof of work of an envelope (SPEC §11.1); returns its time.
 pub fn pow_check(origin: &str, ev: &Event, bits: u32, now: u64) -> Option<u64> {
     let tag = ev.tags.iter().find(|t| t.first().map(String::as_str) == Some("pow"))?;
-    let (t, nonce) = (tag.get(1)?, tag.get(2)?);
-    let t: u64 = t.parse().ok().filter(|n: &u64| n.to_string() == *t)?;
-    if nonce.is_empty() || nonce.len() > 32 || !nonce.is_ascii() || t + POW_PAST < now || t > now + POW_AHEAD {
-        return None;
-    }
-    let h = encoding::sha256(format!("{}/pow\n{origin}\n{}\n{t}\n{nonce}", isoloir_proto::PROTOCOL, ev.pubkey).as_bytes());
-    (leading_zeros(&h) >= bits).then_some(t)
-}
-
-fn leading_zeros(h: &[u8]) -> u32 {
-    let mut n = 0;
-    for b in h {
-        if *b == 0 {
-            n += 8;
-        } else {
-            return n + b.leading_zeros();
-        }
-    }
-    n
+    isoloir_proto::pow::check(origin, &ev.pubkey, tag, bits, now)
 }
 
 /// Finds a nonce for a key (tests, the CLI's voter).
 pub fn pow_solve(origin: &str, pubkey: &str, t: u64, bits: u32) -> String {
-    (0u64..)
-        .map(|n| n.to_string())
-        .find(|nonce| leading_zeros(&encoding::sha256(format!("{}/pow\n{origin}\n{pubkey}\n{t}\n{nonce}", isoloir_proto::PROTOCOL).as_bytes())) >= bits)
-        .expect("a nonce")
+    isoloir_proto::pow::solve(origin, pubkey, t, bits)
 }
 
 /// The identifier a message claims (SPEC §11.2: the queue's order).
