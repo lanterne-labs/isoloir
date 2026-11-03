@@ -18,7 +18,8 @@ recount.
 Nothing runs on a blockchain. Messages travel by the **channels** the
 ledger declares (§11.1): public Nostr relays, so that the browser never
 talks to the operator's server, or the ingest's own HTTP endpoint, or
-both; the library picks them from the ledger. Bitcoin is used
+both; the library picks them from the ledger. Channels are transport
+only: nothing relies on them keeping a copy of anything. Bitcoin is used
 only to timestamp checkpoints (OpenTimestamps), Ethereum only to read the
 passport certificate registry, drand only as a time-lock beacon.
 
@@ -30,7 +31,7 @@ passport certificate registry, drand only as a time-lock beacon.
 | Ingest (server) | the ledger's log key, its Nostr key | verifies and logs, acknowledges, checkpoints, mirrors |
 | Authority (`authority`) | a poll's decryption key, or nothing (tlock) | publishes decryptions when the poll's rule says so |
 | Channels | nothing | carry messages; a relay sees who posts what, from which address (a direct channel: the operator does) |
-| Auditor | nothing | recomputes everything from the log, the relays, the mirror |
+| Auditor | nothing | recomputes everything from the log and the mirror |
 
 The ingest cannot vote for anyone, cannot change a ballot, cannot read a
 ballot, and cannot drop one without the voter's receipt check failing in
@@ -82,8 +83,10 @@ name, e.g. `vote.example/isoloir`). Entries are numbered from 0 (`seq`).
 - **Leaf**: `"isoloir/1\n" ‖ seq ‖ "\n" ‖ kind ‖ "\n" ‖ body`, seq in
   decimal. The log is an RFC 6962 Merkle tree over the leaves (SHA-256,
   `0x00` leaf prefix, `0x01` node prefix).
-- **Kinds**: `ledger`, `registry`, `register`, `poll`, `ballot`, `reject`,
-  `rejects`, `tally`, `close`. Later versions add `partial` and `dkg` (threshold
+- **Kinds**: `ledger`, `registry`, `register`, `poll`, `ballot`, `tally`,
+  `close`. Logs written before this version of the document also hold
+  `reject` and `rejects` entries (§11.4), which readers still accept and
+  no ingest writes. Later versions add `partial` and `dkg` (threshold
   decryption, §9.4).
 - **Checkpoint**: a signed note (C2SP `signed-note`) by the ledger's log
   key (Ed25519), text:
@@ -96,7 +99,7 @@ name, e.g. `vote.example/isoloir`). Entries are numbered from 0 (`seq`).
   time <unix seconds>
   registry <id> <tree size> <tree root>      one line per registry
   ballots <poll> <tree size> <tree root>     one line per delta poll
-  mirror <token>                             when the mirror has one
+  mirror <commit> <index>                    when the mirror has one
   ```
 
   The note's key name is the origin; its key id is the first 4 bytes of
@@ -110,6 +113,12 @@ name, e.g. `vote.example/isoloir`). Entries are numbered from 0 (`seq`).
   their checkpoint (in poll order) so that the ballots accepted before
   the close and logged with it come first; registrations take their tree
   positions in that order.
+- **The `mirror` line** names the newest commit of the mirror's
+  repository that the ingest knows its remote holds, and the newest
+  checkpoint whose files that commit holds (§15): a checkpoint is never
+  delayed by the mirror, so its own files are named by a later note.
+  Notes written before this version name one commit, the one holding
+  that checkpoint's own data files (`mirror <commit>`).
 - **Stamps**: every checkpoint note's SHA-256 is timestamped with
   OpenTimestamps; the stamps are upgraded until they carry a Bitcoin
   attestation and are published with the mirror.
@@ -124,7 +133,8 @@ change what may change (§13).
  "log_key":"<C2SP verifier key>","ingest":"<Nostr pubkey, x-only hex>",
  "channels":[{"type":"nostr","url":"wss://…","state":"active"},
              {"type":"direct","url":"https://vote.example/ingest","state":"active"}],
- "checkpoint_period":20,"anchor_age":86400}
+ "checkpoint_period":20,"anchor_age":86400,
+ "revote_gap":3600,"pow":16}
 ```
 
 `channels`: at least one active (three relays for a ledger that wants
@@ -132,7 +142,10 @@ voters never to reach the operator); `state` is `active` or `retired` (read, not
 written). `anchor_age`: how old a tree root a ballot may prove against
 (at least `checkpoint_period`). Channel URLs are `wss://` (nostr) or
 `https://` (direct), `ws://` and `http://` on the local machine only, no
-trailing slash, no duplicate.
+trailing slash, no duplicate. `revote_gap` (seconds, absent: 0): the
+least time between two counted ballots of one pseudonym (§7.4). `pow`
+(bits, absent: 0): the proof of work every envelope carries (§11.1).
+Both are left out at 0, so a ledger written without them reads the same.
 
 ## 5. Registries
 
@@ -304,7 +317,16 @@ reused for each candidate of the other.
   a ballot counts if it has the highest `seq` of its nullifier, and
   `seq` may not exceed the last one by more than 16 (`seq_gap`: a huge
   seq would make a ballot final, a receipt a coercer could demand). The
-  log shows when and how often a pseudonym changed its mind.
+  log shows when and how often a pseudonym changed its mind. With the
+  ledger's `revote_gap` g > 0, a ballot of a pseudonym that already has
+  one is refused as `too_soon` while its newest ballot is pending or was
+  logged by a checkpoint less than g seconds before (a refused ballot
+  does not count). It is a rate, not a total: whoever votes in the
+  voter's place, a coercer included, cannot use up the voter's re-votes,
+  and the voter's last ballot before the close counts. The device keeps
+  its last `seq`; one that lost it (a new device) learns it from
+  `stale_seq` refusals, raising `seq` until one is accepted (within the
+  gap of 16).
 - **`delta`**: every ballot has a fresh identifier
   `ident_i = H(T_bnull, poll, s, i)` (i = 0, 1, … private), carries the
   **correction** `new − old` (old = 0 for i = 0), and appends to the
@@ -404,7 +426,7 @@ root of the registry at most `anchor_age` old (`old_root`), same for
 minutes by its own clock: a mirror serving one voter an old root would
 single that voter's ballot out); points decode and are not at infinity (`malformed`); the
 re-vote rule (`revote_off`, `stale_seq` when `seq` is not above the
-pseudonym's last, `duplicate`); `blob` ≤ 4 KiB (tlock); the proof against
+pseudonym's last, `seq_gap`, `too_soon`, `duplicate`); `blob` ≤ 4 KiB (tlock); the proof against
 the circuit of the setup with the public inputs rebuilt from the body,
 the setup and the poll (`bad_proof`).
 
@@ -501,38 +523,75 @@ Every message is a signed **envelope** in the format of a Nostr event
 (NIP-01: id, pubkey, created_at, kind, tags, content, sig; BIP340 on
 secp256k1), tag `["t","isoloir/1/<origin>"]`, content the body. The
 envelope and its acknowledgement are the same whatever carries them; a
-channel type only says how they travel:
+channel type only says how they travel. Channels are transport only:
+the protocol and the audit never rely on a channel keeping a copy.
 
 - **`nostr`**: public relays (`wss://`). The voter publishes the envelope;
-  the ingest reads the relays and publishes the ack on the relay the
-  envelope came from. The relays keep copies, so an auditor can prove
-  withholding (§16); the operator never sees a voter's address.
+  the ingest, subscribed to the relays, publishes the ack on the relay
+  the envelope came from. Every kind is ephemeral (20000–29999, NIP-16):
+  relays forward the events to the live subscriptions and keep none. The
+  operator never sees a voter's address.
+- **`iroh`** (not built yet; the form is fixed so that a ledger may list
+  it): `{"type":"iroh","url":"iroh://<node id>","relay":"https://<relay>","state":"active"}`,
+  the ingest's iroh node, reached only through the iroh relay (DERP)
+  named, never directly, so that the ingest never sees the voter's
+  address. One envelope per message, the ack back on the same
+  connection.
 - **`direct`**: the ingest's HTTP endpoint (`https://`).
   `POST <url>/v1/messages` with the envelope as JSON answers 200 with the
   ack, or 202 `{"pending":"<id>"}` when judgment waits (§11.2);
-  `GET <url>/v1/acks/<id>` answers the ack, or 404. Simpler to run, but
-  the operator sees each voter's address and timing, and no third party
-  keeps a copy: withholding shows only through receipts (§11.3).
-- Later types (a chain, for instance) add a variant: the envelope, the
-  ack, the log and the mirror do not change.
+  `GET <url>/v1/acks/<id>` answers the ack, or 404. The operator sees
+  each voter's address and timing.
+- A channel type is a way to carry an envelope to the ingest and its ack
+  back: a later type adds a variant here and in the ledger's `channels`;
+  the envelope, the ack, the log and the mirror do not change.
 
 Kinds:
 
 | Kind | Content | Signed by |
 |---|---|---|
-| 7100 | register | a throwaway key |
-| 7101 | ballot | a throwaway key |
-| 7102 | ack | the ingest |
-| 7103 | checkpoint note | the ingest |
-| 7104 | device link | a throwaway key |
-| 7105 | tally | a throwaway key (the body carries its own signature) |
-| 7106 | complaint | a throwaway key |
+| 27100 | register | a throwaway key |
+| 27101 | ballot | a throwaway key |
+| 27102 | ack | the ingest |
+| 27103 | checkpoint note | the ingest |
+| 27104 | device link | a throwaway key |
+| 27105 | tally | a throwaway key (the body carries its own signature) |
+| 27106 | complaint | a throwaway key |
 
-A voter ranks the active channels by `H(T_relay, s, SHA-256(url) mod r)`,
-lowest first: registrations go to the first, ballots start with the
-second when there is more than one (so the two are not seen together by
-one relay); the voter moves to the next when no ack comes within 60 s.
-The device link (§14) needs a relay.
+Clients written before this version post 7100–7106 (kinds relays
+store); the ingest still reads them and answers in the same range.
+
+**Order.** A voter tries the active channels by type, `nostr` first,
+then `iroh`, then `direct` last (it shows the voter's address to the
+operator), and within a type by `H(T_relay, s, SHA-256(url) mod r)`,
+lowest first: registrations go to the first relay, ballots start with
+the second when there is more than one (so the two are not seen
+together by one relay). The voter moves to the next channel when no ack
+comes within 60 s, in a fresh envelope. The device link (§14) needs a
+relay.
+
+**Proof of work.** With the ledger's `pow` d > 0, every envelope carries
+a tag `["pow","<t>","<nonce>"]`: `t` a time (Unix seconds, decimal),
+`nonce` up to 32 ASCII characters, such that
+
+```
+SHA-256("isoloir/1/pow\n" ‖ origin ‖ "\n" ‖ pubkey ‖ "\n" ‖ t ‖ "\n" ‖ nonce)
+```
+
+(pubkey the envelope's, lower-case hex) starts with d zero bits, and
+`now − 7200 ≤ t ≤ now + 300` at the ingest. The work is bound to the
+throwaway key and a time, not to the envelope id: the id covers the
+body, which exists only once the proof is made, and in NIP-01's
+serialization the tags precede the content, so mining the id would
+hash the whole ballot (about 22 KB) at every try and nothing could be
+done in advance. Bound to the key, the device draws the key and does
+the work in the background while it proves the ballot (d = 16: about
+65,000 hashes of 150 bytes, well under a second on a phone), then signs
+the envelope with it. One key carries one body: the ingest takes resends
+of the same body under the key, and drops another body under it.
+Checked first, with the tag and the signature: an envelope that fails
+them is dropped unanswered (answering junk would cost the ingest a
+signature and a post per junk message).
 
 ### 11.2 Acknowledgements
 
@@ -547,64 +606,69 @@ channel it came from, tag `["e", <event id>]`:
 or `"outcome":"rejected","reason":"…"`. The ack's `created_at` is
 rounded down to the minute (an ack is public: to the second, it would
 date the entry it names). A message resent after a missed ack goes in a
-fresh envelope (relays filter old events by time); the ingest answers
-the same body with the same outcome whatever its envelope. An accepted message is first
+fresh envelope; the ingest answers the same body with the same outcome
+whatever its envelope. An accepted message is first
 written to durable storage (pending), then acknowledged, then logged at
 the named checkpoint in the same transaction as the checkpoint itself.
 A message whose check failed for an infrastructure reason is neither
 acknowledged nor refused; it is retried.
 
+**Order of judgment.** The ingest judges in two steps. The cheap checks
+come first, in arrival order: the envelope (tag, signature, proof of
+work), then the body up to its proof (canonical form, version, setup,
+signature, dates, roots, the identifiers it claims not used, the
+re-vote rule); a message that fails them is refused at once. The
+messages that pass wait for the proof check (the ballot proof, the
+passport verifier) in a queue ordered by how long ago the identifier
+they claim (the registration's `uid`, the ballot's `nullifier` or
+`ident`) was last claimed by a message, never claimed first: a flood
+replaying one identifier waits behind every fresh voter. Tallies come
+first.
+
 ### 11.3 Receipts and complaints
 
+The ack is the voter's receipt, signed by the ingest's Nostr key, which
+nobody else holds:
+
+- an `accepted` ack whose body is missing from the entries of the
+  checkpoint it names proves the ingest dropped an accepted message;
+- a `rejected` ack together with the body (whose hash the ack names)
+  lets anyone judge the refusal again against the log at that time: a
+  valid message refused proves a wrong refusal.
+
 The browser keeps the ack and checks the entries of the named
-checkpoint on the mirror for its body hash. A missing body is a
-**complaint**: `{"v":1,"ack":<the ack event>,"body":<the body, as JSON>}`
-(the body is canonical, so embedding it as JSON is lossless) posted
-by the ledger's channels; anyone can judge it from the log and the ack's
-signature, which no one but the ingest can make.
+checkpoint on the mirror for its body hash. Either case is a
+**complaint**: `{"v":1,"ack":<the ack event>,"body":<the body, as
+JSON>}` (the body is canonical, so embedding it as JSON is lossless),
+kept by the voter and posted by the ledger's channels (kind 27106) to
+whoever listens; anyone can judge it from the log and the ack's
+signature.
 
-### 11.4 Every refusal is logged
+A message that is never answered proves nothing afterwards: no third
+party keeps a copy. The device retries on the next channel, `direct`
+last.
 
-A body over 256 KiB is refused as `malformed`. Every refusal is
-accounted for in the log, and none carries the refused body: anyone can
-post junk for free under fresh keys, and the log is public and kept
-forever.
+### 11.4 Refusals are not logged
 
-- A refusal is a `reject` entry:
+The log holds accepted entries only. A refused message gets its signed
+`rejected` ack (§11.2) and nothing else. A body over 256 KiB is refused
+as `malformed`. The ingest keeps refused bodies (up to 256 KiB) in its
+database for 30 days, for debugging, then deletes them; they are not
+published.
 
-  ```json
-  {"v":1,"of":"<event id>","author":"<the envelope's pubkey>","size":1234,
-   "hash":"<SHA-256 of the body>","reason":"…","kind":"ballot"}
-  ```
-
-  The ingest keeps the body (up to 256 KiB) and serves it to anyone,
-  `GET <ingest>/v1/refused/<event id>` (404: no such refusal; 410: over
-  the size limit, not kept). The relays keep their copies too. Either
-  copy is checked against `hash` (and a relay's envelope against
-  `author`), so neither the ingest nor a relay can substitute another.
-- A checkpoint logs its first 16 refusals, in arrival order, as `reject`
-  entries. The others are summed up in one `rejects` entry:
-
-  ```json
-  {"v":1,"count":5000,"size":1048576,"root":"0x…"}
-  ```
-
-  `count` refusals, `size` the total of their body sizes, `root` the
-  RFC 6962 root (§4's hashing, `SHA-256(0x00 ‖ body)` per leaf) over
-  their `reject` bodies in body-hash order. The ingest serves the list,
-  `GET <ingest>/v1/rejects/<checkpoint index>` answers
-  `{"checkpoint":i,"rejects":["<reject body>",…]}` in that order. A
-  checkpoint thus adds at most 16 refusals and one summary to the log,
-  however much junk arrived.
-- Refusals logged before this form carry `raw` (the body, base64) and
-  no `author` or `size`; readers accept both forms.
+Logs written before this version also hold, per refused message, a
+`reject` entry `{"v":1,"of":"<event id>","hash":"…","reason":"…",
+"kind":"ballot","raw":"<the body, base64>"}` (or, for a few weeks, with
+`author` and `size` in place of `raw`), and possibly `rejects` entries
+`{"v":1,"count":…,"size":…,"root":"0x…"}`. Readers accept them as
+entries of the log; nothing is judged from them.
 
 ## 12. Reasons
 
 `malformed`, `version`, `unknown`, `not_open`, `closed`, `bad_sig`,
 `stale_date`, `uid_used`, `id_used`, `full`, `bad_proof`, `old_root`,
-`revote_off`, `stale_seq`, `seq_gap`, `duplicate`, `not_due`,
-`bad_tally`.
+`revote_off`, `stale_seq`, `seq_gap`, `too_soon`, `duplicate`,
+`not_due`, `bad_tally`.
 
 ## 13. Upgrades
 
@@ -614,7 +678,7 @@ forever.
   id and `version + 1` supersedes the previous. What may change:
   - `ledger`: `channels` (append, retire; a channel keeps its type),
     `ingest` (a new Nostr key), `checkpoint_period`,
-    `anchor_age`; never `origin`, `log_key`.
+    `anchor_age`, `revote_gap`, `pow`; never `origin`, `log_key`.
   - `registry`: `name`, `validity`; never `id`, `eligibility`, `depth`.
   - `poll`: `title`, `closes` (later only, before the close), `blackouts`
     (future ones only), `publish.k_real` and `publish.min_gap` (open
@@ -645,8 +709,9 @@ carries the warning).
 
 ## 15. The mirror
 
-Static files, served from a git repository by commit (the checkpoint's
-`mirror` token) so that a reader can prove which files it was served:
+Static files in a git repository whose history only grows (commits are
+appended, never rewritten), so that a file is addressed for ever by a
+commit:
 
 ```
 checkpoint.txt                       the latest note
@@ -658,24 +723,46 @@ setup/ledger.json, registries/<id>.json, polls/<id>.json
 polls/<id>/close.json                <proven entry>
 circuits/<name>/{artifact.json,vk}
 registries/<id>/leaves/<k>.json      leaves 1024·k … 1024·k+1023
-registries/<id>/positions/<pp>.json  leaf → position, by leaf prefix
-polls/<id>/pseudonyms/<pp>.json      nullifier → last seq (linked)
 polls/<id>/ballots/<k>.json          ballot tree leaves (delta)
 polls/<id>/tallies/latest.json, polls/<id>/tallies/<seq>.json
                                      <proven entry>
 ```
 
-The refused bodies and the lists of `rejects` entries are not on the
-mirror: the ingest serves them (§11.4).
+The mirror grows with the entries; the other files are few, or
+rewritten in place (the newest leaves block, the setups, the latest
+tally, the stamps as they are upgraded). Mirrors of earlier versions
+also hold `registries/<id>/positions/` and `polls/<id>/pseudonyms/`,
+no longer written: a device finds its tree position in the entries of
+the checkpoint its registration's ack names (the registry's tree size
+in the previous note, plus the rank of its registration among that
+checkpoint's registrations of the registry, in log order), and keeps its
+last `seq` (§7.4).
+
+**Addressing.** Files are read by commit (a CDN serves
+`<repo>@<commit>/<path>` for ever, while a branch is cached for hours).
+Each checkpoint writes its files and commits them locally; a background
+task pushes, and retries every 30 s what the remote lacks. A checkpoint
+never waits for the push: the git host down or full never stops the
+log. A note's `mirror <commit> <index>` (§4) names the newest commit the
+ingest knows the remote holds and the newest checkpoint that commit
+covers. A reader takes the latest note from any source (its signature
+and its time are what it trusts), reads `checkpoints/<index>.txt` and
+the files of checkpoints up to `index` at that commit, and waits for a
+later note to read files of a later checkpoint (a receipt check for a
+checkpoint above `index`). Every file is checked against signed notes
+(entries against the log root, setups and tallies by their proofs,
+leaves against the registry root of the note of the same tree size), so
+the commit only makes the files addressable, it vouches for nothing.
 
 The ingest clones the mirror's repository at start when its disk is
 empty, as a partial clone (`--filter=blob:none`: every commit and tree,
 the newest version of each file, older versions fetched when a merge
 needs them), not a shallow one: a push the remote refuses because it
 moved (a commit from elsewhere, a README) is merged, never rebased, so
-every commit a note names stays in the history. A checkpoint is signed
-only once the remote holds the commits of the previous ones: a lost
-disk then loses no commit a note names.
+every pushed commit stays in the history. Commits not yet pushed when
+the ingest restarts on an empty disk are written again from the log,
+under other hashes; no note names them, since a note names only pushed
+commits.
 
 A **proven entry** is `{"seq","kind","body","checkpoint","size","path"}`:
 the entry's log position, its body as a string, the checkpoint whose
@@ -696,18 +783,13 @@ between checkpoints; the stamps against Bitcoin block headers; every
 setup against its predecessor (§13) and the matrix (§8); every
 registration (signature, freshness, provider proof, uniqueness, tree
 positions and roots); every ballot (roots in age, re-vote rule, proof);
-every reject's reason, recomputed from a copy of the refused body (a
-relay's, or the ingest's, checked against the logged hash), and every
-`rejects` entry against the list the ingest serves (count, size, root,
-order), each refusal of it judged the same way; every tally (due by §10.1, aggregate,
+every tally (due by §10.1, aggregate,
 shares, combination, values, signature; tlock: beacon, openings, void
-list); every close. With the relays: every message the relays hold was
-judged (else withholding). A refusal whose body the audit could not get
-(the relays dropped it, the ingest did not keep it) is reported as not
-judged again, and so is a `rejects` entry whose list it could not read;
-an event on a relay that such a list may cover is reported as such, not
-as withheld. Both are said, never passed. With the mirror: its files at each
-checkpoint's commit are the log's.
+list); every close. `reject` and `rejects` entries of earlier logs are
+read as entries (they count in the log's hashes) and counted, not judged.
+With the mirror: its files are the log's. A message the ingest never
+answered is out of the audit's reach (§11.3); a dropped or wrongly
+refused message is proven by its voter's receipt.
 
 ## 17. What each party learns
 
@@ -716,7 +798,7 @@ checkpoint's commit are the log's.
 | Public | yes to the issuing state with a non-salted uid; salted: only with 2 of 3 OPRF operators (§5) | no | closed elgamal: aggregates only; open: tally differences, down to one ballot at low traffic or `k_real` 1 (§10.1); tlock: every ballot at the round | linked: per pseudonym, with the minute of each post; delta: the count of corrections per tally window |
 | Ingest | yes | no, but it chooses what each checkpoint holds (§10.1) | as public | as public |
 | Authority (elgamal) | yes | no | could decrypt any ballot of any poll under its key | as public |
-| Relay | yes | address and time of the post; under tlock, the content at the round | as public | as public |
+| Relay (nostr, iroh) | yes | address and time of the post (an iroh relay: the address only); under tlock, the content at the round | as public | as public |
 | Mirror host | no | the address that asks for a checkpoint's entries or a shard (browsers fetch windows, not one checkpoint) | as public | as public |
 | Network observer | no | address ↔ relay ↔ time; defeated only by Tor or a VPN, which the app may recommend | as public | as public |
 | Passkey provider | learns a passkey for the site exists; a compelled account yields `s` | | | |
