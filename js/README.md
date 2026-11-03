@@ -1,6 +1,6 @@
 # @isoloir/web
 
-The browser side of isoloir (`../SPEC.md`), with no framework: keys, passport registration, ballots, receipts, complaints and results. The browser never calls the operator's server. It posts signed envelopes through the channels the ledger lists (Nostr relays, or the ingest's direct HTTP endpoint when the ledger has no relay). Everything else it reads as static files from the mirror.
+The browser side of isoloir (`../SPEC.md`), with no framework: keys, passport registration, ballots, receipts, complaints and results. It posts signed envelopes through the channels the ledger lists: Nostr relays first, then iroh (when an app provides it), then the ingest's direct HTTP endpoint last, which shows the voter's address to the operator. Everything else it reads as static files from the mirror. Channels are transport only: the library never reads a relay's past events to recover anything.
 
 Every protocol rule comes from the Rust crates compiled to WebAssembly (`../crates/wasm`): leaves, pseudonyms, ballot drafts, tlock sealing, checkpoint notes, log inclusion proofs, tally proofs and the 12 words. This package only orchestrates.
 
@@ -40,13 +40,14 @@ await session.init();
 
 `init()` reads `setup/ledger.json`, `registries/<id>.json` and `polls/<id>.json`. It uses none of them until it has checked each one's inclusion proof against the note of the checkpoint the file names, and that note was verified under the pinned key. It also checks that the ledger names the pinned log key. The session's channels come from that ledger. The app never chooses a transport.
 
-1. **Scan.** The registration key is drawn before any voter key exists:
+1. **Scan.** The registration key is drawn before any voter key exists. Start the envelope's proof of work as the passport step begins (see "Envelopes" below), so it is ready when the registration goes:
 
    ```ts
+   void session.startWork().catch(() => {});                                // the ledger's pow, mined in the background
    await session.scanPassport(async (req) => zkpassportScan(req, session)); // see the adapter below
    ```
 
-   The proof is kept in the store until the key exists and the registration is posted.
+   The proof is kept in the store until the key exists and the registration is posted. `scanPassport` starts the work itself when the app did not.
 
 2. **Key.** Either `createKeyFromWords()`, which returns the 12 words to show, or `await createKeyWithPasskey()`.
    - A passkey counts only when the platform reports it as synced (WebAuthn backup state). Otherwise it throws `passkey_not_backed_up` and the app should offer the words instead.
@@ -58,20 +59,23 @@ await session.init();
    - Call `session.confirmWords(positions, answers)`, which returns `{ ok, wrong }`; `wrong` lists the 1-based positions that do not match.
    - Case and French accents do not matter.
 
-4. **Submit.** `await session.submitRegistration()` signs the body and posts it to the key's first channel, then waits 60 s for the ingest's signed ack before trying the next channel.
-   - A missed ack is recovered with `resendRegistration()`: the same body in a fresh envelope.
+4. **Submit.** `await session.submitRegistration()` signs the body and posts it to the key's first channel, then waits 60 s for the ingest's signed ack before trying the next channel, in a fresh envelope.
+   - A missed ack is recovered with `resendRegistration()`: the same body in a fresh envelope. A registration sent and never acked is also found in the log when the ingest took it.
    - A kept registration whose proof went stale is replaced from a fresh scan of the same registration key.
-   - The position comes from the checkpoint entries the session reads in order.
+   - The position comes from the entries of the checkpoint that logged the registration: the registry's size in that note, less its registrations there, plus this one's rank among them in log order. No positions file is read (mirrors no longer have one). A key restored on a new device finds its leaf among the registry's leaves (`leaves/<k>.json`, the whole tree, which a ballot reads anyway).
    - `session.register({ obtainProof, key: 'words', confirm })` runs steps 1 to 4 in one call.
 
 5. **Cast.** `await session.cast({ pick: 1 })`, or `{ rank: [2, 0] }` for ranked polls.
    - The session refuses to draft against a checkpoint older than 30 minutes (`stale_mirror`).
    - Ballots go to the key's channels after the first one, never to the registration's channel.
    - Re-votes continue the key's chain: the next seq in linked polls, the correction of the previous ballot in delta polls.
+   - The device keeps its last seq (mirrors no longer publish one per pseudonym). A device without it (restored words, a new device) starts at 0 and raises the seq on each `stale_seq` refusal, by steps of 1, 2, 4, 8, then 16 (the ingest's seq gap), proving again each time, until one is accepted.
+   - With the ledger's `revote_gap`, a re-vote within the gap of the pseudonym's newest ballot, or while that ballot is not logged yet, is refused as `too_soon`. The session refuses it before proving when its record says so, and otherwise passes on the ingest's refusal. The error's `data` is `{ retryAt, waitSeconds, exact }`: when the next ballot counts (unix seconds, the server's clock), how long that is from now, and whether it is exact (the newest ballot was found in the log) or estimated from its ack. The voter's last ballot before the close always counts.
    - A ballot no channel acknowledged is kept: call `resendBallot()`, or `discardKeptBallot()` to drop it.
 
 6. **Receipts and complaints.**
    - While something waits, `refresh()` reads the entries of every checkpoint since the post. It runs on a timer, and live checkpoints come from a relay that is neither the registration's nor the ballots'.
+   - A note's `mirror <commit>:<index>` names the newest pushed commit and the newest checkpoint it covers. Files are read at that commit; the entries of a later checkpoint are read once a later note covers it, and a ballot is drafted against the roots of the covered checkpoint (`checkpoints/<index>.txt`, verified). Notes of earlier versions (`mirror <commit>`) cover themselves.
    - A body that is missing from the checkpoint its ack named becomes a complaint. It is posted to the relays, or to the direct endpoint when there are none, and it stays on the device with the signed ack.
 
 7. **Results.** `state.tally` holds the last tally that verified (proven in the log; signature, decryption proofs and values checked). A newer tally that fails is kept apart in `state.tallyUnverified`. A tlock tally never reaches `ok`: the browser only checks its beacon, and the openings are an auditor's job.
@@ -85,7 +89,32 @@ Other calls:
   - The sender counts the link as a backup only when its `confirmed` promise resolves to `true`.
 - `state.storage` is `persistent`, `best-effort` or `memory`. The session asks for `navigator.storage.persist()`.
 
-Every error is an `IsoloirError` whose `code` belongs to the `IsoloirErrorCode` union. Some codes carry `data`; for example `bad_words` includes `{ unknown: [3, 8] }`.
+Every error is an `IsoloirError` whose `code` belongs to the `IsoloirErrorCode` union. Some codes carry `data`; for example `bad_words` includes `{ unknown: [3, 8] }`, and `too_soon` includes `{ retryAt, waitSeconds, exact }`. `pow` means the proof of work could not be made. An envelope the ingest drops for its work gets no answer: it shows as `no_ack` once every channel was tried.
+
+## Envelopes: kinds, channels, proof of work
+
+**Kinds.** Messages travel on the ephemeral Nostr kinds 27100–27106: relays forward them to live subscriptions and keep none. An ingest of an earlier version reads only 7100–7106; an ingest of this version reads both and answers each envelope in its own range. The `kinds` option picks the range:
+- `'auto'` (default): the legacy range until the ledger shows an ingest of this version, then the ephemeral one. The signs: a `pow` or `revote_gap` in the ledger setup (an earlier ingest cannot read such a ledger), a note whose mirror line names the checkpoint it covers, or a checkpoint event of kind 27103 from the ingest on a relay. `state.kinds` says which range is in use.
+- `'ephemeral'` or `'legacy'`: forced.
+
+Acks are read in both ranges, and device links are listened for in both.
+
+**Channels.** The session tries the ledger's active channels by type, `nostr` first, then `iroh`, then `direct`, and within a type by the key's ranking. It moves to the next channel when no ack comes within `ackTimeoutMs` (60 s), each time in a fresh envelope. A registration starts with the first relay. Ballots start with the second and never use the registration's relay when there is another; in the other types the first comes last. A `ChannelFactory` that returns `null` leaves a channel out: the default one does so for iroh, which is specified but not built. An app with an iroh transport gives a factory that returns an `IngestChannel` for it (`send` posts one envelope and resolves with the ack, or with null when none came). Nothing else changes.
+
+**Proof of work.** With the ledger's `pow` d > 0 (for example `"pow":16`), every envelope to the ingest carries `["pow","<t>","<nonce>"]`. The tag makes `SHA-256("isoloir/1/pow\n" ‖ origin ‖ "\n" ‖ pubkey ‖ "\n" ‖ t ‖ "\n" ‖ nonce)` start with d zero bits. The work is bound to the envelope's throwaway key and a time `t`, not to the body, so the session draws the key and mines before the body exists. The ingest takes `t` from 2 h before its clock to 5 min after; the session uses a key's work up to 1 h 45 min old, then mines again. Every envelope takes its own key, and the next one is mined as soon as one is taken. With `pow` absent or 0, there is no tag and nothing to mine.
+- `session.startWork()` starts the work and resolves once it is ready. Call it when the passport step begins and when the ballot screen opens. `scanPassport()` and `cast()` start it too; a registration or a ballot waits for the work only if it is not ready yet.
+- `state.pow` is `{ bits, state: 'none' | 'mining' | 'ready' }`.
+- The hashing is the wasm core's. It runs in slices of about 8 ms that give the thread back (`pow: { sliceMs, chunk, yieldTo }` to tune), so the page stays responsive.
+- Measured with Node 24 on an Apple M5 Pro, the wasm miner does about 0.16 µs per hash. For d = 16 that is 9 ms on average and 29 ms at the 95th percentile. Assuming a phone 8 times slower, that is 70 ms on average and 0.23 s at the 95th percentile. d = 18 stays under 1 s at the 95th percentile on such a phone.
+
+## The audit
+
+`audit()` replays a mirror with the wasm judge. It reads mirrors of every version:
+- Earlier logs hold `reject` entries (with a raw body, or with `author` and `size`) and `rejects` summaries. They are counted, not judged.
+- An entry's body may be its text or its JSON.
+- When the newest note's commit covers fewer checkpoints than the note, the audit stops at the last one whose files are on the mirror and says so in `warnings` (`upto`, `latest`).
+
+Channels keep no copies, so the audit does not compare the log with the relays.
 
 ## The ZKPassport adapter (the app writes it)
 

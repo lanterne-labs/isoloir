@@ -4,13 +4,16 @@
 export type Hex = string;
 
 /**
- * A way to the ingest (SPEC §11.1): a Nostr relay (ws:// or wss://) or the
- * ingest's own HTTP endpoint ("direct"). Retired channels are read, not
- * written.
+ * A way to the ingest (SPEC §11.1): a Nostr relay (ws:// or wss://), the
+ * ingest's iroh node reached through its relay (iroh://<node id>, with
+ * `relay`), or the ingest's own HTTP endpoint ("direct"). Retired
+ * channels are read, not written.
  */
 export interface Channel {
-	type: 'nostr' | 'direct';
+	type: 'nostr' | 'iroh' | 'direct';
 	url: string;
+	/** iroh: the iroh relay (https://) the node is reached through, never directly. */
+	relay?: string;
 	state: 'active' | 'retired';
 }
 
@@ -24,6 +27,10 @@ export interface LedgerSetup {
 	channels: Channel[];
 	checkpoint_period: number;
 	anchor_age: number;
+	/** The least time between two counted ballots of a pseudonym, seconds (absent: 0, SPEC §7.4). */
+	revote_gap?: number;
+	/** The proof of work every envelope carries, bits (absent: 0, SPEC §11.1). */
+	pow?: number;
 }
 
 export interface Eligibility {
@@ -144,7 +151,14 @@ export interface Checkpoint {
 	time: number;
 	registries: { id: number; size: number; root: Hex }[];
 	ballots: { poll: number; size: number; root: Hex }[];
+	/** The mirror's commit the note names (SPEC §4, §15), null when it names none. */
 	mirror: string | null;
+	/**
+	 * The newest checkpoint whose files that commit holds (`mirror
+	 * <commit>:<index>`); null in notes of earlier versions, whose commit
+	 * holds the note's own files.
+	 */
+	mirror_index: number | null;
 }
 
 /** A Nostr event (NIP-01). */

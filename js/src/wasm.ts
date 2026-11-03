@@ -53,12 +53,13 @@ export interface IsoloirWasm {
 	audit_start(log_key: string, verdicts_json: string, allow_dev: boolean): number;
 	audit_checkpoint(id: number, note: string, entries_json: string): string;
 	audit_finish(id: number): string;
-	audit_relays(id: number, events_json: string): string;
 	audit_drop(id: number): void;
+	pow_mine(origin: string, pubkey: string, t: number, bits: number, start: number, count: number): string;
+	pow_check(origin: string, pubkey: string, t: number, nonce: string, bits: number): boolean;
 }
 
-/** The Nostr kinds of SPEC §11.1. */
-export interface Kinds {
+/** One set of the Nostr kinds of SPEC §11.1. */
+export interface KindSet {
 	register: number;
 	ballot: number;
 	ack: number;
@@ -66,6 +67,11 @@ export interface Kinds {
 	link: number;
 	tally: number;
 	complaint: number;
+}
+
+/** The Nostr kinds: ephemeral (27100–27106), and `legacy` (7100–7106, what clients posted before). */
+export interface Kinds extends KindSet {
+	legacy: KindSet;
 }
 
 export interface TreePath {
@@ -230,6 +236,13 @@ export class Core {
 	}
 	linkOpen(receiverSecret: string, sealed: string): { payload: string; code: string } {
 		return JSON.parse(this.w.link_open(receiverSecret, sealed)) as { payload: string; code: string };
+	}
+	/** The first nonce in start … start + count − 1 that does the work, or null (SPEC §11.1). */
+	powMine(origin: string, pubkey: string, t: number, bits: number, start: number, count: number): string | null {
+		return this.w.pow_mine(origin, pubkey, t, bits, start, count) || null;
+	}
+	powCheck(origin: string, pubkey: string, t: number, nonce: string, bits: number): boolean {
+		return this.w.pow_check(origin, pubkey, t, nonce, bits);
 	}
 }
 

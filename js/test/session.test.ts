@@ -249,7 +249,7 @@ describe('ballots', () => {
 		w.relays.relay(r1).down = true;
 		w.relays.relay(r2).down = true;
 		await expect(s.cast({ pick: 1 })).rejects.toMatchObject({ code: 'no_relay' });
-		expect(w.relays.relay(r0).events.filter((e) => e.kind === core.kinds.ballot)).toHaveLength(0);
+		expect(w.relays.relay(r0).seen.filter((e) => e.kind === core.kinds.ballot)).toHaveLength(0);
 	});
 
 	it('watches checkpoints on a relay that is neither the registration nor the ballot relay', async () => {
@@ -397,7 +397,8 @@ describe('delta polls', () => {
 	});
 
 	it('is not stuck on duplicate after a discarded ballot that was logged', async () => {
-		const w = world();
+		// An ingest of the earlier version, on relays that store (legacy kinds): it reads the discarded ballot later.
+		const w = world(undefined, undefined, { version: 'old' });
 		const prover = new StubProver();
 		const { s } = await voter(w, { poll: 8, prover });
 		await s.cast({ pick: 0 });
@@ -421,7 +422,7 @@ describe('delta polls', () => {
 });
 
 describe('keys', () => {
-	it('restores from the words with the seq of the log', async () => {
+	it('restores from the words, finds its leaf in the tree and learns the seq from stale_seq', async () => {
 		const w = world();
 		const { s, words } = await voter(w);
 		await s.cast({ pick: 0 });
@@ -434,7 +435,10 @@ describe('keys', () => {
 		expect(other.state().phase).toBe('ready');
 		expect(other.state().key?.position).toBe(0);
 		await other.cast({ pick: 1 });
-		expect(prover.calls[0].inputs.seq).toBe(1);
+		// No pseudonym file: seq 0 is refused as stale, seq 1 goes.
+		expect(prover.calls.map((c) => c.inputs.seq)).toEqual([0, 1]);
+		expect(stored(other).polls['7'].seq).toBe(1);
+		expect(w.mirror.reads.some((p) => p.includes('/pseudonyms/') || p.includes('/positions/'))).toBe(false);
 	});
 
 	it('reads French words without accents and names the wrong ones', async () => {

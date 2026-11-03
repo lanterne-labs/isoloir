@@ -102,7 +102,7 @@ describe('a direct-only ledger', () => {
 });
 
 describe('a mixed ledger', () => {
-	it('leaves the direct endpoint out when there are relays: registration to the first, ballots to the second', async () => {
+	it('uses the relays before the direct endpoint: registration to the first, ballots to the second', async () => {
 		const channels = [direct(DIRECT), nostr(RELAYS[0]), nostr(RELAYS[1])];
 		const w = world(channels);
 		const { s } = await voter(w);
@@ -113,9 +113,9 @@ describe('a mixed ledger', () => {
 		expect(s.state().ballot.state).toBe('verified');
 		expect(w.direct.received).toHaveLength(0);
 		const [first, second] = core.relayRanking(stored(s).secret, [RELAYS[0], RELAYS[1]]);
-		expect(w.relays.relay(first).events.some((e) => e.kind === core.kinds.register)).toBe(true);
-		expect(w.relays.relay(second).events.some((e) => e.kind === core.kinds.ballot)).toBe(true);
-		expect(w.relays.relay(first).events.some((e) => e.kind === core.kinds.ballot)).toBe(false);
+		expect(w.relays.relay(first).seen.some((e) => e.kind === core.kinds.register)).toBe(true);
+		expect(w.relays.relay(second).seen.some((e) => e.kind === core.kinds.ballot)).toBe(true);
+		expect(w.relays.relay(first).seen.some((e) => e.kind === core.kinds.ballot)).toBe(false);
 		// The relays serve device links.
 		const b = session(w);
 		await b.init();
@@ -125,7 +125,7 @@ describe('a mixed ledger', () => {
 		expect(rx.offer()).toBe(sender.code);
 	});
 
-	it('recovers a registration ack from the relay that holds it only', async () => {
+	it('finds a registration whose ack was missed in the log, asking no relay for past events', async () => {
 		const w = world();
 		const s = session(w);
 		await s.init();
@@ -137,12 +137,13 @@ describe('a mixed ledger', () => {
 		k.registration!.state = 'sent';
 		delete k.registration!.ack;
 		(s as unknown as { saveKey(k: unknown): void }).saveKey(k);
+		w.ingest.checkpoint();
 		const before = w.relays.subscriptions.length;
 		const again = session(w, { store });
 		await again.init();
-		expect(again.state().registration.state).not.toBe('failed');
-		const asked = w.relays.subscriptions.slice(before).filter((x) => x.filter['#e']);
-		expect(asked.length).toBeGreaterThan(0);
-		expect(new Set(asked.map((x) => x.url))).toEqual(new Set([k.registration!.channel]));
+		// Relays keep nothing: no subscription for the ack; the entries show the registration.
+		expect(w.relays.subscriptions.slice(before).filter((x) => x.filter['#e'])).toHaveLength(0);
+		expect(again.state().registration.state).toBe('verified');
+		expect(again.state().key?.position).toBe(0);
 	});
 });
