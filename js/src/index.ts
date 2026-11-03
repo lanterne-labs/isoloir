@@ -18,8 +18,10 @@ export type {
 	PostRecord,
 	DeltaRecord,
 	KeySource,
-	KindsMode
+	KindsMode,
+	SavedComplaint
 } from './session.js';
+export { encodeComplaint, decodeComplaint, readComplaint, judgeComplaint, type ComplaintVerdict, type ComplaintVerdictCode, type JudgeComplaintOptions } from './complaint.js';
 export { Core, loadWasm, messageOf, toHex, type IsoloirWasm, type Kinds, type KindSet, type TreePath, type DeltaChain, type WordsCheck } from './wasm.js';
 export { Mirror, covered, dirSource, jsDelivrSource, withTimeout, SHARD, type MirrorSource, type Fetcher, type FetchResponse } from './mirror.js';
 export { WebSocketTransport, type RelayTransport, type Filter, type SubscribeOptions, type SocketFactory, type SocketLike } from './relay.js';

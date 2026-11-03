@@ -212,7 +212,7 @@ export interface AuditWasm {
 }
 
 /** An entries file with every body as its text (a mirror may write a body as JSON). */
-function normalizeEntries(text: string): string {
+export function normalizeEntries(text: string): string {
 	const list = JSON.parse(text) as { seq: number; kind: string; body: unknown }[];
 	if (!Array.isArray(list)) throw new Error('entries: not an array');
 	if (list.every((e) => typeof e.body === 'string')) return text;

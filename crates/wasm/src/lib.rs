@@ -86,6 +86,33 @@ mod bind {
         with_run(id, |run| run.finish())
     }
 
+    /// A pass that only builds the state (no request for the logged proofs).
+    #[wasm_bindgen]
+    pub fn audit_quiet(id: u32, on: bool) -> Result<(), JsError> {
+        with_run(id, |run| {
+            run.quiet(on);
+            Ok(())
+        })
+    }
+
+    /// More verdicts for a pass (the answers to a rejudge's requests).
+    #[wasm_bindgen]
+    pub fn audit_answer(id: u32, verdicts_json: &str) -> Result<(), JsError> {
+        with_run(id, |run| run.answer(verdicts_json))
+    }
+
+    /// Judges a message again against the state fed so far (a complaint of a refusal).
+    #[wasm_bindgen]
+    pub fn audit_rejudge(id: u32, kind: &str, body: &str, times_json: &str, pending_json: &str) -> Out {
+        with_run(id, |run| run.rejudge(kind, body, times_json, pending_json))
+    }
+
+    /// Reads a complaint, its event or its body (SPEC §11.3).
+    #[wasm_bindgen]
+    pub fn read_complaint(text: &str, ingest_keys_json: &str) -> Out {
+        js(api::read_complaint(text, ingest_keys_json))
+    }
+
     /// Forgets a pass.
     #[wasm_bindgen]
     pub fn audit_drop(id: u32) {

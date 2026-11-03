@@ -4,7 +4,7 @@
 // given to the session by the app (loadWasm in a browser, the nodejs
 // build in tests), so this package never guesses how wasm is served.
 
-import type { Ack, Checkpoint, Choice, Draft, KindInfo, NostrEvent, PollSetup, TallyVerdict, Results } from './types.js';
+import type { Ack, Checkpoint, ComplaintClaim, Choice, Draft, KindInfo, NostrEvent, PollSetup, TallyVerdict, Results } from './types.js';
 
 export interface IsoloirWasm {
 	protocol(): string;
@@ -54,6 +54,10 @@ export interface IsoloirWasm {
 	audit_checkpoint(id: number, note: string, entries_json: string): string;
 	audit_finish(id: number): string;
 	audit_drop(id: number): void;
+	audit_quiet(id: number, on: boolean): void;
+	audit_answer(id: number, verdicts_json: string): void;
+	audit_rejudge(id: number, kind: string, body: string, times_json: string, pending_json: string): string;
+	read_complaint(text: string, ingest_keys_json: string): string;
 	pow_mine(origin: string, pubkey: string, t: number, bits: number, start: number, count: number): string;
 	pow_check(origin: string, pubkey: string, t: number, nonce: string, bits: number): boolean;
 }
@@ -236,6 +240,10 @@ export class Core {
 	}
 	linkOpen(receiverSecret: string, sealed: string): { payload: string; code: string } {
 		return JSON.parse(this.w.link_open(receiverSecret, sealed)) as { payload: string; code: string };
+	}
+	/** Reads a complaint, its signed event or its body (SPEC §11.3); throws when its form does not hold. */
+	readComplaint(text: string, ingestKeys: string[] = []): ComplaintClaim {
+		return JSON.parse(this.w.read_complaint(text, json(ingestKeys))) as ComplaintClaim;
 	}
 	/** The first nonce in start … start + count − 1 that does the work, or null (SPEC §11.1). */
 	powMine(origin: string, pubkey: string, t: number, bits: number, start: number, count: number): string | null {

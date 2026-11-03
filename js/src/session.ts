@@ -40,6 +40,7 @@ import { createPrf, assertPrf, prfInput, type PasskeyOptions } from './passkey.j
 import type { Prover } from './prover.js';
 import { CHANNEL_ORDER, defaultChannelFactory, findAck, postWithAck, type Acked, type ChannelFactory, type IngestChannel, type PostProgress } from './channel.js';
 import { WorkPool, powTags, type MineOptions } from './pow.js';
+import { encodeComplaint } from './complaint.js';
 import { defaultStore, readJSON, writeJSON, type KeyValueStore, type StorageMode } from './storage.js';
 import type {
 	Channel,
@@ -147,7 +148,31 @@ export interface PostRecord {
 	foundIn?: number;
 	/** Found under a later checkpoint than the ack named. */
 	late?: boolean;
+	/** The ids of the complaints made of this message. */
 	complaints?: string[];
+	/** The complaints' signed events, whole (channels keep no copy: the device does). */
+	complaintEvents?: NostrEvent[];
+}
+
+/**
+ * A complaint the device made (SPEC §11.3), kept with the key across
+ * re-votes: the whole signed event, which proves the claim to anyone with
+ * the mirror (judgeComplaint), and its base64url for a link fragment
+ * (`#c=<link>`) or a file.
+ */
+export interface SavedComplaint {
+	what: 'registration' | 'ballot';
+	/** The poll of a ballot's complaint. */
+	poll?: number;
+	/** dropped: an accepted body missing from its checkpoint; wrong_refusal: a refused body the voter holds valid. */
+	claim: 'dropped' | 'wrong_refusal';
+	/** The checkpoint the ack named (dropped). */
+	checkpoint: number | null;
+	/** When it was made, ms (local clock). */
+	at: number;
+	event: NostrEvent;
+	/** encodeComplaint(event). */
+	link: string;
 }
 
 export interface RegistrationRecord extends PostRecord {
@@ -201,6 +226,8 @@ export interface StoredKey {
 	regSecret?: string;
 	registration?: RegistrationRecord;
 	polls: Record<string, PollRecord>;
+	/** Every complaint this device made, oldest first (at most 32 kept). */
+	complaints?: Omit<SavedComplaint, 'link'>[];
 }
 
 interface ScanRecord {
@@ -242,6 +269,9 @@ export interface RegistrationView {
 	detail?: string;
 	/** The proof is too old to post: scan again (the same registration key). */
 	stale?: boolean;
+	/** The ids of the complaints made of the registration, and their signed events. */
+	complaints?: string[];
+	complaintEvents?: NostrEvent[];
 }
 
 export interface BallotView {
@@ -253,7 +283,9 @@ export interface BallotView {
 	reason?: string;
 	detail?: string;
 	late?: boolean;
+	/** The ids of the complaints made of this ballot, and their signed events (SessionState.complaints keeps every one). */
 	complaints?: string[];
+	complaintEvents?: NostrEvent[];
 	/** A proven ballot waits for an ack: resendBallot() posts it again. */
 	kept?: boolean;
 }
@@ -303,13 +335,15 @@ export interface SessionState {
 	linkAvailable: boolean;
 	/** How the key is kept by the browser. */
 	storage: StorageMode;
+	/** Every complaint this device made, oldest first, with its event and link. */
+	complaints: SavedComplaint[];
 }
 
 export interface SessionEvents {
 	state: SessionState;
 	checkpoint: Checkpoint;
 	receipt: { what: 'registration' | 'ballot'; checkpoint: number; logSeq: number; late: boolean };
-	complaint: { what: 'registration' | 'ballot'; checkpoint: number | null; events: string[] };
+	complaint: { what: 'registration' | 'ballot'; checkpoint: number | null; events: string[]; complaint: SavedComplaint };
 	'link-offer': { code: string };
 	tally: TallyVerdict;
 }
@@ -336,6 +370,7 @@ const LINK_TIMEOUT = 15 * 60_000;
 const LATE_SEARCH = 16;
 const WINDOW_MAX = 64;
 const ENVELOPES_KEPT = 8;
+const COMPLAINTS_KEPT = 32;
 /** How many times a ballot's seq is raised after stale_seq refusals (steps 1, 2, 4, 8, then 16: about 150 ballots found again). */
 const STALE_RAISES = 12;
 /** The ingest's seq gap (SPEC §7.4): a seq at most this far above the last. */
@@ -441,7 +476,8 @@ export class Session {
 			pow: { bits: this.powBits(), state: this.powBits() > 0 ? this.workState : 'none' },
 			revoteGap: this.ledger?.body.revote_gap ?? 0,
 			linkAvailable: this.relays().length > 0,
-			storage: this.storageMode
+			storage: this.storageMode,
+			complaints: (k?.complaints ?? []).map((c) => ({ ...c, link: encodeComplaint(c.event) }))
 		};
 	}
 
@@ -1350,7 +1386,7 @@ export class Session {
 		if (k.position >= 0) this.registration = { state: 'verified', checkpoint: r?.ack?.checkpoint ?? null };
 		else if (!r) this.registration = this.scanReady() ? { state: 'scanned' } : { state: 'none' };
 		else if (r.state === 'kept' || r.state === 'sent') this.registration = { state: 'failed', reason: 'no_ack', stale: !this.proofFresh(r.proofDate) };
-		else this.registration = { state: r.state, checkpoint: r.ack?.checkpoint ?? null, reason: r.reason };
+		else this.registration = { state: r.state, checkpoint: r.ack?.checkpoint ?? null, reason: r.reason, complaints: r.complaints, complaintEvents: r.complaintEvents };
 		const b = this.pollRecord()?.ballot;
 		if (!b) this.ballot = { state: 'idle' };
 		else if (b.state === 'kept' || b.state === 'sent') this.ballot = { state: 'failed', choice: b.choice, reason: 'no_ack', kept: true, hash: b.hash };
@@ -1358,7 +1394,7 @@ export class Session {
 	}
 
 	private ballotView(b: BallotRecord): BallotView {
-		return { state: b.state === 'kept' ? 'failed' : b.state, choice: b.choice, checkpoint: b.ack?.checkpoint ?? null, hash: b.hash, reason: b.reason, late: b.late, complaints: b.complaints };
+		return { state: b.state === 'kept' ? 'failed' : b.state, choice: b.choice, checkpoint: b.ack?.checkpoint ?? null, hash: b.hash, reason: b.reason, late: b.late, complaints: b.complaints, complaintEvents: b.complaintEvents };
 	}
 
 	private start() {
@@ -1823,27 +1859,61 @@ export class Session {
 	 */
 	private async complain(what: 'registration' | 'ballot', k: StoredKey, r: PostRecord) {
 		if (!r.ack) return;
-		const content = this.core.complaintBody(r.ack.event, r.body);
+		r.state = 'missing';
+		const saved = await this.postComplaint(what, k, r, 'dropped');
+		if (what === 'ballot') this.ballot = this.ballotView(r as BallotRecord);
+		else this.registration = { state: 'missing', checkpoint: r.ack.checkpoint, complaints: r.complaints, complaintEvents: r.complaintEvents };
+		this.log('warn', 'acked and missing from its checkpoint: complaint posted', { what, checkpoint: r.ack.checkpoint });
+		this.events.emit('complaint', { what, checkpoint: r.ack.checkpoint, events: [saved.event.id], complaint: saved });
+		this.emit();
+	}
+
+	/**
+	 * Makes, keeps and posts a complaint of a message: the signed ack and
+	 * the body. It goes to every active relay (and, for a dropped body,
+	 * the message itself again), or to the direct endpoints on a ledger
+	 * without relays; channels keep no copy, so the device keeps the whole
+	 * event with the record and in the key's list of complaints.
+	 */
+	private async postComplaint(what: 'registration' | 'ballot', k: StoredKey, r: PostRecord, claim: SavedComplaint['claim']): Promise<SavedComplaint> {
+		const ack = r.ack!;
+		const content = this.core.complaintBody(ack.event, r.body);
 		const event = await this.envelope('complaint', content);
-		const ids: string[] = [];
 		const relays = this.relays();
 		for (const ch of relays.length > 0 ? relays : this.channels) {
 			try {
 				await ch.publish(event);
-				ids.push(`${ch.url} ${event.id}`);
-				if (ch.type === 'nostr') await ch.publish(await this.envelope(what === 'ballot' ? 'ballot' : 'register', r.body)).catch(() => undefined);
+				if (claim === 'dropped' && ch.type === 'nostr') await ch.publish(await this.envelope(what === 'ballot' ? 'ballot' : 'register', r.body)).catch(() => undefined);
 			} catch (e) {
 				this.log('warn', 'complaint not posted', { channel: ch.url, detail: messageOf(e) });
 			}
 		}
-		r.state = 'missing';
 		r.complaints = [...(r.complaints ?? []), event.id];
+		r.complaintEvents = [...(r.complaintEvents ?? []), event];
+		const kept: Omit<SavedComplaint, 'link'> = { what, claim, checkpoint: claim === 'dropped' ? (ack.checkpoint ?? null) : null, at: this.local(), event };
+		if (what === 'ballot' && this.config.poll !== undefined) kept.poll = this.config.poll;
+		k.complaints = [...(k.complaints ?? []), kept].slice(-COMPLAINTS_KEPT);
 		this.saveKey(k);
+		return { ...kept, link: encodeComplaint(event) };
+	}
+
+	/**
+	 * A complaint of a refusal the voter holds wrong (SPEC §11.3): the
+	 * signed rejected ack of the registration or of the poll's last ballot,
+	 * with its body, kept on the device and posted. Anyone judges it again
+	 * against the log (judgeComplaint). Throws not_ready when that message
+	 * was not refused.
+	 */
+	async complainOfRefusal(what: 'registration' | 'ballot'): Promise<SavedComplaint> {
+		const k = this.requireKey();
+		const r = what === 'registration' ? k.registration : this.pollRecord(k).ballot;
+		if (!r || r.state !== 'rejected' || !r.ack) throw new IsoloirError('not_ready', `no refused ${what}`);
+		const saved = await this.postComplaint(what, k, r, 'wrong_refusal');
 		if (what === 'ballot') this.ballot = this.ballotView(r as BallotRecord);
-		else this.registration = { state: 'missing', checkpoint: r.ack.checkpoint };
-		this.log('warn', 'acked and missing from its checkpoint: complaint posted', { what, checkpoint: r.ack.checkpoint, channels: ids.length });
-		this.events.emit('complaint', { what, checkpoint: r.ack.checkpoint, events: [event.id] });
+		else this.registration = { ...this.registration, complaints: r.complaints, complaintEvents: r.complaintEvents };
+		this.events.emit('complaint', { what, checkpoint: null, events: [saved.event.id], complaint: saved });
 		this.emit();
+		return saved;
 	}
 
 	// --------------------------------------------------- restore flow
