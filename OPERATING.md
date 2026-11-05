@@ -81,6 +81,15 @@ by default. At start it replays the log, brings the mirror up to date,
 and reads the relays from its saved cursors. It checkpoints when the
 log grew, and at least every 10 minutes.
 
+A database behind its mirror (lost, or restored from an older backup)
+gets its log back from the mirror at start: every checkpoint the
+database lacks is read from the mirror's files, its note checked against
+the log key and its entries replayed until the state gives that very
+note, then written to the database; the relays are read again from a
+heartbeat before the last checkpoint. No checkpoint is signed twice.
+What only the database held stays lost: the bodies of refused messages,
+and the submissions not yet logged (submit them again).
+
 ## 5. The authority
 
 ```sh
