@@ -338,6 +338,15 @@ async fn main() -> Result<()> {
             }
             let store = Store::connect(&db).await?;
             let _lease = store.lease_wait(Duration::from_secs(600)).await?;
+            let mirror = Mirror::new(mirror_dir.clone(), mirror_git.or_else(|| std::env::var("ISOLOIR_MIRROR_GIT").ok()));
+            mirror.prepare()?;
+            // A database behind its mirror (lost, or restored from an older
+            // backup) gets back the checkpoints the mirror holds.
+            if mirror.last_index() > store.checkpoints().await?.len() as u64 {
+                let origin = isoloir_server::restore::origin(&mirror)?;
+                let verifier = note::Signer::new(&origin, &parse_log_key(&log_seed, Some(&origin))?).verifier();
+                isoloir_server::restore::restore(&store, &mirror, &verifier, now()).await?;
+            }
             let entries = store.entries().await?;
             // The channels of the ledger's current version.
             let Some((_, _, last_ledger, _)) = entries.iter().filter(|e| e.1 == EntryKind::Ledger).last() else { bail!("no ledger: run isoloir genesis first") };
@@ -351,8 +360,6 @@ async fn main() -> Result<()> {
             }
             let transport = Arc::new(Channels { pool: pool.clone(), direct: hubs.clone() });
             let bb = Tools::find_bb()?;
-            let mirror = Mirror::new(mirror_dir.clone(), mirror_git.or_else(|| std::env::var("ISOLOIR_MIRROR_GIT").ok()));
-            mirror.prepare()?;
             let config = Config { log_seed: parse_log_key(&log_seed, Some(&l.origin))?, nostr_sk: seed(&nostr_key, "nostr key")? };
             let mut ing = Ingest::load(
                 store.clone(),
