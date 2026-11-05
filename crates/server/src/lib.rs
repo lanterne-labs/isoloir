@@ -8,6 +8,7 @@ pub mod ingest;
 pub mod mirror;
 pub mod packed;
 pub mod relays;
+pub mod restore;
 pub mod source;
 pub mod store;
 pub mod authority;
