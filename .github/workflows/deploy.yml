@@ -1,4 +1,4 @@
-# Deploys main to the Railway services `ingest` (the ledger) and `tally`
+# Deploys main to the Railway services `mirror-ingest` (the ledger) and `mirror-authority`
 # (the authority: the same image, its start command set on the service) on every push,
 # with a project token (RAILWAY_TOKEN, production environment).
 name: deploy
@@ -20,11 +20,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: npm install -g @railway/cli@5.70.0
-      - name: railway up ingest
+      - name: railway up mirror-ingest
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-        run: railway up --service ingest --ci
-      - name: railway up tally
+        run: railway up --service mirror-ingest --ci
+      - name: railway up mirror-authority
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-        run: railway up --service tally --ci
+        run: railway up --service mirror-authority --ci
