@@ -742,6 +742,8 @@ commit:
 checkpoint.txt                       the latest note
 checkpoints/<index>.txt              every note
 entries/<index>.json                 [{seq, kind, body}] of a checkpoint
+windows/<k>.json                     {from, to, checkpoints: [{index, note, entries}]}:
+                                     the notes and entries of checkpoints from..=to
 stamps/<index>.ots                   the OpenTimestamps proof
 setup/ledger.json, registries/<id>.json, polls/<id>.json
                                      {"setups":[<proven entry>…]}, every version
@@ -755,7 +757,23 @@ polls/<id>/tallies/latest.json, polls/<id>/tallies/<seq>.json
 
 The mirror grows with the entries; the other files are few, or
 rewritten in place (the newest leaves block, the setups, the latest
-tally, the stamps as they are upgraded). Mirrors of earlier versions
+tally, the stamps as they are upgraded, the open window).
+
+**Windows.** A checkpoint is taken at least every 10 minutes (§4), so a
+log holds tens of thousands of them a year, most empty. A reader of the
+whole log (the audit, the authority) reads the windows: `windows/<k>.json`
+holds, in order, the checkpoints `from..=to` with their notes and their
+entries exactly as `checkpoints/<index>.txt` and `entries/<index>.json`
+hold them. Windows are numbered from 0 and contiguous; each checkpoint
+joins the open window, which closes at 256 checkpoints or once its file
+passes 1 MiB, whichever comes first, so a quiet year reads in about a
+hundred fetches and a busy day never makes a file too large to fetch.
+A window never holds a checkpoint the files do not hold. A reader takes
+window 0, 1, … while they exist; the checkpoints before the first window,
+between two windows and after the last one (a mirror written before this
+version, a window not yet written) it reads from their own files. Every
+note in a window is verified as the file's would be: the window only
+saves round trips, it vouches for nothing. Mirrors of earlier versions
 also hold `registries/<id>/positions/` and `polls/<id>/pseudonyms/`,
 no longer written: a device finds its tree position in the entries of
 the checkpoint its registration's ack names (the registry's tree size
@@ -824,7 +842,7 @@ refused message is proven by its voter's receipt.
 | Ingest | yes | no, but it chooses what each checkpoint holds (§10.1) | as public | as public |
 | Authority (elgamal) | yes | no | could decrypt any ballot of any poll under its key | as public |
 | Relay (nostr, iroh) | yes | address and time of the post (an iroh relay: the address only); under tlock, the content at the round | as public | as public |
-| Mirror host | no | the address that asks for a checkpoint's entries or a shard (browsers fetch windows, not one checkpoint) | as public | as public |
+| Mirror host | no | the address that asks for a window, a checkpoint's entries or a shard | as public | as public |
 | Network observer | no | address ↔ relay ↔ time; defeated only by Tor or a VPN, which the app may recommend | as public | as public |
 | Passkey provider | learns a passkey for the site exists; a compelled account yields `s` | | | |
 | Whoever holds `s` or the words | | every ballot of the voter | delta: every choice (the chain is recoverable); tlock: the ballot | all |

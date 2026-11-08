@@ -140,25 +140,60 @@ export async function audit(wasm: IsoloirWasm & AuditWasm, opts: AuditOptions): 
 		if (!draining) draining = drain().finally(() => (draining = null));
 	};
 
-	const pass = async (onCheckpoint: (out: CheckpointOut) => void): Promise<number> => {
+	// Checkpoint `i` from its own files; null past the checkpoint the
+	// note's commit covers, where the files may not be pushed yet.
+	const one = async (i: number): Promise<ReadCheckpoint | null> => {
+		const [note, entries] = await Promise.all([opts.text(`checkpoints/${i}.txt`), opts.text(`entries/${i}.json`)]);
+		if (note === null || entries === null) {
+			if (i > coveredTo) return null;
+			throw new Error(note === null ? `checkpoint ${i} is missing on the mirror` : `the entries of checkpoint ${i} are missing on the mirror`);
+		}
+		return { index: i, note, entries: normalizeEntries(entries) };
+	};
+	// The checkpoints 1..last, from the windows first (SPEC §15) and the
+	// checkpoint files for what no window holds. A missing file past
+	// coveredTo ends the read and lowers `last`.
+	async function* read(): AsyncGenerator<ReadCheckpoint> {
+		let next = 1;
+		const files = async function* (from: number, to: number) {
+			for (let i = from; i <= to; i++) {
+				const r = await one(i);
+				if (r === null) {
+					last = i - 1;
+					progress.checkpoints = last;
+					return;
+				}
+				yield r;
+			}
+		};
+		for (let k = 0; next <= last; k++) {
+			const text = await opts.text(`windows/${k}.json`);
+			if (text === null) break;
+			const w = parseWindow(text, k);
+			if (w.to < next) continue;
+			if (w.from > next) {
+				for await (const r of files(next, Math.min(w.from - 1, last))) yield r;
+				if (last < w.from) return;
+			}
+			for (const c of w.checkpoints) if (c.index >= next && c.index <= last) yield c;
+			next = Math.max(next, w.to + 1);
+		}
+		for await (const r of files(next, last)) yield r;
+	}
+	// What the first pass read, kept for the replay up to KEEP_BYTES: the
+	// replay then fetches nothing. Over it, the replay reads again.
+	const kept: ReadCheckpoint[] = [];
+	let keptBytes = 0;
+
+	const pass = async (source: AsyncIterable<ReadCheckpoint> | Iterable<ReadCheckpoint>, onCheckpoint: (r: ReadCheckpoint, out: CheckpointOut) => void): Promise<number> => {
 		const id = wasm.audit_start(opts.logKey, JSON.stringify(verdicts), opts.allowDev === true);
 		try {
-			for (let i = 1; i <= last; i++) {
+			for await (const r of source) {
 				opts.signal?.throwIfAborted();
-				const [note, entries] = await Promise.all([opts.text(`checkpoints/${i}.txt`), opts.text(`entries/${i}.json`)]);
-				if (note === null || entries === null) {
-					// Past the checkpoint the note's commit covers, the files may not be pushed yet.
-					if (i > coveredTo) {
-						last = i - 1;
-						progress.checkpoints = last;
-						break;
-					}
-					throw new Error(note === null ? `checkpoint ${i} is missing on the mirror` : `the entries of checkpoint ${i} are missing on the mirror`);
-				}
-				const out = JSON.parse(wasm.audit_checkpoint(id, note, normalizeEntries(entries))) as CheckpointOut;
-				progress.checkpoint = i;
+				const out = JSON.parse(wasm.audit_checkpoint(id, r.note, r.entries)) as CheckpointOut;
+				progress.checkpoint = r.index;
 				progress.report = out.report;
-				onCheckpoint(out);
+				onCheckpoint(r, out);
 				tell();
 			}
 			return id;
@@ -169,7 +204,11 @@ export async function audit(wasm: IsoloirWasm & AuditWasm, opts: AuditOptions): 
 	};
 
 	// 1. Read the log, collect the proofs and verify them as they come.
-	const first = await pass((out) => ask(out.requests));
+	const first = await pass(read(), (r, out) => {
+		ask(out.requests);
+		keptBytes += r.note.length + r.entries.length;
+		if (keptBytes <= KEEP_BYTES) kept.push(r);
+	});
 	wasm.audit_drop(first);
 	progress.phase = 'proofs';
 	tell();
@@ -179,7 +218,8 @@ export async function audit(wasm: IsoloirWasm & AuditWasm, opts: AuditOptions): 
 	progress.phase = 'replay';
 	progress.checkpoint = 0;
 	tell();
-	const second = await pass((out) => {
+	const again = kept.length === last ? kept : read();
+	const second = await pass(again, (_, out) => {
 		// A proof first asked now (it should not happen): verified later, reported meanwhile.
 		if (out.requests.length) ask(out.requests);
 	});
@@ -194,6 +234,28 @@ export async function audit(wasm: IsoloirWasm & AuditWasm, opts: AuditOptions): 
 	} finally {
 		wasm.audit_drop(second);
 	}
+}
+
+/** A checkpoint as read: its note and its entries file's text, every body as text. */
+interface ReadCheckpoint {
+	index: number;
+	note: string;
+	entries: string;
+}
+
+/** How much of the first pass the audit keeps for the replay. */
+const KEEP_BYTES = 64 << 20;
+
+/** A window file (`windows/<k>.json`, SPEC §15): the checkpoints from..=to with their notes and entries. */
+function parseWindow(text: string, k: number): { from: number; to: number; checkpoints: ReadCheckpoint[] } {
+	const w = JSON.parse(text) as { from: number; to: number; checkpoints: { index: number; note: string; entries: unknown }[] };
+	if (!Number.isInteger(w?.from) || !Number.isInteger(w?.to) || !Array.isArray(w?.checkpoints)) throw new Error(`windows/${k}.json: not a window`);
+	const checkpoints = w.checkpoints.map((c) => {
+		if (!Number.isInteger(c?.index) || typeof c?.note !== 'string') throw new Error(`windows/${k}.json: a checkpoint without index or note`);
+		return { index: c.index, note: c.note, entries: normalizeEntries(JSON.stringify(c.entries)) };
+	});
+	if (checkpoints.length !== w.to - w.from + 1 || checkpoints.some((c, i) => c.index !== w.from + i)) throw new Error(`windows/${k}.json: the checkpoints are not ${w.from}..${w.to}`);
+	return { from: w.from, to: w.to, checkpoints };
 }
 
 interface CheckpointOut {

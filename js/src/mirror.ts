@@ -17,6 +17,8 @@
 // File formats this reader expects (the ingest writes them):
 //   checkpoint.txt, checkpoints/<i>.txt   a signed note
 //   entries/<i>.json                       [{seq, kind, body}], body the logged text (or its JSON)
+//   windows/<k>.json                       {from, to, checkpoints: [{index, note, entries}]}: the
+//                                          notes and entries of checkpoints from..to (the audit reads them)
 //   setup/ledger.json, registries/<id>.json, polls/<id>.json
 //                                          {setups: [{seq, body, checkpoint, size, path}, …]}: every
 //                                          version in order, the last in force

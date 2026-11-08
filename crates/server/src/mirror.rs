@@ -20,6 +20,13 @@ use std::time::Duration;
 /// Leaves per shard.
 pub const SHARD: usize = 1024;
 
+/// Checkpoints per window file (SPEC §15): a window closes at this many
+/// checkpoints, or earlier once its file passes WINDOW_BYTES, so a quiet
+/// year of heartbeats reads in about a hundred fetches and a busy day
+/// never makes a file a browser cannot take.
+pub const WINDOW: usize = 256;
+pub const WINDOW_BYTES: usize = 1 << 20;
+
 /// How often the background task tries again a push that failed.
 pub const PUSH_RETRY: Duration = Duration::from_secs(30);
 
@@ -213,8 +220,9 @@ impl Mirror {
     pub fn write_checkpoint(&self, state: &State, index: u64, from: u64, note: &str) -> anyhow::Result<()> {
         {
             let _g = self.files.lock().unwrap();
-            self.write_data(state, index, from)?;
+            let entries = self.write_data(state, index, from)?;
             write(&self.dir.join(format!("checkpoints/{index}.txt")), note.as_bytes())?;
+            self.append_window(index, note, entries)?;
             write(&self.dir.join("checkpoint.txt"), note.as_bytes())?;
             self.written.store(index, Ordering::SeqCst);
         }
@@ -225,16 +233,17 @@ impl Mirror {
     }
 
     /// The data files of the entries `from..state.next_seq()` of
-    /// checkpoint `index`. The positions and pseudonyms files of earlier
-    /// versions are no longer written (SPEC §15).
-    fn write_data(&self, state: &State, index: u64, from: u64) -> anyhow::Result<()> {
+    /// checkpoint `index`; returns the entries as `entries/<index>.json`
+    /// holds them. The positions and pseudonyms files of earlier versions
+    /// are no longer written (SPEC §15).
+    fn write_data(&self, state: &State, index: u64, from: u64) -> anyhow::Result<Vec<Value>> {
         let entries: Vec<Value> = (from..state.next_seq())
             .map(|seq| {
                 let (k, b) = &state.entries[seq as usize];
                 json!({"seq": seq, "kind": k.as_str(), "body": String::from_utf8_lossy(b)})
             })
             .collect();
-        write_json(&self.dir.join(format!("entries/{index}.json")), &Value::Array(entries))?;
+        write_json(&self.dir.join(format!("entries/{index}.json")), &Value::Array(entries.clone()))?;
         let mut leaves_touched: BTreeSet<(u32, usize)> = BTreeSet::new();
         let mut ballot_shards: BTreeSet<(u32, usize)> = BTreeSet::new();
         for seq in from..state.next_seq() {
@@ -272,7 +281,68 @@ impl Mirror {
             let leaves: Vec<String> = (k * SHARD..((k + 1) * SHARD).min(t.len())).map(|i| field::to_hex(&t.leaf(i).unwrap())).collect();
             write_json(&self.dir.join(format!("polls/{poll}/ballots/{k}.json")), &json!(leaves))?;
         }
-        Ok(())
+        Ok(entries)
+    }
+
+    /// The newest window file (its number and its content), if any.
+    fn last_window(&self) -> Option<(u64, Value)> {
+        let k = std::fs::read_dir(self.dir.join("windows"))
+            .ok()?
+            .filter_map(|e| e.ok()?.file_name().to_str()?.strip_suffix(".json")?.parse::<u64>().ok())
+            .max()?;
+        Some((k, read_json(&self.dir.join(format!("windows/{k}.json")))))
+    }
+
+    /// Adds checkpoint `index` (its note and its entries) to the open
+    /// window, or opens the next one when the last is closed (WINDOW
+    /// checkpoints, or WINDOW_BYTES) or does not end at `index - 1`: a
+    /// window is contiguous, and a reader that finds a gap before one
+    /// reads the checkpoint files of the gap (SPEC §15).
+    fn append_window(&self, index: u64, note: &str, entries: Vec<Value>) -> anyhow::Result<()> {
+        let (k, mut w) = match self.last_window() {
+            Some((k, w)) => {
+                let to = w["to"].as_u64().unwrap_or(0);
+                let n = w["checkpoints"].as_array().map_or(0, |a| a.len());
+                let bytes = std::fs::metadata(self.dir.join(format!("windows/{k}.json"))).map_or(0, |m| m.len() as usize);
+                if to == index - 1 && n < WINDOW && bytes < WINDOW_BYTES {
+                    (k, w)
+                } else if to >= index {
+                    // Written already (a boot that backfills what is there).
+                    return Ok(());
+                } else {
+                    (k + 1, json!({"from": index, "to": index, "checkpoints": []}))
+                }
+            }
+            None => (0, json!({"from": index, "to": index, "checkpoints": []})),
+        };
+        w["to"] = json!(index);
+        w["checkpoints"].as_array_mut().expect("checkpoints").push(json!({"index": index, "note": note, "entries": entries}));
+        write_json(&self.dir.join(format!("windows/{k}.json")), &w)
+    }
+
+    /// Writes the windows of the checkpoints the mirror holds that no
+    /// window holds yet (a mirror written before the windows, at boot):
+    /// `notes` are every checkpoint's note, `entries` the log's entries
+    /// with the checkpoint each was logged in.
+    pub fn backfill_windows(&self, notes: &[(u64, String)], entries: &[(u64, EntryKind, Vec<u8>, u64)]) -> anyhow::Result<u64> {
+        let _g = self.files.lock().unwrap();
+        let from = self.last_window().and_then(|(_, w)| w["to"].as_u64()).map_or(1, |to| to + 1);
+        let mut n = 0;
+        for (index, note) in notes.iter().filter(|(i, _)| *i >= from) {
+            let es: Vec<Value> = entries
+                .iter()
+                .filter(|e| e.3 == *index)
+                .map(|(seq, k, b, _)| json!({"seq": seq, "kind": k.as_str(), "body": String::from_utf8_lossy(b)}))
+                .collect();
+            self.append_window(*index, note, es)?;
+            n += 1;
+        }
+        if n > 0 {
+            if let Some(w) = self.wake.lock().unwrap().as_ref() {
+                let _ = w.send(());
+            }
+        }
+        Ok(n)
     }
 
     fn append_setup(&self, path: &Path, entry: Value) -> anyhow::Result<()> {
@@ -355,6 +425,27 @@ fn proven(state: &State, seq: u64, index: u64) -> Value {
     let size = state.next_seq();
     let path: Vec<String> = state.log.inclusion(seq as usize, size as usize).iter().map(hex::encode).collect();
     json!({"seq": seq, "kind": k.as_str(), "body": String::from_utf8_lossy(b), "checkpoint": index, "size": size, "path": path})
+}
+
+/// A window file (`windows/<k>.json`): the checkpoints `from..=to`, each
+/// with its note and its entries as `entries/<index>.json` holds them.
+pub fn parse_window(v: &Value) -> anyhow::Result<(u64, u64, Vec<(u64, String, Vec<(u64, EntryKind, Vec<u8>)>)>)> {
+    let from = v["from"].as_u64().ok_or_else(|| anyhow::anyhow!("window: no from"))?;
+    let to = v["to"].as_u64().ok_or_else(|| anyhow::anyhow!("window: no to"))?;
+    let cps = v["checkpoints"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("window: no checkpoints"))?
+        .iter()
+        .map(|c| {
+            let index = c["index"].as_u64().ok_or_else(|| anyhow::anyhow!("window: a checkpoint without index"))?;
+            let note = c["note"].as_str().ok_or_else(|| anyhow::anyhow!("window: checkpoint {index} without note"))?.to_string();
+            Ok((index, note, parse_entries(&c["entries"])?))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if cps.first().is_some_and(|c| c.0 != from) || cps.last().is_some_and(|c| c.0 != to) || cps.windows(2).any(|p| p[1].0 != p[0].0 + 1) {
+        anyhow::bail!("window: the checkpoints are not {from}..={to}");
+    }
+    Ok((from, to, cps))
 }
 
 /// Reads a checkpoint's entries from a mirror's `entries/<index>.json`.
@@ -505,6 +596,45 @@ mod tests {
         assert!(m.token().unwrap().ends_with(":1"));
         assert!(!m.dir.join(".git/MERGE_HEAD").exists());
         assert_eq!(std::fs::read_to_string(m.dir.join("checkpoint.txt")).unwrap(), "index 2\n");
+    }
+
+    // Every checkpoint joins the open window; a window closes at WINDOW
+    // checkpoints; a boot backfills the checkpoints no window holds, and a
+    // gap before a window is left to the checkpoint files.
+    #[test]
+    fn windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = Mirror::new(tmp.path().join("m"), None);
+        m.prepare().unwrap();
+        for i in 1..=(WINDOW as u64 + 2) {
+            checkpoint(&m, i).unwrap();
+        }
+        let (from, to, cps) = parse_window(&read_json(&m.dir.join("windows/0.json"))).unwrap();
+        assert_eq!((from, to, cps.len()), (1, WINDOW as u64, WINDOW));
+        assert_eq!(cps[3].1, "index 4\n");
+        let (from, to, cps) = parse_window(&read_json(&m.dir.join("windows/1.json"))).unwrap();
+        assert_eq!((from, to, cps.len()), (WINDOW as u64 + 1, WINDOW as u64 + 2, 2));
+        assert!(!m.dir.join("windows/2.json").exists());
+
+        // A mirror written before the windows: the boot fills them, once.
+        let old = Mirror::new(tmp.path().join("old"), None);
+        old.prepare().unwrap();
+        for i in 1..=3u64 {
+            write(&old.dir.join(format!("checkpoints/{i}.txt")), format!("index {i}\n").as_bytes()).unwrap();
+        }
+        let notes: Vec<(u64, String)> = (1..=3).map(|i| (i, format!("index {i}\n"))).collect();
+        let entries = vec![(0u64, EntryKind::Ledger, b"{}".to_vec(), 2u64)];
+        assert_eq!(old.backfill_windows(&notes, &entries).unwrap(), 3);
+        assert_eq!(old.backfill_windows(&notes, &entries).unwrap(), 0);
+        let (from, to, cps) = parse_window(&read_json(&old.dir.join("windows/0.json"))).unwrap();
+        assert_eq!((from, to), (1, 3));
+        assert_eq!(cps[1].2, vec![(0, EntryKind::Ledger, b"{}".to_vec())]);
+        assert!(cps[0].2.is_empty());
+
+        // A checkpoint that does not follow the window's end opens a new one.
+        checkpoint(&old, 6).unwrap();
+        let (from, to, _) = parse_window(&read_json(&old.dir.join("windows/1.json"))).unwrap();
+        assert_eq!((from, to), (6, 6));
     }
 
     // The background task pushes after a checkpoint without being asked.
