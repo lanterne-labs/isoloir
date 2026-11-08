@@ -36,12 +36,17 @@ export class ServerClock {
 	/**
 	 * A checkpoint is read after it was signed, never before: its time minus
 	 * the local time is a lower bound of the offset (it corrects a clock
-	 * that is behind). One that arrived live on a relay is the offset.
+	 * that is behind). One that arrived on a relay was signed moments ago,
+	 * or minutes ago when the relay kept it and hands it to a new
+	 * subscription: the freshest one seen is the offset, so the largest is
+	 * kept. (Taking the last one let a stale checkpoint set the clock back
+	 * minutes: envelopes then looked old, and relays dropped them as expired
+	 * ephemeral events.)
 	 */
 	note(unixSeconds: number, isLive = false): void {
 		const o = unixSeconds * 1000 - this.local();
 		this.bound = this.bound === null ? o : Math.max(this.bound, o);
-		if (isLive) this.live = o;
+		if (isLive) this.live = this.live === null ? o : Math.max(this.live, o);
 	}
 
 	/** The server's now, in milliseconds. */
