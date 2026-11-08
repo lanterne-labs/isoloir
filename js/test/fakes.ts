@@ -48,7 +48,7 @@ export class FakeMirror {
 	}
 
 	fetch: Fetcher = async (url, init) => {
-		const path = url.slice(MIRROR.length + 1);
+		const path = url.slice(MIRROR.length + 1).replace(/\?.*$/, '');
 		this.reads.push(path);
 		if (this.hang.has(path)) {
 			return new Promise((_, reject) => init?.signal?.addEventListener('abort', () => reject(new Error('aborted'))));

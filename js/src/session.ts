@@ -367,6 +367,10 @@ export interface LinkSender {
 }
 
 const LINK_TIMEOUT = 15 * 60_000;
+// After an ack the log is about to show the message: the mirror is read
+// every HURRY_EVERY_MS for up to HURRY_MS, instead of at the regular pace.
+const HURRY_MS = 3 * 60_000;
+const HURRY_EVERY_MS = 5_000;
 const LATE_SEARCH = 16;
 const WINDOW_MAX = 64;
 const ENVELOPES_KEPT = 8;
@@ -415,6 +419,8 @@ export class Session {
 	private dupRetried = false;
 	private timer: ReturnType<typeof setInterval> | null = null;
 	private stopWatch: (() => void) | null = null;
+	private hurryTimer: ReturnType<typeof setInterval> | null = null;
+	private hurryUntil = 0;
 	private refreshing: Promise<void> | null = null;
 	private queued: Promise<void> | null = null;
 
@@ -567,6 +573,8 @@ export class Session {
 	destroy(): void {
 		if (this.timer) clearInterval(this.timer);
 		this.timer = null;
+		if (this.hurryTimer) clearInterval(this.hurryTimer);
+		this.hurryTimer = null;
 		this.stopWatch?.();
 		this.stopWatch = null;
 	}
@@ -1369,6 +1377,27 @@ export class Session {
 		return true;
 	}
 
+	/**
+	 * An ack says the log is about to show the message. Rather than wait for
+	 * the regular refresh (30 s) and for the mirror's caches, the mirror is
+	 * read every few seconds, past every cache (Mirror reads the head files
+	 * fresh), until the message is found or HURRY_MS passed.
+	 */
+	private hurry() {
+		this.hurryUntil = this.clock.now() + HURRY_MS;
+		if (this.hurryTimer) return;
+		this.hurryTimer = setInterval(() => {
+			const k = this.key();
+			const waiting = !!k && (this.waiting(k.registration, k, 'registration') || this.waiting(this.pollRecord(k).ballot, k, 'ballot'));
+			if (!waiting || this.clock.now() > this.hurryUntil) {
+				if (this.hurryTimer) clearInterval(this.hurryTimer);
+				this.hurryTimer = null;
+				return;
+			}
+			void this.refresh();
+		}, HURRY_EVERY_MS);
+	}
+
 	private async refreshCheckpoint(): Promise<void> {
 		const cp = await this.mirror.latest();
 		if (cp) this.takeCheckpoint(cp, false);
@@ -1503,7 +1532,10 @@ export class Session {
 		rec.channel = res.channel;
 		rec.event = res.envelope;
 		rec.ack = { event: res.ackEvent, checkpoint: res.ack.checkpoint ?? null };
-		if (res.ack.outcome === 'accepted') rec.state = 'acked';
+		if (res.ack.outcome === 'accepted') {
+			rec.state = 'acked';
+			this.hurry();
+		}
 		else if (resend && (res.ack.reason === 'uid_used' || res.ack.reason === 'id_used')) {
 			// A registration of this key the ingest took before (an earlier
 			// body): the entries say where the leaf is.
@@ -1688,6 +1720,7 @@ export class Session {
 		if (bb.i !== undefined) r.delta = { next: bb.i + 1, previous: { choice: bb.choice, leaf: bb.leaf } };
 		this.saveKey(kk);
 		this.ballot = this.ballotView(bb);
+		this.hurry();
 		this.emit();
 	}
 

@@ -73,6 +73,11 @@ export interface MirrorSource {
 	byCommit: boolean;
 }
 
+/** A URL with a query no cache has seen, for a file that changes. */
+export function fresh(url: string): string {
+	return `${url}${url.includes('?') ? '&' : '?'}r=${Date.now().toString(36)}`;
+}
+
 /** A directory of the latest files (a static host). */
 export function dirSource(base: string): MirrorSource {
 	const b = base.replace(/\/$/, '');
@@ -118,7 +123,13 @@ export class Mirror {
 		for (const a of this.attempts(token)) {
 			try {
 				const got = await withTimeout(this.timeoutMs, async (signal) => {
-					const res = await this.fetcher(a.source.url(path, a.token), { credentials: 'omit', cache: a.token ? 'force-cache' : 'no-cache', signal });
+					// A file read at a commit never changes: the browser may keep it. The
+					// head files change at every checkpoint and a CDN in front of the
+					// mirror keeps them for minutes (GitHub Pages: 10 min), which is what
+					// a voter waits for after an ack. A query no cache has seen reaches the
+					// origin, with the browser's own cache bypassed too.
+					const url = a.token ? a.source.url(path, a.token) : fresh(a.source.url(path, a.token));
+					const res = await this.fetcher(url, { credentials: 'omit', cache: a.token ? 'force-cache' : 'no-store', signal });
 					if (res.status === 404) return null;
 					if (!res.ok) throw new Error(`HTTP ${res.status}`);
 					return await res.text();
