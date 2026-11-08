@@ -146,6 +146,11 @@ pub struct Ingest {
     pub calendars: Vec<String>,
     last_upgrade: u64,
     last_purge: u64,
+    /// The newest checkpoint that logged entries, and the newest one a
+    /// signed note's `mirror` line covers: while the first is ahead, the
+    /// entries are logged but no note lets a reader fetch them yet.
+    last_with_entries: u64,
+    named_covered: u64,
     /// Messages past the cheap checks, waiting for their proof check:
     /// (when their identifier was last claimed + 1, 0 for never; arrival).
     queue: BinaryHeap<Reverse<(u64, u64)>>,
@@ -227,6 +232,8 @@ impl Ingest {
             calendars: vec![],
             last_upgrade: 0,
             last_purge: 0,
+            last_with_entries: 0,
+            named_covered: 0,
             queue: BinaryHeap::new(),
             queued: HashMap::new(),
             queued_ids: Default::default(),
@@ -477,7 +484,14 @@ impl Ingest {
         // A heartbeat when nothing happened: readers refuse stale
         // checkpoints, so a mirror cannot single one out with an old root.
         let heartbeat = now >= last + HEARTBEAT;
-        if (due && (!self.rows.is_empty() || !self.subs.is_empty() || !closes.is_empty())) || heartbeat {
+        // A note names the commit pushed before it, so the entries of the
+        // newest checkpoint become readable with the next note. Once the
+        // push covering them is done, that note comes at the next period
+        // instead of waiting for other traffic or the heartbeat: a voter
+        // waits seconds, not minutes, for the log to show their message.
+        let pushed = self.mirror.as_ref().and_then(|m| m.covered()).unwrap_or(0);
+        let uncovered = self.named_covered < self.last_with_entries && pushed >= self.last_with_entries;
+        if (due && (!self.rows.is_empty() || !self.subs.is_empty() || !closes.is_empty() || uncovered)) || heartbeat {
             return Ok(Some(self.checkpoint(now, &closes).await?));
         }
         Ok(None)
@@ -611,6 +625,7 @@ impl Ingest {
         }
         // The newest pushed commit: a checkpoint never waits for the push.
         let token = self.mirror.as_ref().and_then(|m| m.token());
+        let named = self.mirror.as_ref().and_then(|m| m.covered());
         let cp = state.checkpoint(index, now, token);
         let signed = self.signer.sign(&cp.text());
         state.record(&cp).map_err(|e| anyhow::anyhow!(e))?;
@@ -632,6 +647,12 @@ impl Ingest {
         self.rows.clear();
         self.subs.clear();
         self.pending.clear();
+        if let Some(n) = named {
+            self.named_covered = n;
+        }
+        if !logged.is_empty() {
+            self.last_with_entries = index;
+        }
         if let Some(m) = &self.mirror {
             if let Err(e) = m.write_checkpoint(&self.state, index, from, &signed) {
                 tracing::error!(error = %e, index, "mirror (the log goes on; a restart writes it again)");
