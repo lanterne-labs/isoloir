@@ -89,7 +89,7 @@ and `zkPassportVerifier` for the passports (DESIGN §1.7).
 
 The setup files are JSON bodies as SPEC §4.1, §5 and §7 show
 (`provider: "dev"` for a trial registry: the ingest, the authority and
-the audit accept it only with `--dev`, which they refuse on the host). `crates/server/tests/ingest.rs`
+the audit accept it only with `--dev`, which they refuse in production (`ISOLOIR_PRODUCTION`)). `crates/server/tests/ingest.rs`
 and `crates/zk/tests/e2e.rs` do the same in code.
 
 ## Tests
