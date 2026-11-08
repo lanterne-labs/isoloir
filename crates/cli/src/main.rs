@@ -348,6 +348,13 @@ async fn main() -> Result<()> {
                 isoloir_server::restore::restore(&store, &mirror, &verifier, now()).await?;
             }
             let entries = store.entries().await?;
+            // The window files of the checkpoints written before them.
+            let notes: Vec<(u64, String)> = store.checkpoints().await?.into_iter().map(|(i, n)| (i as u64, n)).collect();
+            let logged: Vec<(u64, EntryKind, Vec<u8>, u64)> = entries.iter().map(|(s, k, b, c)| (*s as u64, *k, b.clone(), *c as u64)).collect();
+            let filled = mirror.backfill_windows(&notes, &logged)?;
+            if filled > 0 {
+                tracing::info!(checkpoints = filled, "mirror: the window files of the earlier checkpoints are written");
+            }
             // The channels of the ledger's current version.
             let Some((_, _, last_ledger, _)) = entries.iter().filter(|e| e.1 == EntryKind::Ledger).last() else { bail!("no ledger: run isoloir genesis first") };
             let Ok(Body::Ledger(l)) = body::decode(EntryKind::Ledger, last_ledger) else { bail!("the ledger entry does not decode") };

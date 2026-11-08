@@ -477,9 +477,32 @@ export class FakeIngest {
 			const h = this.held.shift()!;
 			m.put(`entries/${h.index}.json`, h.entries);
 			m.put(`checkpoints/${h.index}.txt`, h.note);
+			this.window(h.index, h.note, h.entries);
 			this.shards('registries/1/leaves', h.leaves);
 			for (const [poll, l] of h.ballots) this.shards(`polls/${poll}/ballots`, l);
 		}
+	}
+
+	/** Checkpoints per window file (crates/server/src/mirror.rs: 256; small here to see windows close). */
+	windowSize = 4;
+	/** Windows are not written (a mirror of an earlier version). */
+	noWindows = false;
+
+	/** Adds a checkpoint to the open window, as crates/server/src/mirror.rs does. */
+	private window(index: number, note: string, entries: unknown[]) {
+		if (this.noWindows) return;
+		const m = this.mirror;
+		let k = 0;
+		while (m.files.has(`windows/${k + 1}.json`)) k++;
+		const held = m.files.get(`windows/${k}.json`);
+		let w = held ? (JSON.parse(held) as { from: number; to: number; checkpoints: unknown[] }) : null;
+		if (!w || w.to !== index - 1 || w.checkpoints.length >= this.windowSize) {
+			if (w) k++;
+			w = { from: index, to: index, checkpoints: [] };
+		}
+		w.to = index;
+		w.checkpoints.push({ index, note, entries });
+		m.put(`windows/${k}.json`, w);
 	}
 
 	private shards(dir: string, leaves: string[]) {
