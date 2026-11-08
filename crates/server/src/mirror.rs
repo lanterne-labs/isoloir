@@ -146,6 +146,11 @@ impl Mirror {
         self.pushed.lock().unwrap().as_ref().map(|(c, i)| format!("{c}:{i}"))
     }
 
+    /// The newest checkpoint the pushed commit covers.
+    pub fn covered(&self) -> Option<u64> {
+        self.pushed.lock().unwrap().as_ref().map(|(_, i)| *i)
+    }
+
     fn git(&self, args: &[&str]) -> anyhow::Result<String> {
         let out = git_command().arg("-C").arg(&self.dir).args(args).output()?;
         if !out.status.success() {
