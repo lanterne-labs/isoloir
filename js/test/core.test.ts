@@ -62,7 +62,7 @@ describe('the wasm core from node', () => {
 		expect(() => core.verifyNote(note.replace('\n4\n', '\n5\n'), vk)).toThrow();
 		const files = new Map([['checkpoint.txt', note]]);
 		const fetcher = async (url: string) => {
-			const f = files.get(url.replace('https://m.test/', ''));
+			const f = files.get(url.replace('https://m.test/', '').replace(/\?.*$/, ''));
 			return f ? { status: 200, ok: true, text: async () => f } : { status: 404, ok: false, text: async () => '' };
 		};
 		const good = new Mirror(core, [dirSource('https://m.test')], vk, fetcher);
