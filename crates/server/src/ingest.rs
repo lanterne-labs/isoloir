@@ -295,9 +295,11 @@ impl Ingest {
     fn ack_event(&self, of: &str, hash: &str, outcome: Outcome, reason: Option<isoloir_proto::Reason>, checkpoint: Option<u64>, legacy: bool, now: u64) -> Event {
         let ack = Ack { v: V1, of: of.to_string(), hash: hash.to_string(), outcome, reason, checkpoint };
         let kind = if legacy { kinds::ACK - kinds::LEGACY } else { kinds::ACK };
-        // To the minute: an ack is public, and its time would date the
-        // entry it names to the second (SPEC §11.2).
-        Event::sign(&self.nostr_sk, now / 60 * 60, kind, vec![vec!["t".into(), self.tag.clone()], vec!["e".into(), of.to_string()]], canonical::to_string(&ack).expect("ack"))
+        // To the minute, rounded up: an ack is public, and its time would
+        // date the entry it names to the second (SPEC §11.2); rounded down
+        // it is born up to 59 s old, and relays drop ephemeral events about
+        // a minute old.
+        Event::sign(&self.nostr_sk, now.div_ceil(60) * 60, kind, vec![vec!["t".into(), self.tag.clone()], vec!["e".into(), of.to_string()]], canonical::to_string(&ack).expect("ack"))
     }
 
     async fn send_ack(&self, origin: &str, ev: &Event) {
