@@ -302,7 +302,18 @@ impl Ingest {
         Event::sign(&self.nostr_sk, now.div_ceil(60) * 60, kind, vec![vec!["t".into(), self.tag.clone()], vec!["e".into(), of.to_string()]], canonical::to_string(&ack).expect("ack"))
     }
 
-    async fn send_ack(&self, origin: &str, ev: &Event) {
+    async fn send_ack(&self, origin: &str, ev: &Event, now: u64) {
+        // An ack sent again (a message judged before, an ack the relay did
+        // not take) keeps its content and tags but gets this minute's date:
+        // relays drop an ephemeral event about a minute old.
+        let minute = now.div_ceil(60) * 60;
+        let fresh;
+        let ev = if ev.created_at < minute {
+            fresh = Event::sign(&self.nostr_sk, minute, ev.kind, ev.tags.clone(), ev.content.clone());
+            &fresh
+        } else {
+            ev
+        };
         match self.transport.publish(origin, ev).await {
             Ok(()) => {
                 if let Err(e) = self.store.ack_posted(ev.tag("e").unwrap_or_default()).await {
@@ -325,7 +336,7 @@ impl Ingest {
         // Judged before: the same ack again, on this relay too.
         if let Some((_, ack, _)) = self.store.seen(&ev.id).await? {
             let ack: Event = serde_json::from_value(ack)?;
-            self.send_ack(&inc.origin, &ack).await;
+            self.send_ack(&inc.origin, &ack, now).await;
             return Ok(());
         }
         if self.queued_ids.contains(&ev.id) {
@@ -451,7 +462,7 @@ impl Ingest {
             (false, _) => self.store.seen_only(&ev.id, &inc.origin, &ack_json).await?,
         }
         self.deferred.remove(&ev.id);
-        self.send_ack(&inc.origin, &ack).await;
+        self.send_ack(&inc.origin, &ack, now).await;
         Ok(true)
     }
 
@@ -465,7 +476,7 @@ impl Ingest {
         }
         for (_, relay, ack) in self.store.unposted().await? {
             let ev: Event = serde_json::from_value(ack)?;
-            self.send_ack(&relay, &ev).await;
+            self.send_ack(&relay, &ev, now).await;
         }
         self.take_submissions(now).await?;
         self.upgrade_stamps(now).await?;
