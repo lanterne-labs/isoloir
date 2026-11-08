@@ -1,6 +1,6 @@
-# Deploys main to the ledger and the authority (the same image, the start command
-# set on the service) on every push. What is specific to the host is in the secret
-# DEPLOY_SCRIPT, run with DEPLOY_TOKEN set; its output stays out of the public log.
+# Deploys main to the host services `mirror-ingest` (the ledger) and `mirror-authority`
+# (the authority: the same image, its start command set on the service) on every push,
+# with a project token (DEPLOY_TOKEN, production environment).
 name: deploy
 
 on:
@@ -19,13 +19,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: deploy
+      - run: npm install -g host-cli@5.70.0
+      - name: host up mirror-ingest
         env:
-          DEPLOY_TOKEN: ${{ secrets[secrets.DEPLOY_TOKEN_NAME] }}
-          DEPLOY_SCRIPT: ${{ secrets.DEPLOY_SCRIPT }}
-        run: |
-          printf '%s\n' "$DEPLOY_SCRIPT" > "$RUNNER_TEMP/deploy.sh"
-          status=0
-          sh "$RUNNER_TEMP/deploy.sh" > "$RUNNER_TEMP/deploy.log" 2>&1 || status=$?
-          echo "deploy: exit $status"
-          exit "$status"
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+        run: host up --service mirror-ingest --ci
+      - name: host up mirror-authority
+        env:
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+        run: host up --service mirror-authority --ci
