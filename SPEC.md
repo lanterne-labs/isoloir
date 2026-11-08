@@ -607,8 +607,10 @@ channel it came from, tag `["e", <event id>]`:
 ```
 
 or `"outcome":"rejected","reason":"…"`. The ack's `created_at` is
-rounded down to the minute (an ack is public: to the second, it would
-date the entry it names). A message resent after a missed ack goes in a
+rounded up to the minute (an ack is public: to the second, it would
+date the entry it names; rounded down, it would be born up to 59 s old,
+and relays drop ephemeral events about a minute old). A voter's
+envelope is dated the same way. A message resent after a missed ack goes in a
 fresh envelope; the ingest answers the same body with the same outcome
 whatever its envelope. An accepted message is first
 written to durable storage (pending), then acknowledged, then logged at

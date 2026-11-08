@@ -1335,9 +1335,12 @@ export class Session {
 		return this.ledger?.body.pow ?? 0;
 	}
 
-	/** An event of a fresh throwaway key, dated to the minute on the server's clock (device links: relays only, no work). */
+	/** An event of a fresh throwaway key, dated to the minute (rounded up) on the server's clock (device links: relays only, no work). */
 	private signEvent(kind: number, content: string, extraTags: string[][] = []): NostrEvent {
-		const createdAt = Math.floor(this.clock.now() / 60_000) * 60;
+		// Dated to the minute, rounded up: relays drop an ephemeral event once it
+		// is about a minute old (some at 60 s), and one rounded down is born up
+		// to 59 s old. They take events minutes ahead.
+		const createdAt = Math.ceil(this.clock.now() / 60_000) * 60;
 		return this.core.signEvent('', createdAt, kind, [['t', `isoloir/1/${this.config.origin}`], ...extraTags], content);
 	}
 
@@ -1359,7 +1362,10 @@ export class Session {
 		// The next key is being mined (take() started it).
 		this.workState = 'mining';
 		void this.startWork().catch(() => undefined);
-		const createdAt = Math.floor(this.clock.now() / 60_000) * 60;
+		// Dated to the minute, rounded up: relays drop an ephemeral event once it
+		// is about a minute old (some at 60 s), and one rounded down is born up
+		// to 59 s old. They take events minutes ahead.
+		const createdAt = Math.ceil(this.clock.now() / 60_000) * 60;
 		return this.core.signEvent(k.secret, createdAt, kind, [['t', `isoloir/1/${this.config.origin}`], ...powTags(k)], content);
 	}
 
