@@ -116,7 +116,13 @@ name, e.g. `vote.example/isoloir`). Entries are numbered from 0 (`seq`).
 - **The `mirror` line** names the newest commit of the mirror's
   repository that the ingest knows its remote holds, and the newest
   checkpoint whose files that commit holds (§15): a checkpoint is never
-  delayed by the mirror, so its own files are named by a later note.
+  delayed by the mirror, so its own files are named by a later note,
+  and the ingest does not leave that note to traffic or to the
+  heartbeat: once the push covering a checkpoint with entries is done,
+  the next period cuts a **covering** checkpoint, empty, whose note
+  names that commit, so the entries are readable a push and two periods
+  after they were logged. A covering checkpoint has no entries, so it
+  calls for no other.
   One token, `<commit>:<index>`, so that readers of earlier versions
   (which take the line's one field as a commit) still parse the note,
   then fall back to the latest files. Notes written before this version
@@ -610,9 +616,19 @@ or `"outcome":"rejected","reason":"…"`. The ack's `created_at` is
 rounded up to the minute (an ack is public: to the second, it would
 date the entry it names; rounded down, it would be born up to 59 s old,
 and relays drop ephemeral events about a minute old). A voter's
-envelope is dated the same way. A message resent after a missed ack goes in a
-fresh envelope; the ingest answers the same body with the same outcome
-whatever its envelope. An accepted message is first
+envelope is dated the same way, by the ledger's time as the device
+estimates it from the checkpoints it received: a checkpoint is read
+after it was signed, so its time minus the local time is a lower bound
+of the offset, and the freshest checkpoint that arrived on a channel
+(the largest offset) is the estimate. A checkpoint a relay kept and
+hands to a new subscription is minutes old; it must not set the
+estimate back, or every envelope looks old and relays drop it. A
+message resent after a missed ack goes in a fresh envelope; the ingest
+answers the same body with the same outcome whatever its envelope. An
+ack sent again (a body judged before, an ack a relay did not take)
+keeps its content and tags and is signed again, dated to the current
+minute rounded up: with its first date, it would never reach a voter
+resending after a lost ack. An accepted message is first
 written to durable storage (pending), then acknowledged, then logged at
 the named checkpoint in the same transaction as the checkpoint itself.
 A message whose check failed for an infrastructure reason is neither
@@ -667,7 +683,9 @@ for example in a link fragment `#c=<base64url>`. Judging it:
   at the first and the last second of that minute, without and with the
   entries of the next checkpoint as messages pending then. It holds when
   every judgment accepts the body, fails when every one refuses it, and
-  is undecided when they differ.
+  is undecided when they differ. The voter keeps the first ack it
+  received: an ack sent again (§11.2) is dated to the resend, and the
+  log of that later minute is another.
 
 A message that is never answered proves nothing afterwards: no third
 party keeps a copy. The device retries on the next channel, `direct`
@@ -783,6 +801,14 @@ last `seq` (§7.4).
 
 **Addressing.** Files are read by commit (a CDN serves
 `<repo>@<commit>/<path>` for ever, while a branch is cached for hours).
+The head files (`checkpoint.txt` and the files rewritten in place)
+change at every checkpoint, and a CDN in front of the mirror keeps them
+for minutes (GitHub Pages: 10): a reader fetches them with a query no
+cache has seen and its own cache bypassed, and a file at a commit as
+immutable. After an accepted ack the log shows the message within a
+push and two periods (the covering checkpoint, §4): the reader then
+reads the head every few seconds for some minutes, instead of at its
+regular pace.
 Each checkpoint writes its files and commits them locally; a background
 task pushes, and retries every 30 s what the remote lacks. A checkpoint
 never waits for the push: the git host down or full never stops the
