@@ -199,19 +199,56 @@ function wasmPath(wasm: BbWasmFiles | undefined): string | undefined {
 	return `${dir}/barretenberg.wasm.gz`;
 }
 
+/** How long the multi-threaded bb.js may take to come up before the prover goes on with one thread. */
+export const THREADS_UP_MS = 30_000;
+
+const plog = (m: string) => console.info(`isoloir prover: ${m}`);
+
+/**
+ * bb.js in the browser runs the wasm in a worker of its own, which spawns one
+ * worker per thread and waits for each to report; a browser that starts
+ * none of them (a profile, an extension) leaves that wait open forever, with
+ * nothing to see. After THREADS_UP_MS the prover sets bb.js up again on one
+ * thread, which spawns none: slower, but it proves.
+ */
+async function newApi(Barretenberg: { 'new': (o: unknown) => Promise<unknown> }, threads: number, options: ProverOptions): Promise<unknown> {
+	const make = (t: number) => Barretenberg.new({ threads: t, srsSize: SRS_POINTS, skipSrsInit: !!options.srs, wasmPath: wasmPath(options.wasm), logger: plog });
+	if (threads <= 1) return make(1);
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const late = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error('threads_up')), THREADS_UP_MS);
+	});
+	try {
+		return await Promise.race([make(threads), late]);
+	} catch (e) {
+		if (!(e instanceof Error) || e.message !== 'threads_up') throw e;
+		plog(`bb.js did not come up on ${threads} threads in ${THREADS_UP_MS / 1000} s; setting it up on one thread`);
+		return make(1);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 /** Loads noir_js and bb.js for a circuit once; the first call fetches the SRS and sets up the key. */
 export function backendFor(circuit: string, artifact: ArtifactLoader, options: ProverOptions = {}): Promise<Backend> {
 	const key = `${circuit} ${JSON.stringify(options)}`;
 	let b = backends.get(key);
 	if (b) return b;
 	b = (async () => {
+		const t0 = Date.now();
 		const compiled = JSON.parse(await artifact(circuit)) as CompiledCircuit;
+		plog(`${circuit}: artifact read; loading noir_js and bb.js`);
 		const [{ Noir }, { Barretenberg, UltraHonkBackend }] = await Promise.all([import('@noir-lang/noir_js'), import('@aztec/bb.js')]);
 		const noir = new Noir(compiled as never);
-		const api = await Barretenberg.new({ threads: proverThreads(), srsSize: SRS_POINTS, skipSrsInit: !!options.srs, wasmPath: wasmPath(options.wasm) } as never);
+		const threads = proverThreads();
+		const g = globalThis as { crossOriginIsolated?: boolean; navigator?: { hardwareConcurrency?: number } };
+		plog(`setting bb.js up: threads ${threads}, cross-origin isolated ${!!g.crossOriginIsolated}, cores ${g.navigator?.hardwareConcurrency ?? '?'}`);
+		const api = await newApi(Barretenberg as never, threads, options);
+		plog(`bb.js up at ${Date.now() - t0} ms; ${options.srs ? 'loading the pinned SRS' : 'the SRS came with it'}`);
 		if (options.srs) await initSrs(api as unknown as SrsApi, options.srs);
-		const backend = new UltraHonkBackend(compiled.bytecode, api);
+		const backend = new UltraHonkBackend(compiled.bytecode, api as never);
 		await backend.getVerificationKey({ verifierTarget: 'noir-recursive' });
+		plog(`${circuit}: verification key ready at ${Date.now() - t0} ms`);
 		return { noir: noir as unknown as Backend['noir'], backend: backend as unknown as Backend['backend'] };
 	})();
 	b.catch(() => backends.delete(key));
