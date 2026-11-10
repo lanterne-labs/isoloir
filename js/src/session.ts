@@ -377,6 +377,9 @@ const ENVELOPES_KEPT = 8;
 const COMPLAINTS_KEPT = 32;
 /** How many times a ballot's seq is raised after stale_seq refusals (steps 1, 2, 4, 8, then 16: about 150 ballots found again). */
 const STALE_RAISES = 12;
+/** How many times, and how long apart, a cast waits for a note covering the registration's checkpoint (§4: a push and two periods). */
+const COVER_WAITS = 12;
+const COVER_WAIT_MS = 10_000;
 /** The ingest's seq gap (SPEC §7.4): a seq at most this far above the last. */
 const SEQ_GAP = 16;
 
@@ -999,6 +1002,7 @@ export class Session {
 		try {
 			let retries = 0;
 			let raises = 0;
+			let waits = 0;
 			for (;;) {
 				this.ballot = { state: 'drafting', choice };
 				this.emit();
@@ -1010,7 +1014,19 @@ export class Session {
 				const age = this.local() - anchor.time * 1000;
 				if (age > (this.config.maxCheckpointAgeMs ?? 30 * 60_000)) throw new IsoloirError('stale_mirror', `the newest checkpoint is ${Math.round(age / 60_000)} minutes old`);
 				const kk = this.requireKey();
-				const member = await this.memberPath(anchor, kk);
+				let member: TreePath;
+				try {
+					member = await this.memberPath(anchor, kk);
+				} catch (e) {
+					// The covered checkpoint predates the registration (the covering
+					// note is a period away, §4): read the head again in a moment
+					// rather than fail, a few times.
+					if (e instanceof IsoloirError && e.code === 'no_path' && e.detail?.endsWith('yet') && ++waits <= COVER_WAITS) {
+						await new Promise((r) => setTimeout(r, COVER_WAIT_MS));
+						continue;
+					}
+					throw e;
+				}
 				const rec = this.pollRecord(kk);
 				const revoting = await this.revoting(anchor, kk, rec);
 				const draft = this.core.draftBallot({ poll: poll.body, setup_seq: poll.seq, member: { root: member.root, path: member.path, index: member.index }, s: kk.secret, choice, revoting });
@@ -1215,7 +1231,16 @@ export class Session {
 		if (this.phaseOverride) return this.phaseOverride;
 		const k = this.key();
 		if (!k) return 'no-key';
-		if (k.position >= 0) return 'ready';
+		if (k.position >= 0) {
+			// A ballot proves membership against the newest checkpoint whose files
+			// the mirror holds (the covered one, §15). The registration was found
+			// in checkpoint foundIn, readable a push before a note covers it (§4):
+			// until one does, the ballot form waits, or a ballot drafted now
+			// proves against a tree without the leaf.
+			const f = k.registration?.foundIn;
+			if (f !== undefined && this.cp && covered(this.cp) < f) return 'joining';
+			return 'ready';
+		}
 		const r = k.registration;
 		if (!r || r.state === 'rejected') return 'unregistered';
 		if (r.state === 'kept' || r.state === 'sent') return this.registration.state === 'posting' ? 'registering' : 'unregistered';
