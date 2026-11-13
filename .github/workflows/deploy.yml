@@ -1,6 +1,9 @@
-# Deploys main to the host services `mirror-ingest` (the ledger) and `mirror-authority`
-# (the authority: the same image, its start command set on the service) on every push,
-# with a project token (DEPLOY_TOKEN, production environment).
+# Deploys main to the host's services `mirror-ingest` (the ledger) and
+# `mirror-authority` (the authority: the same image, its start command set on
+# the service) on every push, with a token of the project's production
+# environment. What the upload runs is the secret DEPLOY_SCRIPT (it installs
+# the host's CLI, uploads the service, then follows the deployment until it
+# ends); the secret DEPLOY_TOKEN_NAME names the secret that holds the token.
 name: deploy
 
 on:
@@ -17,14 +20,16 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [mirror-ingest, mirror-authority]
     steps:
       - uses: actions/checkout@v4
-      - run: npm install -g host-cli@5.70.0
-      - name: host up mirror-ingest
+      - name: deploy ${{ matrix.service }}
         env:
-          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
-        run: host up --service mirror-ingest --ci
-      - name: host up mirror-authority
-        env:
-          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
-        run: host up --service mirror-authority --ci
+          DEPLOY_SCRIPT: ${{ secrets.DEPLOY_SCRIPT }}
+          DEPLOY_TOKEN: ${{ secrets[secrets.DEPLOY_TOKEN_NAME] }}
+          SERVICE: ${{ matrix.service }}
+        run: bash -c "$DEPLOY_SCRIPT"
