@@ -166,6 +166,9 @@ enum Cmd {
         /// Check the checkpoints' stamps against Bitcoin block headers (blockstream.info, mempool.space).
         #[arg(long)]
         bitcoin: bool,
+        /// With --bitcoin, also check the stamps of the checkpoints that hold no entry.
+        #[arg(long)]
+        every_stamp: bool,
         /// Accept a registry of the dev passport provider (local trials): a
         /// warning, not a problem.
         #[arg(long)]
@@ -534,7 +537,7 @@ async fn main() -> Result<()> {
             }
             println!("ok: {}", String::from_utf8_lossy(&bytes));
         }
-        Cmd::Audit { mirror, log_key, circuits, zkverifier, node, rpc_url, skip_passports, bitcoin, dev } => {
+        Cmd::Audit { mirror, log_key, circuits, zkverifier, node, rpc_url, skip_passports, bitcoin, every_stamp, dev } => {
             let bb = Tools::find_bb()?;
             let vk_dir = match circuits {
                 Some(c) => c,
@@ -549,8 +552,11 @@ async fn main() -> Result<()> {
             // and its registrations are refused, unless --dev (a trial).
             let passports = passports(zkverifier, node, rpc_url, dev);
             let mut a = Auditor::new(log_key.as_deref(), Checkers { proofs: &proofs, passports: &passports, tlock: Some(&DrandTlock) }).map_err(|e| anyhow::anyhow!(e))?;
+            // The notes are kept for the stamps: (index, note, has entries).
+            let mut notes: Vec<(u64, String, bool)> = vec![];
             for (n, es) in MirrorSource::parse(&mirror).from(1).await? {
-                a.checkpoint(&n, &es).map_err(|e| anyhow::anyhow!(e))?;
+                let cp = a.checkpoint(&n, &es).map_err(|e| anyhow::anyhow!(e))?;
+                notes.push((cp.index, n, !es.is_empty()));
             }
             let (state, mut r) = a.finish();
             for (id, reg) in &state.registries {
@@ -562,15 +568,33 @@ async fn main() -> Result<()> {
             if bitcoin {
                 let src = MirrorSource::parse(&mirror);
                 let headers = isoloir_stamps::Esplora::default();
-                let (mut attested, mut pending) = (0, 0);
+                let (mut attested, mut pending, mut quiet) = (0, 0, 0);
+                // A checkpoint without entries adds nothing to the log: the
+                // stamp of the checkpoint that brought the entries already
+                // dates them. Those stamps are read only with --every-stamp;
+                // the head's is always read.
+                let head = notes.last().map(|n| n.0);
+                let with_entries: std::collections::HashMap<u64, (&str, bool)> = notes.iter().map(|(i, n, e)| (*i, (n.as_str(), *e))).collect();
                 for cp in &state.checkpoints {
+                    let Some(&(note, has)) = with_entries.get(&cp.index) else { continue };
+                    if !every_stamp && !has && Some(cp.index) != head {
+                        quiet += 1;
+                        continue;
+                    }
                     let Some(ots) = src.get(&format!("stamps/{}.ots", cp.index)).await? else {
                         r.warnings.push(format!("checkpoint {}: no stamp on the mirror", cp.index));
                         continue;
                     };
-                    let note = src.get(&format!("checkpoints/{}.txt", cp.index)).await?.context("note")?;
-                    let digest = isoloir_core::encoding::sha256(&note);
-                    match isoloir_stamps::Ots::parse(&ots).map_err(|e| e.to_string()).and_then(|o| isoloir_stamps::verify(&o, digest, &headers).map_err(|e| e.to_string())) {
+                    let digest = isoloir_core::encoding::sha256(note.as_bytes());
+                    // A stamp the calendars have not anchored yet is pending, not a problem.
+                    let checked = match isoloir_stamps::Ots::parse(&ots) {
+                        Ok(o) => match isoloir_stamps::verify(&o, digest, &headers) {
+                            Err(isoloir_stamps::Error::NoBitcoinAttestation) => Err("pending".to_string()),
+                            r => r.map_err(|e| e.to_string()),
+                        },
+                        Err(e) => Err(e.to_string()),
+                    };
+                    match checked {
                         Ok(blocks) => {
                             attested += 1;
                             if let Some((h, t)) = blocks.iter().min_by_key(|b| b.0) {
@@ -579,11 +603,11 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
-                        Err(e) if e.contains("NoBitcoinAttestation") || e.contains("pending") => pending += 1,
+                        Err(e) if e == "pending" => pending += 1,
                         Err(e) => r.problems.push(format!("checkpoint {}: stamp: {e}", cp.index)),
                     }
                 }
-                println!("stamps: {attested} attested in Bitcoin, {pending} pending");
+                println!("stamps: {attested} attested in Bitcoin, {pending} pending{}", if quiet > 0 { format!(", {quiet} of checkpoints without entries not read (--every-stamp reads them)") } else { String::new() });
             }
             println!(
                 "{} checkpoints, {} entries: {} registrations, {} ballots, {} tallies, {} refusals of an earlier log (read, not judged)",

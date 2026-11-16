@@ -69,7 +69,24 @@ impl MirrorSource {
         let parsed = mirror::parse_entries(&serde_json::from_slice(&entries)?)?;
         Ok((String::from_utf8(note)?, parsed.into_iter().map(|(_, k, b)| (k, b)).collect()))
     }
+
+    /// The checkpoints `from..to` from their own files, in order, read
+    /// AT_ONCE at a time: a mirror without windows holds two files per
+    /// checkpoint, thousands of them after a quiet month.
+    async fn range(&self, from: u64, to: u64) -> anyhow::Result<Vec<Read>> {
+        let mut out = Vec::with_capacity(to.saturating_sub(from) as usize);
+        let mut i = from;
+        while i < to {
+            let end = (i + AT_ONCE).min(to);
+            out.extend(futures_util::future::try_join_all((i..end).map(|j| self.one(j))).await?);
+            i = end;
+        }
+        Ok(out)
+    }
 }
+
+/// How many checkpoints are read from their files at the same time.
+const AT_ONCE: u64 = 16;
 
 #[async_trait::async_trait]
 impl LogSource for MirrorSource {
@@ -90,9 +107,7 @@ impl LogSource for MirrorSource {
             if to < next {
                 continue;
             }
-            for i in next..from.min(last + 1) {
-                out.push(self.one(i).await?);
-            }
+            out.extend(self.range(next, from.min(last + 1)).await?);
             for (i, note, entries) in cps {
                 if i >= next && i <= last {
                     out.push((note, entries.into_iter().map(|(_, k, b)| (k, b)).collect()));
@@ -100,9 +115,7 @@ impl LogSource for MirrorSource {
             }
             next = next.max(from).max(to + 1);
         }
-        for i in next..=last {
-            out.push(self.one(i).await?);
-        }
+        out.extend(self.range(next, last + 1).await?);
         Ok(out)
     }
 }
