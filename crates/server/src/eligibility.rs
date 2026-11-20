@@ -50,7 +50,7 @@ impl Passports for Verifiers {
                 if ans.get("verified").and_then(Value::as_bool) == Some(true) {
                     Ok(ans.get("uniqueIdentifier").and_then(Value::as_str).map(String::from).filter(|u| !u.is_empty()))
                 } else {
-                    tracing::debug!(errors = %ans["errors"], "passport proof refused");
+                    tracing::warn!(errors = %ans["errors"], "passport proof refused");
                     Ok(None)
                 }
             }
