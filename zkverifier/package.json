@@ -9,6 +9,6 @@
 		"node": ">=20"
 	},
 	"dependencies": {
-		"@zkpassport/sdk": "0.18.2"
+		"@zkpassport/sdk": "0.21.0"
 	}
 }
