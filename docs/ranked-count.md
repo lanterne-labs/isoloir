@@ -1,5 +1,9 @@
 # The ranked count: why pairwise margins, and not instant runoff
 
+> **New to the method?** An illustrated lecture explains it step by step, with diagrams:
+> the problem, how Condorcet works, how Copeland orders a cycle, and the other methods.
+> <https://claude.ai/artifact/Q3qQpBMWKmL4ZXqFQm93uq>
+
 isoloir's `ranked` kind lets a voter rank up to `depth` candidates. This
 document says how such a poll is counted, what the count guarantees,
 why that count was chosen, and how it compares to the method most people
